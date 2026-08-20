@@ -51,9 +51,19 @@ def register_moe_quant_wrapper(
     _QUANT_WRAPPERS.append((priority, wrapper_id, predicate, factory))
 
 
+def _maybe_import_prism() -> None:
+    """Prism(K-split tiered MoE offload)은 모델 파일이 아니라 env로 활성화되므로
+    여기서 지연 import한다 (import 시 self-register). env가 없으면 no-op."""
+    import os
+
+    if os.environ.get("SGLANG_PRISM_PLAN"):
+        import sglang.srt.layers.moe.prism.method  # noqa: F401
+
+
 def maybe_wrap_moe_quant_method(
     layer: Any, gpu_method: "FusedMoEMethodBase", server_args: "ServerArgs"
 ) -> "FusedMoEMethodBase":
+    _maybe_import_prism()
     """Iterate predicates in priority order (lower first); chain-wrap with each
     that matches. For DSV4, the final method is
     KTEPWrapperMethod(DeepSeekMxfp4MoEMethod(gpu_method)) because mxfp4

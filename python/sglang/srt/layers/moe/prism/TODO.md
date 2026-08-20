@@ -47,15 +47,15 @@ kt의 down K(inter)-분할은 "노드가 자기 act 열만 소비"하는 localit
   버퍼 할당은 무변경 자동 반영(치수 출처만 바뀜; 스크래치는 노드별 독립
   + max-grow가 레이어 간 차이 흡수, sglang arena도 이미 레이어 최대치 산정).
 
-## partial prefill (qlen>1) — S7 전 필수
+## ~~partial prefill (qlen>1)~~ — ✅ 완료 (2026-08-20)
 
-K1의 forward_gateup_partial은 decode(qlen==1) 전용 (TP 진입에서 guard).
-주의: kt 기준 qlen>1은 전부 prefill 경로라 **batch>1 eager decode도 이
-guard에 걸린다**. 필요 작업: ① forward_prefill의 1~4단계 절단 (decode가
-아닌 prefill의 토큰 그룹핑 — m_local_pos_/m_local_input_ gather — 을
-계승), ② strided from_mat 변형 (full-width x의 row stride ≠ buffer k;
-SFT pack_a_transposed의 source_stride 선례), ③ m_local_pos_ 기반
-(토큰, slot) scatter export. 자리: K2 직후 (down과 함께 한 번에 이식).
+gateup/down 양쪽에 prefill(qlen>1) 경로 구현 — kt forward_prefill 동형의
+토큰 그룹핑(m_local_pos_) + gather + (m, slot) scatter export. decode와
+stage/export 헬퍼 공유 (decode = pos 0 퇴화형). **strided from_mat 변형은
+불필요했음** — prefill의 gather memcpy가 밴드 슬라이싱을 흡수. batch>1
+eager decode도 함께 해제 (qlen ≤ max_len 범위 guard로 대체). 테스트:
+decode/prefill 파라미터화 (중복 expert 필연 구성 + 정수 비트일치가 좌표
+뒤섞임 검출) + 불균등 shard × prefill 조합.
 
 ## 기타 미룸 항목 (합의된 것만, 요약)
 
