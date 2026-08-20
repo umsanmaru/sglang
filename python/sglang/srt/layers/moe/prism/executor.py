@@ -159,11 +159,12 @@ class PrismExecutor:
                 cur.wait_event(evt)
                 w = self._res.arena.view(Proj.DOWN)
                 for slot, e in enumerate(group):
-                    mask = topk_ids == e            # [M, k] bool (GPU)
-                    if not bool(mask.any()):
-                        continue
-                    a = act_band[mask]              # [n, rows] fp32
-                    warm_down[mask] = a @ w[slot].float()  # fp32 누산 (계약 ⑤)
+                    # sync-free: 전 (m, j) 좌표를 계산하고 where로 선별 —
+                    # 데이터 의존 host 분기/nonzero 없음 (위 _scatter_gateup 참조).
+                    # slot당 여분 계산은 decode에서 무시 가능(수 µs GEMM).
+                    mask = (topk_ids == e).unsqueeze(-1)          # [M, k, 1]
+                    contrib = act_band @ w[slot].float()          # [M, k, H] fp32 누산 (계약 ⑤)
+                    warm_down = torch.where(mask, contrib, warm_down)
                 prev_done = torch.cuda.Event()
                 prev_done.record(cur)
 
@@ -192,13 +193,15 @@ class PrismExecutor:
     @staticmethod
     def _scatter_gateup(warm_gu: torch.Tensor, topk_ids: torch.Tensor, group: Sequence[int],
                         gate_out: torch.Tensor, up_out: torch.Tensor, inter: int) -> None:
-        """그룹 GEMM 결과 [G, M, inter]를 (m, slot) 좌표의 [M, k, 2*inter]로 산란."""
+        """그룹 GEMM 결과 [G, M, inter]를 (m, slot) 좌표의 [M, k, 2*inter]로 산란.
+
+        sync-free 규칙: host 동기화를 유발하는 연산(nonzero, bool(mask.any()),
+        item, 데이터 의존 shape) 금지 — slot당 동기화가 층당 수 ms를 차지했던
+        실측(2026-08-20)의 재발 방지. broadcast where는 전부 device에 머문다.
+        """
         for slot, e in enumerate(group):
-            mask = topk_ids == e                       # [M, k] bool
-            if not bool(mask.any()):
-                continue
-            m_idx = mask.any(dim=1).nonzero(as_tuple=True)[0]
-            # 토큰 m이 expert e를 여러 slot에서 뽑는 일은 없음(topk 무중복)
-            j_idx = mask[m_idx].float().argmax(dim=1)
-            warm_gu[m_idx, j_idx, :inter] = gate_out[slot, m_idx].float()
-            warm_gu[m_idx, j_idx, inter:] = up_out[slot, m_idx].float()
+            mask = (topk_ids == e).unsqueeze(-1)       # [M, k, 1] device bool
+            g = gate_out[slot].float().unsqueeze(1)    # [M, 1, inter] → k로 broadcast
+            u = up_out[slot].float().unsqueeze(1)
+            warm_gu[:, :, :inter] = torch.where(mask, g, warm_gu[:, :, :inter])
+            warm_gu[:, :, inter:] = torch.where(mask, u, warm_gu[:, :, inter:])
