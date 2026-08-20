@@ -18,9 +18,38 @@
 
 from __future__ import annotations
 
+import os
+from contextlib import contextmanager
 from typing import Optional, Sequence
 
 import torch
+
+# nsys 구간 태그 (SGLANG_PRISM_NVTX=1일 때만 활성 — 평시 no-op).
+# 여기 구간은 host-측 push/pop이다: GPU 실측 시간은 CUDA HW row에서 읽고,
+# cold↔GPU 겹침은 cold.*.window(submit 반환~sync 반환)와 커널들의 교차로 읽는다.
+_NVTX = os.environ.get("SGLANG_PRISM_NVTX") == "1"
+
+
+@contextmanager
+def _nvtx(msg: str):
+    if not _NVTX:
+        yield
+        return
+    torch.cuda.nvtx.range_push(msg)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+def _nvtx_push(msg: str) -> None:
+    if _NVTX:
+        torch.cuda.nvtx.range_push(msg)
+
+
+def _nvtx_pop() -> None:
+    if _NVTX:
+        torch.cuda.nvtx.range_pop()
 
 from sglang.srt.layers.moe.prism.cold_backend import ColdBackend
 from sglang.srt.layers.moe.prism.kernels import WarmGemmFn
@@ -85,21 +114,27 @@ class PrismExecutor:
         m, k = hidden.shape[0], topk_ids.shape[1]
         inter, h = dims.intermediate_size, dims.hidden_size
 
+        _nvtx_push(f"prism.L{layer_idx}")
+
         # S1: topk D2H (P0 유일의 host 블록) + dedup
-        ids_cpu = topk_ids.to("cpu")
-        unique_ids = torch.unique(ids_cpu).tolist()
-        groups = expert_groups(unique_ids, res.spec.n_slots)
+        with _nvtx("s1.topk_d2h+dedup"):
+            ids_cpu = topk_ids.to("cpu")
+            unique_ids = torch.unique(ids_cpu).tolist()
+            groups = expert_groups(unique_ids, res.spec.n_slots)
 
         # ── Phase 1: gateup ──────────────────────────────────────────────
         if has_cold:
-            res.staging.fill_x(hidden)            # blocking D2H (P0 strict)
-            res.staging.fill_expert_ids(ids_cpu)
-            self._qlen_pin[0] = m
-            self._cold.submit_gateup(             # enqueue-only, 즉시 반환
-                layer_idx, self._qlen_pin.data_ptr(), k,
-                res.staging._expert_ids.data_ptr(), res.staging._x.data_ptr(),
-                res.staging._partial_gateup.data_ptr(),
-            )
+            with _nvtx("cold.gu.fill_x(D2H-block)"):
+                res.staging.fill_x(hidden)        # blocking D2H (P0 strict)
+                res.staging.fill_expert_ids(ids_cpu)
+                self._qlen_pin[0] = m
+            with _nvtx("cold.gu.submit"):
+                self._cold.submit_gateup(         # enqueue-only, 즉시 반환
+                    layer_idx, self._qlen_pin.data_ptr(), k,
+                    res.staging._expert_ids.data_ptr(), res.staging._x.data_ptr(),
+                    res.staging._partial_gateup.data_ptr(),
+                )
+            _nvtx_push("cold.gu.window")          # CPU expert 연산 재실 구간
 
         warm_gu = None
         gate_band, up_band = prepared.warm.band(Proj.GATE), prepared.warm.band(Proj.UP)
@@ -110,37 +145,49 @@ class PrismExecutor:
             # current stream의 기왕 작업 완료를 기다리게 한다.
             prev_done = torch.cuda.Event()
             prev_done.record(torch.cuda.current_stream())
-            for group in groups:
-                evt_g = stage(gate_band, group, self._res.arena.view(Proj.GATE), res.warm_stream, prev_done)
-                evt_u = stage(up_band, group, self._res.arena.view(Proj.UP), res.warm_stream, None)
-                cur = torch.cuda.current_stream()
-                cur.wait_event(evt_g)
-                cur.wait_event(evt_u)
-                g = len(group)
-                gate_out = self._warm_gemm(hidden, self._res.arena.view(Proj.GATE)[:g], gate_band.k_offset)
-                up_out = self._warm_gemm(hidden, self._res.arena.view(Proj.UP)[:g], up_band.k_offset)
-                self._scatter_gateup(warm_gu, topk_ids, group, gate_out, up_out, inter)
-                prev_done = torch.cuda.Event()
-                prev_done.record(cur)
+            for gi, group in enumerate(groups):
+                with _nvtx(f"warm.gu.g{gi}x{len(group)}"):
+                    with _nvtx("stage.gate+up(H2D)"):
+                        evt_g = stage(gate_band, group, self._res.arena.view(Proj.GATE), res.warm_stream, prev_done)
+                        evt_u = stage(up_band, group, self._res.arena.view(Proj.UP), res.warm_stream, None)
+                    cur = torch.cuda.current_stream()
+                    cur.wait_event(evt_g)
+                    cur.wait_event(evt_u)
+                    g = len(group)
+                    with _nvtx("gemm.gate"):
+                        gate_out = self._warm_gemm(hidden, self._res.arena.view(Proj.GATE)[:g], gate_band.k_offset)
+                    with _nvtx("gemm.up"):
+                        up_out = self._warm_gemm(hidden, self._res.arena.view(Proj.UP)[:g], up_band.k_offset)
+                    with _nvtx("scatter.gu"):
+                        self._scatter_gateup(warm_gu, topk_ids, group, gate_out, up_out, inter)
+                    prev_done = torch.cuda.Event()
+                    prev_done.record(cur)
 
         cold_gu = None
         if has_cold:
-            self._cold.sync()                     # S3: CPU 완료 블록
-            cold_gu = res.staging.gateup_out(m).to(hidden.device)  # H2D
+            with _nvtx("cold.gu.sync(host-block)"):
+                self._cold.sync()                 # S3: CPU 완료 블록
+            _nvtx_pop()                           # cold.gu.window
+            with _nvtx("cold.gu.h2d_out"):
+                cold_gu = res.staging.gateup_out(m).to(hidden.device)  # H2D
 
         # rejoin#1: fp32 합 → act → bf16 (계약 ⑤)
-        gu = self._accumulate(warm_gu, cold_gu, (m, k, 2 * inter), hidden.device)
-        gate, up = gu.split(inter, dim=2)
-        act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)  # [M, k, inter]
+        with _nvtx("rejoin1.acc+silu"):
+            gu = self._accumulate(warm_gu, cold_gu, (m, k, 2 * inter), hidden.device)
+            gate, up = gu.split(inter, dim=2)
+            act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)  # [M, k, inter]
 
         # ── Phase 2: down ────────────────────────────────────────────────
         if has_cold:
-            res.staging.fill_act(act)
-            self._cold.submit_down(
-                layer_idx, self._qlen_pin.data_ptr(), k,
-                res.staging._expert_ids.data_ptr(), res.staging._act.data_ptr(),
-                res.staging._partial_down.data_ptr(),
-            )
+            with _nvtx("cold.dn.fill_act(D2H-block)"):
+                res.staging.fill_act(act)
+            with _nvtx("cold.dn.submit"):
+                self._cold.submit_down(
+                    layer_idx, self._qlen_pin.data_ptr(), k,
+                    res.staging._expert_ids.data_ptr(), res.staging._act.data_ptr(),
+                    res.staging._partial_down.data_ptr(),
+                )
+            _nvtx_push("cold.dn.window")
 
         warm_down = None
         down_band = prepared.warm.band(Proj.DOWN)
@@ -153,29 +200,37 @@ class PrismExecutor:
             #  우연히 직렬화해 숨겨져 있었다 — sync-free 전환에서 발현, 2026-08-20)
             prev_done = torch.cuda.Event()
             prev_done.record(torch.cuda.current_stream())
-            for group in groups:
-                evt = stage(down_band, group, self._res.arena.view(Proj.DOWN), res.warm_stream, prev_done)
-                cur = torch.cuda.current_stream()
-                cur.wait_event(evt)
-                w = self._res.arena.view(Proj.DOWN)
-                for slot, e in enumerate(group):
-                    # sync-free: 전 (m, j) 좌표를 계산하고 where로 선별 —
-                    # 데이터 의존 host 분기/nonzero 없음 (위 _scatter_gateup 참조).
-                    # slot당 여분 계산은 decode에서 무시 가능(수 µs GEMM).
-                    mask = (topk_ids == e).unsqueeze(-1)          # [M, k, 1]
-                    contrib = act_band @ w[slot].float()          # [M, k, H] fp32 누산 (계약 ⑤)
-                    warm_down = torch.where(mask, contrib, warm_down)
-                prev_done = torch.cuda.Event()
-                prev_done.record(cur)
+            for gi, group in enumerate(groups):
+                with _nvtx(f"warm.dn.g{gi}x{len(group)}"):
+                    with _nvtx("stage.down(H2D)"):
+                        evt = stage(down_band, group, self._res.arena.view(Proj.DOWN), res.warm_stream, prev_done)
+                    cur = torch.cuda.current_stream()
+                    cur.wait_event(evt)
+                    w = self._res.arena.view(Proj.DOWN)
+                    with _nvtx("gemm+where.dn"):
+                        for slot, e in enumerate(group):
+                            # sync-free: 전 (m, j) 좌표를 계산하고 where로 선별 —
+                            # 데이터 의존 host 분기/nonzero 없음 (위 _scatter_gateup 참조).
+                            # slot당 여분 계산은 decode에서 무시 가능(수 µs GEMM).
+                            mask = (topk_ids == e).unsqueeze(-1)          # [M, k, 1]
+                            contrib = act_band @ w[slot].float()          # [M, k, H] fp32 누산 (계약 ⑤)
+                            warm_down = torch.where(mask, contrib, warm_down)
+                    prev_done = torch.cuda.Event()
+                    prev_done.record(cur)
 
         cold_down = None
         if has_cold:
-            self._cold.sync()
-            cold_down = res.staging.down_out(m).to(hidden.device)
+            with _nvtx("cold.dn.sync(host-block)"):
+                self._cold.sync()
+            _nvtx_pop()                           # cold.dn.window
+            with _nvtx("cold.dn.h2d_out"):
+                cold_down = res.staging.down_out(m).to(hidden.device)
 
         # rejoin#2: fp32 합 → router 가중 expert합 → bf16
-        down = self._accumulate(warm_down, cold_down, (m, k, h), hidden.device)
-        out = (down * topk_weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
+        with _nvtx("rejoin2.acc+wsum"):
+            down = self._accumulate(warm_down, cold_down, (m, k, h), hidden.device)
+            out = (down * topk_weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
+        _nvtx_pop()                               # prism.L{layer_idx}
         return out.to(torch.bfloat16)
 
     # ── helpers ──────────────────────────────────────────────────────────
