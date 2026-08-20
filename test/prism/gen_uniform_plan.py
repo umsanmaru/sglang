@@ -42,7 +42,8 @@ def main():
     cfg = json.loads((Path(args.model_dir) / "config.json").read_text())
     hidden = cfg["hidden_size"]
     inter = cfg["moe_intermediate_size"]
-    experts = cfg.get("num_experts") or cfg.get("n_routed_experts")
+    experts = (cfg.get("num_experts") or cfg.get("n_routed_experts")
+               or cfg.get("num_local_experts"))
     top_k = cfg.get("num_experts_per_tok") or cfg.get("top_k")
     layers = cfg["num_hidden_layers"]
 
