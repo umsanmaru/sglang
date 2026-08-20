@@ -105,7 +105,11 @@ class PrismExecutor:
         gate_band, up_band = prepared.warm.band(Proj.GATE), prepared.warm.band(Proj.UP)
         if gate_band is not None:
             warm_gu = torch.zeros(m, k, 2 * inter, dtype=torch.float32, device=hidden.device)
-            prev_done: Optional[torch.cuda.Event] = None
+            # WAR 시드: 이전 레이어의 down GEMM이 같은 arena 바이트를 읽는 중일 수
+            # 있다 (down이 gate/up storage를 alias + 레이어 간 재사용). 첫 stage가
+            # current stream의 기왕 작업 완료를 기다리게 한다.
+            prev_done = torch.cuda.Event()
+            prev_done.record(torch.cuda.current_stream())
             for group in groups:
                 evt_g = stage(gate_band, group, self._res.arena.view(Proj.GATE), res.warm_stream, prev_done)
                 evt_u = stage(up_band, group, self._res.arena.view(Proj.UP), res.warm_stream, None)
@@ -143,7 +147,12 @@ class PrismExecutor:
         if down_band is not None:
             warm_down = torch.zeros(m, k, h, dtype=torch.float32, device=hidden.device)
             act_band = act[:, :, down_band.k_offset : down_band.k_offset + down_band.k_rows].float()
-            prev_done = None
+            # WAR 시드: down arena는 gate/up storage를 alias — 첫 down stage는
+            # gateup GEMM(current stream)이 arena를 다 읽은 뒤에만 덮어야 한다.
+            # (이전의 prev_done=None은 잠복 레이스였고, slot당 host 동기화가
+            #  우연히 직렬화해 숨겨져 있었다 — sync-free 전환에서 발현, 2026-08-20)
+            prev_done = torch.cuda.Event()
+            prev_done.record(torch.cuda.current_stream())
             for group in groups:
                 evt = stage(down_band, group, self._res.arena.view(Proj.DOWN), res.warm_stream, prev_done)
                 cur = torch.cuda.current_stream()
