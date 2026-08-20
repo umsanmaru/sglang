@@ -72,11 +72,15 @@ class _PrismRuntime:
             from sglang.srt.layers.moe.prism.cold_backend import KtColdBackend
             from sglang.srt.layers.moe.prism.numa import numa_node_count
 
+            # 기본값 = 물리 코어 − 2 (HT 제외, 메인/tokenizer 여유).
+            # 과다구독은 submit/sync 고정비를 폭증시킨다 (실측 2026-08-20:
+            # 물리 16코어에 60스레드 → sync 회당 1.85ms, 14스레드 → 0.05ms).
+            default_threads = max(2, (os.cpu_count() or 4) // 2 - 2)
             self._cold = KtColdBackend(
                 self.plan,
                 max_tokens=self.max_tokens,
                 num_numa_nodes=numa_node_count(),
-                cpuinfer_threads=int(os.environ.get(_ENV_CPUINFER, "60")),
+                cpuinfer_threads=int(os.environ.get(_ENV_CPUINFER, str(default_threads))),
             )
         return self._cold
 
