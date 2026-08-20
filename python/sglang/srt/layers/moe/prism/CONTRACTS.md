@@ -79,14 +79,24 @@ submit/sync host-node 쌍을 통해 호출된다 (kt forward와 동일 기계).
 void forward_gateup_partial(int qlen, int k,
     const int64_t* expert_ids,   // [qlen × k], 두 phase가 같은 버퍼 재사용
     const void*    x,            // bf16 [qlen × hidden_FULL]  ← full-width
-    float*         out);         // fp32 [qlen × k × 2·inter], slot j ↔ expert_ids[m, j]
+    ggml_bf16_t*   out);         // bf16 [qlen × k × 2·inter], slot j ↔ expert_ids[m, j]
                                  //      열 [0, inter) = gate, [inter, 2·inter) = up
 
 void forward_down_partial(int qlen, int k,
     const int64_t* expert_ids,
-    const void*    act,          // bf16 [qlen × inter_FULL]   ← full-width
-    float*         out);         // fp32 [qlen × k × hidden]
+    const void*    act,          // bf16 [qlen × k × inter_FULL] ← full-width
+    ggml_bf16_t*   out);         // bf16 [qlen × k × hidden]
 ```
+
+> 개정 (2026-08-20, ⑤ 개정과 연동): out은 초판의 fp32에서 **bf16**으로
+> 변경 — kt의 `to_mat`(fp32 누산 → bf16 재료화) 동작을 무변경 재사용한다.
+> GEMM *누산*은 여전히 fp32(AMX 타일)이며, 합산 정밀도는 GPU rejoin이
+> fp32 누산으로 보장한다 (⑤).
+
+> 정오표 (2026-08-20): `act`의 초판 표기 `[qlen × inter_FULL]`은 오기.
+> act는 expert별 값이므로 slot 차원 k가 있어야 하며, 계약 ④의
+> `rejoin_gateup → [M, k, inter]`와 이렇게 정합된다. "full-width"의 의미는
+> inter 차원이 슬라이스되지 않았다는 뜻으로 불변.
 
 1. **대수 경계**: 두 partial 모두 "순수 GEMM 부분합"이다. gateup partial은
    activation **이전**(pre-act), down partial은 router 가중 **이전**.
@@ -116,6 +126,10 @@ class PreparedWeights:          # Stage 2의 유일한 산출물이자 lifetime 
     cold: ColdHandle            # C++ MOE 객체 핸들 — packed NUMA 메모리는 C++ 소유
 ```
 
+(`HotWeights`/`ColdHandle`은 미구현 자리 표시 — hot tier/K3 시점에 실물이
+생긴다. 현 구현(weights.py)에서 hot은 `None`, cold는 `PendingColdTensors`
+(backend 접속 전 임시 소유자)다.)
+
 - Stage 2 종료 후 full-K 텐서는 어디에도 존재하지 않는다.
 - weight 수명 = PreparedWeights의 수명.
 - warm의 pinned 메모리는 GPU DMA만 읽는다 (C++는 warm의 존재를 모른다).
@@ -130,16 +144,20 @@ class PreparedWeights:          # Stage 2의 유일한 산출물이자 lifetime 
 
 ```python
 def stage(proj, topk_ids, warm_store, arena, warm_stream) -> (SlotMap, cuda.Event)
-def run_warm(proj, x_or_act, slot_map, arena, evt_staged) -> Tensor      # fp32 [M, k, N]
+# slot: "이번 그룹의 i번째 distinct expert"라는 논리 인덱스. SlotMap은
+# proj 공유이되 물리 버퍼는 proj별 — arena slot 수는 proj당 n_slots
+# (기본 top_k)이고 gateup phase의 물리 상주는 gate+up = 2×n_slots.
+# distinct > n_slots(M>1)이면 executor가 n_slots 단위 그룹 직렬 루프.
+def run_warm(proj, x_or_act, slot_map, arena, evt_staged) -> Tensor      # bf16 [M, k, N] — ⑤
 def submit_cold(phase, x_or_act_gpu, staging, cold, stream) -> None
-def sync_cold(phase, staging, stream) -> Tensor                          # fp32 [M, k, N] (GPU)
-def rejoin_gateup(warm, cold, hot=None) -> Tensor    # fp32 합 → act → bf16 [M, k, inter]
-def rejoin_down(warm, cold, router_w, hot=None) -> Tensor  # 합 → 가중 expert합 → bf16 [M, hidden]
+def sync_cold(phase, staging, stream) -> Tensor                          # bf16 [M, k, N] (GPU) — ⑤ 개정
+def rejoin_gateup(warm, cold, hot=None) -> Tensor    # fp32 누산(cold upcast) → act → bf16 [M, k, inter]
+def rejoin_down(warm, cold, router_w, hot=None) -> Tensor  # fp32 누산 → 가중 expert합 → bf16 [M, hidden]
 ```
 
 | primitive | sync point | buffer 소유 |
 |---|---|---|
-| `stage` | S1: sel D2H 동기 (P0 유일의 host 블록) | arena는 ExecutionResources 소유 |
+| `stage` | S1: topk_ids D2H 동기 (P0 유일의 host 블록) | arena는 ExecutionResources 소유 |
 | `run_warm` | S2: evt_staged를 stream이 wait | 출력은 호출자 소유 (eager 신규 할당 허용) |
 | `submit_cold` | 없음 — **enqueue-only, 즉시 반환** | staging은 ExecutionResources 소유, `.copy_()` in-place만 |
 | `sync_cold` | S3: sync host node (CPU 완료 블록) | 〃 |
@@ -152,21 +170,46 @@ def rejoin_down(warm, cold, router_w, hot=None) -> Tensor  # 합 → 가중 expe
 - primitive는 영구 메모리를 절대 할당하지 않는다 — 전부 ExecutionResources
   에서 빌린다. ("Stage 4 이후 graph가 참조하는 storage identity는 바뀌지
   않는다"가 이 규칙 하나로 지켜진다.)
-- graph 경로에서 구현이 갈라지는 primitive는 `stage` 하나뿐이다 (S1이
-  데이터 의존 host 분기이므로 capture 불가). 나머지는 문자 그대로 같은
-  호출을 capture한다.
+- graph 경로에서 **구현이 교체되는** primitive는 `stage` 하나다 (S1이
+  데이터 의존 host 분기이므로 capture 불가 → device worklist + gather
+  커널). 단, 나머지가 "같은 호출"로 capture되는 것은 다음 전제 위에서다:
+  1. cold 바인딩은 kt 방식(args 영구 할당, `qlen` 등 가변값은 포인터
+     경유)으로 설계한다 — submit/sync가 eager와 graph에서 동일해지는
+     조건 (K3 설계 제약).
+  2. `run_warm`/`rejoin`은 shape-static하게 구동된다 — capture-bs별
+     최악치 고정 그룹 수, 패딩 slot은 쓰레기 계산 후 rejoin에서 소거.
+     데이터 의존 host 분기 금지. (동적 구동은 eager executor의 자유이고,
+     고정 구동은 graph 경로 executor의 책임 — primitive 자체는 양쪽에서
+     같은 callable.)
+  primitive 밖에서는 executor 구동 구조(동적 루프 ↔ 고정 패스),
+  capture-bs별 버퍼 등록, model_runner 접점 2줄이 graph 경로에서 추가된다.
 
 ---
 
-## ⑤ 수치 계약
+## ⑤ 수치 계약 (2026-08-20 개정)
 
-1. **부분합 dtype = fp32.** 티어 partial(C++ out, warm GEMM out, H2D 경로)은
-   전부 fp32이고, rejoin 합산·act·router 가중합까지 fp32로 수행 후 마지막에
-   bf16 캐스트. 근거: bf16 partial은 정확도 오차가 티어 경계 위치(= plan
-   내용)에 의존하게 되어 최악의 디버깅 지형을 만든다. fp32 partial이면
-   "어떤 plan이든 단일 GEMM의 fp32 누산과 동등" 한 문장으로 계약된다.
-2. **레퍼런스**: numpy fp32 단일-GEMM 레퍼런스에 대해, 임의 plan(경계 임의
-   배치 포함)에서 rejoin 결과가 tol 이내.
-3. **plan 불변성 테스트**: "hot=∅/warm=10%/cold=90%", "전부 cold", "전부
-   warm" plan들이 동일 입력에서 서로 일치해야 한다 — 레퍼런스 없이도
-   이중계산/누락을 잡는다.
+원칙: **누산은 항상 fp32, 재료화(wire)는 bf16** — kt의 기존 정밀도
+프로파일(GEMM 누산 fp32, 스테이지 경계마다 bf16 재료화, moe_base.hpp:44-46
+/ :560 / :708)과 동일한 클래스를 유지한다.
+
+1. **partial dtype = bf16, 예외 없음.** cold partial(C++ out, H2D 경로)은
+   kt `to_mat` 무변경 재사용으로 bf16. warm partial(GPU GEMM out)도 bf16 —
+   bf16 bmm이 내부 누산은 fp32(cuBLAS compute type 32F)로 하고 출력만
+   1회 라운딩하므로 cold와 같은 정밀도 클래스이며, fp32 출력을 고집하면
+   tensor core를 못 타 CUDA-core GEMM(수십 배 느림) + 입력 업캐스트
+   복사가 붙는다 (2026-08-20 재개정: 초판 개정의 "warm은 fp32 유지(무비용)"
+   판단은 계산 비용을 놓친 오류였음).
+2. **모든 합산은 fp32 누산.** rejoin의 티어 합산(bf16 partial들을 upcast),
+   act 계산, router 가중 expert 합까지 fp32로 수행 후 마지막에 bf16 캐스트.
+   warm GEMM의 내부 누산도 fp32 — bf16 split-K 환원 허용 플래그
+   (`allow_bf16_reduced_precision_reduction`)를 커널 안에서 끄고 복원한다.
+3. 정밀도 등급: kt 기존이 완성값을 bf16으로 1회 라운딩하는 자리에서,
+   우리는 tier별 partial이 각각 라운딩(≤ 티어 수만큼)된 뒤 fp32 합산 —
+   같은 클래스, 라운딩 이벤트 수만 증가.
+4. **레퍼런스**: fp64/fp32 단일-GEMM 레퍼런스 대비 tolerance 검증
+   (tolerance는 bf16 재료화 횟수를 반영).
+5. **plan 불변성 테스트 이원화**: bf16 라운딩이 밴드 경계에 의존하므로
+   일반 입력에서는 tolerance 비교. **exact 검출은 정확히 표현 가능한
+   입력**(작은 정수/2의 거듭제곱 — bf16 라운딩 무손실)으로 구성한 테스트가
+   담당한다: 그 입력에서 "전부 cold = 전부 warm = 혼합"은 비트일치여야
+   하며, 이것이 이중계산/누락의 exact 검출기다.
