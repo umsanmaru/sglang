@@ -127,8 +127,30 @@ void forward_down_partial(int qlen, int k,
 
    enabled == true이면 모든 range와 n_total은 **명시값**이다 ("0 = full"
    센티널 없음 — down이 full이면 `{0, intermediate_size}`로 적는다).
-   접근자 `gateup_k()`/`down_k()`/`n_total()`은 enabled == false일 때
-   full 치수를 돌려준다. (K2에서 per-node N-shard 테이블이 이 구조에 추가됨)
+   접근자 `gateup_k()`/`down_k()`/`n_total()`/`down_n()`은
+   enabled == false일 때 full 치수를 돌려준다.
+
+   K2 확장 — NUMA N-shard 테이블 (같은 구조체 안):
+
+   ```cpp
+   // top-level (Plan이 주입; 비어 있으면 TP ctor가 균등 분할):
+   std::vector<int> node_gateup_n_offset, node_gateup_n_rows;  // inter 축
+   std::vector<int> node_down_n_offset,  node_down_n_rows;     // hidden 축
+   // node-scope (TP ctor가 각 노드 config에 기록):
+   KRange gateup_n;  KRange down_n;
+   ```
+
+   전 proj가 각자의 N축으로 노드 분할되므로 (down도 hidden 축 —
+   GPU rejoin 왕복이 act-locality를 끊어 노드 합산이 불필요),
+   partial의 out은 gateup/down 모두 **노드별 서로소 열 direct write**다.
+   불균등 테이블 = warm 소켓의 cold 몫을 줄이는 비율 노브.
+
+   down partial 진입점 (gateup과 동형):
+   ```cpp
+   void forward_down_partial(int qlen, int k, const int64_t* expert_ids,
+       const void* act,        // bf16 [qlen × k × n_total] — rejoin#1 결과 D2H
+       ggml_bf16_t* out);      // bf16 [qlen × k × hidden_FULL], 자기 shard 열만
+   ```
 4. **완료 계약**: sync host node가 반환한 시점에 out은 완전히 쓰여 있다.
    sync 이전의 out 내용은 undefined. 패딩 토큰 slot의 출력은 쓰레기이며
    마스킹은 GPU 소관.
