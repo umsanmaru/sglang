@@ -25,10 +25,11 @@ Prism = K-split hot/warm/cold 티어링 MoE 오프로드. 패키지명이자 프
   - `GATE`, `UP`의 K = hidden_size / `DOWN`의 K = intermediate_size
 - N shard도 반개구간, 해당 proj의 출력 축.
   - `GATE`, `UP`의 N = intermediate_size / `DOWN`의 N = hidden_size
-- gate와 up은 **독립적으로 분할될 수 있다** (스키마 수준). 단 P0 실행은
-  cold 로드 시 `gate.bands == up.bands`를 요구한다 — 이는 C++ dual-pack
-  미구현이라는 capability gap이지 스키마 제약이 아니다. dual-pack 구현 시
-  로드 검증 한 줄만 제거된다.
+- **gate와 up은 K 밴드·N shard를 공유한다** (2026-08-20 확정 — 이
+  자유도는 부하 균형 목적상 중복이라 풀 계획 없음). 실행은 cold 로드
+  시 `gate == up` (bands·cold_shards)을 검증하고 위반 시 즉사한다.
+  스키마가 proj별 독립 표현을 허용하는 것은 공짜 일반성으로 남겨둔
+  것일 뿐 실행 계약이 아니다. down은 밴드·shard 모두 독립.
 - 밴드를 같게 맞추는 padding(작은 쪽을 union으로 확장)은 **planner의 결정**
   이다. 런타임은 받은 밴드를 집행할 뿐 스스로 padding하지 않는다.
 
@@ -110,6 +111,24 @@ void forward_down_partial(int qlen, int k,
    구워진다 (Plan → pack). 입력이 full-width이므로 cold 밴드가 비연속·다중이
    되어도 호출 시그니처는 불변이고, "pack된 weight와 호출 인자의 정합"이라는
    불변식 자체가 존재하지 않는다.
+
+   기하 운반자는 kt `GeneralMOEConfig`의 중첩 구조 `config.partial`이다
+   (K1에서 확정 — 이 구조가 두 저장소 간 계약이며, 변경 시 양쪽 동시 검토):
+
+   ```cpp
+   struct KRange { int offset; int rows; };   // [offset, offset+rows)
+   struct PartialGeometry {
+     bool enabled;    // false(기본) = 기존 kt와 비트 동일 동작 (침습성 상한)
+     KRange gateup;   // gate/up 공유 밴드 — K(hidden) 축
+     KRange down;     // down 밴드 — K(intermediate) 축, global 좌표
+     int n_total;     // gate/up 출력축(inter)의 full 크기 (TP shard 후에도 원본)
+   };
+   ```
+
+   enabled == true이면 모든 range와 n_total은 **명시값**이다 ("0 = full"
+   센티널 없음 — down이 full이면 `{0, intermediate_size}`로 적는다).
+   접근자 `gateup_k()`/`down_k()`/`n_total()`은 enabled == false일 때
+   full 치수를 돌려준다. (K2에서 per-node N-shard 테이블이 이 구조에 추가됨)
 4. **완료 계약**: sync host node가 반환한 시점에 out은 완전히 쓰여 있다.
    sync 이전의 out 내용은 undefined. 패딩 토큰 slot의 출력은 쓰레기이며
    마스킹은 GPU 소관.
