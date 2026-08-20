@@ -35,6 +35,10 @@ logger = logging.getLogger(__name__)
 _ENV_PLAN = "SGLANG_PRISM_PLAN"
 _ENV_MAX_TOKENS = "SGLANG_PRISM_MAX_TOKENS"
 _ENV_CPUINFER = "SGLANG_PRISM_CPUINFER_THREADS"
+# 실험 노브: 콤마 구분 NUMA node id 리스트 (예: "1" = node 1 단독).
+# 설정 시 subpool을 그 노드들에만 만들고, plan의 shard "node i"는
+# i번째 서브풀(= 리스트의 i번째 실제 노드)로 매핑된다. 미설정 = 전 노드.
+_ENV_NUMA_MAP = "SGLANG_PRISM_NUMA_MAP"
 
 
 class _PrismRuntime:
@@ -76,12 +80,32 @@ class _PrismRuntime:
             # 과다구독은 submit/sync 고정비를 폭증시킨다 (실측 2026-08-20:
             # 물리 16코어에 60스레드 → sync 회당 1.85ms, 14스레드 → 0.05ms).
             default_threads = max(2, (os.cpu_count() or 4) // 2 - 2)
-            self._cold = KtColdBackend(
-                self.plan,
-                max_tokens=self.max_tokens,
-                num_numa_nodes=numa_node_count(),
-                cpuinfer_threads=int(os.environ.get(_ENV_CPUINFER, str(default_threads))),
-            )
+            threads = int(os.environ.get(_ENV_CPUINFER, str(default_threads)))
+            numa_map = os.environ.get(_ENV_NUMA_MAP)
+            if numa_map:
+                from kt_kernel import kt_kernel_ext
+
+                nodes = [int(x) for x in numa_map.split(",")]
+                cfg = kt_kernel_ext.WorkerPoolConfig()
+                cfg.subpool_count = len(nodes)
+                cfg.subpool_numa_map = nodes
+                cfg.subpool_thread_count = [
+                    threads // len(nodes) + (1 if i < threads % len(nodes) else 0)
+                    for i in range(len(nodes))
+                ]
+                self._cold = KtColdBackend(
+                    self.plan,
+                    max_tokens=self.max_tokens,
+                    num_numa_nodes=len(nodes),
+                    cpuinfer=kt_kernel_ext.CPUInfer(cfg),
+                )
+            else:
+                self._cold = KtColdBackend(
+                    self.plan,
+                    max_tokens=self.max_tokens,
+                    num_numa_nodes=numa_node_count(),
+                    cpuinfer_threads=threads,
+                )
         return self._cold
 
 
