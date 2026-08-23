@@ -16,7 +16,14 @@ Prism의 "full 텐서 로드 → K-슬라이스 → 주입" 흐름과 겹치는 
     (full 텐서 소멸 — 계약 ③)
   apply: executor.run_layer 위임 한 줄
 
-P0 제약: TP=1, eager(--disable-cuda-graph) 전용.
+P0 제약: TP=1. eager는 모든 batch size에서 동작하는 경로이고, Task 8부터
+CUDA graph bs=1 decode도 지원한다 — 단 그래프 launch는 **반드시**
+`--cuda-graph-bs 1 --cuda-graph-max-bs 1`로 해야 한다. 이 두 플래그를 같이
+주지 않으면 sglang이 기본 bs 목록(1보다 큰 값 포함)으로 캡처를 시도하고,
+executor의 M==1 guard가 그 첫 bs>1 캡처 시도에서 즉시 `RuntimeError`를
+던져 launch 자체가 실패한다 (설계상 fail-fast — bs>1 캡처를 조용히 잘못
+실행하는 경우는 없다). 두 플래그가 맞으면 executor가 캡처 구간을 자동
+감지해 graph-safe 경로(device-sel gather + stream 통합 cold)를 탄다.
 """
 
 from __future__ import annotations
@@ -39,6 +46,24 @@ _ENV_CPUINFER = "SGLANG_PRISM_CPUINFER_THREADS"
 # 설정 시 subpool을 그 노드들에만 만들고, plan의 shard "node i"는
 # i번째 서브풀(= 리스트의 i번째 실제 노드)로 매핑된다. 미설정 = 전 노드.
 _ENV_NUMA_MAP = "SGLANG_PRISM_NUMA_MAP"
+# eager에서도 cold submit/sync를 stream host node로 보내는 opt-in.
+# (graph 경로는 env와 무관하게 항상 stream 통합 — executor 참조.)
+_ENV_COLD_STREAM = "SGLANG_PRISM_COLD_STREAM"
+
+
+def _sglang_capture_mode() -> bool:
+    """sglang CudaGraphRunner.capture() 구간(캡처 전 워밍업 2회 포함) 감지.
+
+    executor의 graph-safe 경로 선택 입력으로 주입된다 — 워밍업 run도 graph
+    경로를 타야 gather jit compile 같은 lazy init이 캡처 밖에서 끝난다.
+    외부 시스템(runner) 접촉은 조립 지점인 이 모듈에 둔다; import 실패
+    (runner 미탑재 경량 환경)는 False = "캡처 구간 아님"으로 처리한다.
+    """
+    try:
+        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+    except Exception:
+        return False
+    return get_is_capture_mode()
 
 
 class _PrismRuntime:
@@ -67,13 +92,15 @@ class _PrismRuntime:
 
             spec = ResourceSpec.from_plan(self.plan, max_tokens=self.max_tokens, device=device)
             self._resources = ExecutionResources(spec)
-            # 조립 지점: env 같은 외부 입력은 여기서 읽어 명시 인자로 주입한다
-            # (executor/stagers는 hidden input 없음).
+            # 조립 지점: env·runner 같은 외부 입력은 전부 여기서 읽어 명시
+            # 인자로 주입한다 (executor/stagers는 hidden input 없음).
             stager = select_stager(self._resources, graph_mode=False,
                                    override=os.environ.get(ENV_STAGER))
             self._executor = PrismExecutor(
                 self.plan, self._resources, self.cold(), resolve_gpu_kernel(self.plan.kernels.gpu_warm),
                 stager=stager,
+                cold_stream=os.environ.get(_ENV_COLD_STREAM) == "1",
+                capture_mode_fn=_sglang_capture_mode,
             )
         return self._executor
 

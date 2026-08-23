@@ -19,6 +19,9 @@ def expert_groups(unique_ids: Sequence[int], n_slots: int) -> list[list[int]]:
 
 
 class GroupingStrategy(Protocol):
+    # make_groups_for_graph는 이 Protocol의 멤버가 아니다 — SlotOrderGrouping
+    # 전용 메서드(graph 경로는 M==1이라 SlotOrderGrouping만 쓰인다; DedupGrouping
+    # 에는 정의돼 있지 않다).
     def make_groups(self, ids_cpu: torch.Tensor, n_slots: int) -> list[list[int]]: ...
     def scatter_gateup(self, warm_gu: torch.Tensor, topk_ids: torch.Tensor,
                        group: Sequence[int], gi: int, n_slots: int,
@@ -60,6 +63,14 @@ class SlotOrderGrouping:
 
     def make_groups(self, ids_cpu, n_slots):
         return expert_groups(ids_cpu.view(-1).tolist(), n_slots)
+
+    def make_groups_for_graph(self, k: int, n_slots: int) -> list[list[int]]:
+        """graph 캡처용 더미 그룹 (Task 8): M==1이면 그룹 조성에 host 결정이
+        없다 — 그룹은 항상 topk 슬롯 순서 절단이고, scatter_gateup/down_apply는
+        expert id가 아니라 위치만 쓰므로 내용은 자리 표지 [0..k)면 충분하다.
+        실제 expert 선택은 stager의 device sel(topk_ids에서 직접)이 나른다.
+        ids_cpu D2H가 decode 경로에서 완전히 사라지는 지점."""
+        return expert_groups(list(range(k)), n_slots)
 
     def scatter_gateup(self, warm_gu, topk_ids, group, gi, n_slots, gate_out, up_out, inter):
         j0, g = gi * n_slots, len(group)

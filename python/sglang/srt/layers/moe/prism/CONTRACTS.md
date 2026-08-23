@@ -239,6 +239,46 @@ def rejoin_down(warm, cold, router_w, hot=None) -> Tensor  # fp32 누산 → 가
   새지 않는다. env/외부 시스템 읽기는 전부 조립 지점(method.py)이 하고
   명시 인자로 주입한다.
 
+> **④ 개정 (2026-08-20, Task 8 — cuda-graph bs=1 구현으로 확정된 것):**
+>
+> 1. **"P0 strict blocking fill" 경계의 한정.** staging fill(`fill_x`/
+>    `fill_act`/`fill_expert_ids`)의 blocking D2H는 *cold 호출이 host 경로일
+>    때만* 필요한 완료 보장이었다. cold submit/sync가 current stream 경유
+>    (kt `submit_with_cuda_stream`/`sync_with_cuda_stream` =
+>    `cudaLaunchHostFunc` host node)로 가면, kt task는 같은 stream에서 fill
+>    D2H **뒤에** 실행되므로 host-측 완료 보장이 불필요해진다 — fill은
+>    `non_blocking=True`로 enqueue만 한다. eager 기본값은 여전히 P0
+>    blocking이고, stream 통합은 `SGLANG_PRISM_COLD_STREAM=1` opt-in 또는
+>    graph 경로에서 자동이다. (근거: 같은 kt 빌드의 cold-only + CUDA graph가
+>    이 host-node 패턴으로 정상 동작함을 실증, 2026-08-20.)
+> 2. **graph 경로에서 실제로 교체된 것**은 예고대로 `stage` 하나다
+>    (`GatherKernelStager.stage_from_device` — sel을 device topk_ids에서
+>    직접, pinned 경유/guard sync 없음). 단 "S1 소멸"의 형태가 확정됐다:
+>    M==1 + slot-order에서는 그룹 조성 자체에 host 결정이 없으므로 graph
+>    경로의 그룹은 위치 표지 `[0..k)` 절단이고 `ids_cpu` D2H는 존재하지
+>    않는다. cold의 expert_ids는 device topk_ids → pinned async D2H로
+>    내려간다 (캡처되어 replay마다 재실행).
+> 3. **"최악치 고정 그룹 수" 항은 bs=1에서 자연 충족**: M==1이면 그룹 수 =
+>    ceil(k / n_slots)로 상수다. bs>1 캡처는 미지원이며 executor가 즉사로
+>    방어한다 (조용한 오답 금지).
+> 4. **graph 경로의 qlen은 전용 상수 버퍼 `qlen_pin_graph`(=1)를 쓴다** —
+>    캡처가 baked하는 포인터를 eager의 `qlen_pin`과 공유하면 나중의 eager
+>    prefill 쓰기(`qlen_pin[0]=L`)에 노출돼 replay마다 cold가 L토큰 분량을
+>    계산하는 stale-share 버그가 된다 (Task 8 review Finding A, 2026-08-21
+>    실측: 30B decode 328→56 ms/tok). host 쓰기는 캡처 안에서 replay되지
+>    않으므로 "아무도 다시 쓰지 않는 상수 1"이 격리의 전제이고, M==1
+>    guard가 이를 보장한다.
+> 5. **host-측 즉시쓰기는 stream 순서의 보호를 받지 않는다.** `_expert_ids`의
+>    eager 경로(`fill_expert_ids(ids_cpu)`, host→host copy)와 `_qlen_pin`
+>    쓰기(`self._qlen_pin[0] = m`)는 둘 다 plain Python/CPU 메모리 연산이라
+>    GPU stream에 올라가지 않는다 — 뒤따르는 cold submit이 이 값들을 실제로
+>    읽기 *전에* 이 쓰기가 완료돼 있다는 보장은 stream이 주는 게 아니다.
+>    eager에서는 그 앞의 S1 blocking D2H(`topk_ids.to("cpu")`)가 사실상의
+>    throttle 역할을 해 이 순서를 우연히 지켜준다. S1을 나중에 제거하거나
+>    async로 바꾸면 이 host 쓰기들의 순서 보장이 조용히 사라진다 —
+>    "조용한 오답" 위험이므로, S1을 만지는 변경은 이 항목을 반드시 재검토
+>    해야 한다.
+
 ---
 
 ## ⑤ 수치 계약 (2026-08-20 개정)

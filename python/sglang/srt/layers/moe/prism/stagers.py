@@ -90,8 +90,17 @@ class BatchedCopyStager:
 
 
 class GatherKernelStager:
-    """device 인덱스 + UVA gather 커널 1 launch (env override
-    `SGLANG_PRISM_STAGER=gather` 또는 graph_mode 선택).
+    """device 인덱스 + UVA gather 커널 1 launch로 두 가지 역할을 겸한다:
+
+    - `stage()` (eager 경로): env override(`SGLANG_PRISM_STAGER=gather`)로
+      선택됐을 때 쓰인다. sel은 host `group_ids`(list[int])에서 와서
+      pinned 버퍼로 copy_ 후 H2D — flip 카운터 + guard event로 WAR를
+      막는다 (아래 문단). BatchedCopyStager의 scratch 더블버퍼와 동형.
+    - `stage_from_device()` (graph 경로): sel이 이미 device topk_ids
+      슬라이스이므로 host copy/H2D/guard가 전부 없다 — 캡처 가능한
+      순수 device-side stream op만 남는다. graph 경로는 이 메서드만
+      쓰고 `stage()`는 절대 호출하지 않는다 (flip/guard 상태가 무해하게
+      남아 있을 뿐 참조되지 않음).
 
     sel(선택 인덱스) 버퍼는 BatchedCopyStager의 scratch와 같은 WAR 계급이다:
     host copy_ → 비동기 H2D → gather 커널이 warm_stream에 순서대로 올라가므로,
@@ -125,18 +134,47 @@ class GatherKernelStager:
             if wait_event is not None:
                 warm_stream.wait_event(wait_event)
             sel_d = self._res.sel_device()[:g]
-            sel_d.copy_(sel_p, non_blocking=True)               # 32B H2D
+            sel_d.copy_(sel_p, non_blocking=True)               # 32B H2D (graph 고정점)
             gather_bands_from_pinned(band.weights, sel_d, arena_view[:g], warm_stream)
         evt = torch.cuda.Event()
         evt.record(warm_stream)
         self._guard[b] = evt
         return evt
 
+    def stage_from_device(self, band: WarmBand, sel_src: torch.Tensor,
+                          arena_view: torch.Tensor, warm_stream: torch.cuda.Stream,
+                          wait_event: Optional[torch.cuda.Event], proj: Proj
+                          ) -> torch.cuda.Event:
+        """graph-safe 스테이징 (Task 8): sel을 device 상주 topk_ids 슬라이스에서
+        직접 취한다 — pinned 경유 host copy/H2D/guard synchronize가 전부 없다.
+
+        전 연산이 device-side stream op라 CUDA graph 캡처 가능하고, replay마다
+        topk가 sel_device에 다시 쓰이므로 graph는 per-token 재패치 없이 재생된다
+        (planir kernels.cu:100-112의 "graph needs no per-token repointing").
+        sel_device는 단일 버퍼지만 warm_stream 위 쓰기라 stream 순서로
+        직렬화된다 — 더블버퍼/guard가 필요한 것은 host-측 쓰기(stage())뿐이다.
+
+        sel_src: int cuda [g] (통상 topk_ids.view(-1)의 슬라이스, int64) —
+        copy_가 int32로 device-cast한다 (별도 임시 텐서 없음).
+        """
+        g = sel_src.numel()
+        with torch.cuda.stream(warm_stream):
+            if wait_event is not None:
+                warm_stream.wait_event(wait_event)
+            sel_d = self._res.sel_device()[:g]
+            sel_d.copy_(sel_src)                                # device cast copy
+            gather_bands_from_pinned(band.weights, sel_d, arena_view[:g], warm_stream)
+        evt = torch.cuda.Event()
+        evt.record(warm_stream)
+        return evt
+
 
 def select_stager(resources, graph_mode: bool, override: Optional[str] = None) -> Stager:
     """staging 전략 선택. override(통상 env ENV_STAGER의 값 — 읽기는 호출자
     몫)가 있으면 그것이 우선, 없으면 graph_mode에 따라 갈린다: eager 기본값은
-    batched, graph_mode=True면 gather (device 인덱스라 graph 캡처와 호환).
+    batched. graph_mode=True로 고른 GatherKernelStager도 실제 graph 경로에서는
+    `stage()`가 아니라 `stage_from_device()`(device-sel, host copy/guard
+    없음)를 통해 호출된다 — executor._graph_stager_inst()가 그 경유점이다.
     """
     if override == "gather":
         return GatherKernelStager(resources)

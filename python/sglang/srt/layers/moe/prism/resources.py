@@ -150,24 +150,31 @@ class ColdStaging:
         self._partial_gateup = torch.empty(m, k, 2 * i, dtype=torch.bfloat16, **kw)
         self._partial_down = torch.empty(m, k, h, dtype=torch.bfloat16, **kw)
 
-    def _fill(self, buf: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    def _fill(self, buf: torch.Tensor, value: torch.Tensor,
+              non_blocking: bool = False) -> torch.Tensor:
+        # non_blocking=True는 cold stream 통합 경로(Task 8)용: D2H를 현재
+        # stream에 enqueue만 한다 — 소비자(kt host node)가 같은 stream에
+        # 순서대로 올라가므로 host-측 완료 보장이 불필요하고, CUDA graph
+        # 캡처도 가능해진다. 기본 False = P0 blocking 동작 그대로.
         if value.shape[0] > self.spec.max_tokens:
             raise ValueError(
                 f"{value.shape[0]} tokens exceed staging capacity "
                 f"{self.spec.max_tokens}"
             )
         view = buf[: value.shape[0]]
-        view.copy_(value)  # in-place만 — 계약 ④
+        view.copy_(value, non_blocking=non_blocking)  # in-place만 — 계약 ④
         return view
 
-    def fill_x(self, x: torch.Tensor) -> torch.Tensor:
-        return self._fill(self._x, x)
+    def fill_x(self, x: torch.Tensor, non_blocking: bool = False) -> torch.Tensor:
+        return self._fill(self._x, x, non_blocking)
 
-    def fill_expert_ids(self, ids: torch.Tensor) -> torch.Tensor:
-        return self._fill(self._expert_ids, ids)
+    def fill_expert_ids(self, ids: torch.Tensor, non_blocking: bool = False) -> torch.Tensor:
+        """ids: cpu int64 (eager) 또는 cuda int64 (graph 경로 — 캡처 가능한
+        async D2H로 pinned int64 버퍼에 내린다; dtype은 _expert_ids와 동일)."""
+        return self._fill(self._expert_ids, ids, non_blocking)
 
-    def fill_act(self, act: torch.Tensor) -> torch.Tensor:
-        return self._fill(self._act, act)
+    def fill_act(self, act: torch.Tensor, non_blocking: bool = False) -> torch.Tensor:
+        return self._fill(self._act, act, non_blocking)
 
     # ── cold submit에 넘기는 원시 주소들 ──────────────────────────────────
     # C++ 경계는 포인터가 곧 인터페이스다 — executor가 내부 버퍼(_x 등)를

@@ -14,15 +14,27 @@
 - 누산은 전부 fp32, 재료화는 bf16 (계약 ⑤).
 - 그룹 직렬 루프의 arena WAR은 이벤트 체인으로 보장: 그룹 g+1의 stage는
   그룹 g의 GEMM 완료 이벤트를 warm stream에서 기다린다.
-- 이 모듈은 env를 직접 읽지 않는다 (NVTX 태그 게이트 제외): 구성 입력은
-  전부 생성자 주입 — env 읽기는 조립 지점(method.py)의 몫이다.
+
+graph-safe 경로 (Task 8, M==1 전용 — 캡처 중 자동 선택):
+- per-token host 결정 제거: ids_cpu D2H 없이 그룹은 위치 표지 [0..k) 절단,
+  expert 선택은 stager가 device topk_ids에서 직접(sel_device) 나른다.
+- cold submit/sync는 current stream 경유(kt cudaLaunchHostFunc host node)로
+  캡처되고, staging D2H/H2D는 전부 non_blocking stream op — replay마다
+  재실행되어 그 시점의 topk/hidden을 나른다.
+- eager에서도 cold stream 통합만 opt-in 가능 (생성자 cold_stream — env
+  SGLANG_PRISM_COLD_STREAM 읽기는 조립 지점 method.py의 몫).
+
+이 모듈은 env/외부 시스템을 직접 읽지 않는다: 모드 결정 입력(cold_stream,
+capture_mode_fn)은 전부 생성자 주입이고, 호출별 모드는 _plan_flow()가
+_LayerFlow 값 객체로 1회 확정한다.
 """
 
 from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import Optional
+from dataclasses import dataclass
+from typing import Callable, Optional, Sequence
 
 import torch
 
@@ -54,12 +66,28 @@ def _nvtx_pop() -> None:
         torch.cuda.nvtx.range_pop()
 
 from sglang.srt.layers.moe.prism.cold_backend import ColdBackend
-from sglang.srt.layers.moe.prism.grouping import select_grouping
+from sglang.srt.layers.moe.prism.grouping import GroupingStrategy, select_grouping
 from sglang.srt.layers.moe.prism.kernels import WarmGemmFn
 from sglang.srt.layers.moe.prism.plan import Plan, Proj, Tier
 from sglang.srt.layers.moe.prism.resources import ExecutionResources
-from sglang.srt.layers.moe.prism.stagers import Stager
+from sglang.srt.layers.moe.prism.stagers import GatherKernelStager, Stager
 from sglang.srt.layers.moe.prism.weights import PreparedWeights
+
+
+@dataclass(frozen=True)
+class _LayerFlow:
+    """run_layer 한 호출의 실행 모드 — _plan_flow()가 상단에서 1회 확정하는
+    값 객체. (모드 플래그들이 함수 본문과 helper 인자를 관통하며 흩어지는 것을
+    막는다 — 실행 모드가 늘면 여기와 _plan_flow만 늘어난다.)"""
+
+    graph_flow: bool                    # graph-safe 경로인가 (캡처/워밍업/강제)
+    use_cold_stream: bool               # cold 호출을 stream host node로 보낼 것인가
+    stream_arg: Optional[int]           # cold submit/sync의 cudaStream_t (None = host 경로)
+    qlen_ptr: int                       # cold task가 역참조할 qlen 버퍼 주소
+    grouping: GroupingStrategy
+    groups: list[list[int]]
+    flat_ids: Optional[torch.Tensor]    # graph 경로 sel 원천 (device int64 [k]) / eager는 None
+    ids_cpu: Optional[torch.Tensor]     # eager 경로 expert_ids 원천 / graph는 None
 
 
 class PrismExecutor:
@@ -67,16 +95,37 @@ class PrismExecutor:
 
     def __init__(self, plan: Plan, resources: ExecutionResources,
                  cold: Optional[ColdBackend], gpu_warm_kernel: WarmGemmFn,
-                 stager: Stager):
+                 stager: Stager, *,
+                 cold_stream: bool = False,
+                 force_graph_path: bool = False,
+                 capture_mode_fn: Optional[Callable[[], bool]] = None):
+        """cold_stream: eager에서도 cold submit/sync를 stream 통합으로 (opt-in).
+        force_graph_path: 캡처 없이 graph-safe 경로 강제 (테스트/디버그).
+        capture_mode_fn: sglang CudaGraphRunner의 capture 구간(캡처 전 워밍업
+        포함) 신호 — 조립 지점이 주입한다. None이면 실제 stream 캡처 중에만
+        graph 경로를 탄다 (워밍업의 lazy init이 캡처 안으로 밀리므로, sglang
+        통합 실행에서는 반드시 주입할 것 — method.py 참조)."""
         self._plan = plan
         self._res = resources
         self._cold = cold
         self._warm_gemm = gpu_warm_kernel
         self._stager = stager
+        self._cold_stream = cold_stream
+        self._force_graph_path = force_graph_path
+        self._capture_mode_fn = capture_mode_fn or (lambda: False)
         self._layers: dict[int, PreparedWeights] = {}
         self._layer_has_cold: dict[int, bool] = {}
         # cold task가 나중에 읽는 qlen — 주소 고정 멤버 (계약 ④의 포인터 경유)
         self._qlen_pin = torch.zeros(1, dtype=torch.int32)
+        # graph 경로 전용 qlen 버퍼 — eager의 _qlen_pin과 절대 공유하지 않는다.
+        # graph flow는 M==1만 허용(아래 guard)하므로 상수 1이며, 캡처 후에도
+        # 아무도 다시 쓰지 않는다. 공유하면: 캡처가 baked하는 포인터가 나중의
+        # eager prefill(self._qlen_pin[0] = L)에 노출되고, 그 후의 모든 graph
+        # replay가 cold를 L토큰짜리로 돌려 perf가 붕괴한다 (review Finding A,
+        # 실측 30B decode graph 328ms/tok vs eager 106ms/tok — 원인이 바로
+        # 이 stale 공유 포인터였다).
+        self._qlen_pin_graph = torch.ones(1, dtype=torch.int32)
+        self._graph_stager: Optional[GatherKernelStager] = None
 
     def register_layer(self, layer_idx: int, prepared: PreparedWeights) -> None:
         """Stage 2 산출물 등록. cold 밴드가 있으면 backend에 이미 load_layer된
@@ -87,6 +136,51 @@ class PrismExecutor:
             raise RuntimeError(f"layer {layer_idx} has COLD bands but no cold backend")
         self._layers[layer_idx] = prepared
         self._layer_has_cold[layer_idx] = has_cold
+
+    # ── 모드 결정 ──────────────────────────────────────────────────────────
+    def _plan_flow(self, m: int, k: int, topk_ids: torch.Tensor) -> _LayerFlow:
+        """호출별 실행 모드를 1회 확정. graph-safe 경로는 캡처 중 불법 연산
+        (pageable D2H, tolist, event.synchronize, blocking copy)을 전부
+        우회해야 하므로, 여기서 갈라진 결정이 본문의 유일한 분기 원천이다."""
+        graph_flow = (
+            torch.cuda.is_current_stream_capturing()
+            or self._force_graph_path
+            or self._capture_mode_fn()
+        )
+        # cold stream 통합: graph 경로는 필수(호출이 kt host node로 캡처돼야
+        # 함), eager는 생성자 opt-in. None이면 기존 host 경로 (P0 그대로).
+        use_cold_stream = graph_flow or self._cold_stream
+        stream_arg = (
+            torch.cuda.current_stream().cuda_stream if use_cold_stream else None
+        )
+        if graph_flow:
+            # 그룹 조성에 host 결정 없음: M==1 + slot-order 전제에서 그룹은
+            # 항상 위치 표지 [0..k) 절단 — ids_cpu D2H 자체가 사라진다.
+            # qlen도 격리된 상수 버퍼(1)를 쓴다 (Finding A).
+            if m != 1:
+                raise RuntimeError(
+                    f"prism graph path requires M==1 (bs=1), got M={m} — "
+                    f"capture with cuda_graph_bs=[1] (and cuda_graph_max_bs=1)"
+                )
+            grouping = select_grouping(1)  # SlotOrderGrouping 싱글턴
+            return _LayerFlow(
+                graph_flow=True, use_cold_stream=True, stream_arg=stream_arg,
+                qlen_ptr=self._qlen_pin_graph.data_ptr(),
+                grouping=grouping,
+                groups=grouping.make_groups_for_graph(k, self._res.spec.n_slots),
+                flat_ids=topk_ids.view(-1),  # device int64 [k] — stager의 sel 원천
+                ids_cpu=None,
+            )
+        # S1: topk D2H (P0 유일의 host 블록) + dedup
+        with _nvtx("s1.topk_d2h+dedup"):
+            ids_cpu = topk_ids.to("cpu")
+            grouping = select_grouping(m)
+            groups = grouping.make_groups(ids_cpu, self._res.spec.n_slots)
+        return _LayerFlow(
+            graph_flow=False, use_cold_stream=use_cold_stream, stream_arg=stream_arg,
+            qlen_ptr=self._qlen_pin.data_ptr(),
+            grouping=grouping, groups=groups, flat_ids=None, ids_cpu=ids_cpu,
+        )
 
     # ── 본체 ──────────────────────────────────────────────────────────────
     def run_layer(self, layer_idx: int, hidden: torch.Tensor,
@@ -100,24 +194,35 @@ class PrismExecutor:
         inter, h = dims.intermediate_size, dims.hidden_size
 
         _nvtx_push(f"prism.L{layer_idx}")
-
-        # S1: topk D2H (P0 유일의 host 블록) + dedup
-        with _nvtx("s1.topk_d2h+dedup"):
-            ids_cpu = topk_ids.to("cpu")
-            grouping = select_grouping(m)
-            groups = grouping.make_groups(ids_cpu, res.spec.n_slots)
+        flow = self._plan_flow(m, k, topk_ids)
 
         # ── Phase 1: gateup ──────────────────────────────────────────────
         if has_cold:
             with _nvtx("cold.gu.fill_x(D2H-block)"):
-                res.staging.fill_x(hidden)        # blocking D2H (P0 strict)
-                res.staging.fill_expert_ids(ids_cpu)
-                self._qlen_pin[0] = m
+                # stream 통합 시 non_blocking: kt host node가 같은 stream에
+                # 순서대로 실행되므로 host-측 완료 보장이 불필요 (Task 8 —
+                # CONTRACTS ④ 개정). 기본은 P0 blocking 그대로.
+                res.staging.fill_x(hidden, non_blocking=flow.use_cold_stream)
+                if flow.graph_flow:
+                    # device topk_ids → pinned int64 async D2H (캡처 가능;
+                    # kt는 pinned를 읽는다). ids_cpu는 이 경로에 존재하지 않음.
+                    res.staging.fill_expert_ids(topk_ids, non_blocking=True)
+                    # qlen_pin_graph는 상수 1(M==1 guard가 보장) — 아무도
+                    # 다시 쓰지 않는다. 격리가 깨지지 않았는지만 방어적으로
+                    # 확인 (host 메모리 읽기라 capture-safe).
+                    assert int(self._qlen_pin_graph[0]) == 1, (
+                        f"qlen_pin_graph={int(self._qlen_pin_graph[0])} != 1 — "
+                        f"graph path must never write this buffer"
+                    )
+                else:
+                    res.staging.fill_expert_ids(flow.ids_cpu)
+                    self._qlen_pin[0] = m
             with _nvtx("cold.gu.submit"):
                 self._cold.submit_gateup(         # enqueue-only, 즉시 반환
-                    layer_idx, self._qlen_pin.data_ptr(), k,
+                    layer_idx, flow.qlen_ptr, k,
                     res.staging.expert_ids_ptr(), res.staging.x_ptr(),
                     res.staging.partial_gateup_ptr(),
+                    cuda_stream=flow.stream_arg,
                 )
             _nvtx_push("cold.gu.window")          # CPU expert 연산 재실 구간
 
@@ -130,13 +235,11 @@ class PrismExecutor:
             # current stream의 기왕 작업 완료를 기다리게 한다.
             prev_done = torch.cuda.Event()
             prev_done.record(torch.cuda.current_stream())
-            for gi, group in enumerate(groups):
+            for gi, group in enumerate(flow.groups):
                 with _nvtx(f"warm.gu.g{gi}x{len(group)}"):
                     with _nvtx("stage.gate+up(H2D)"):
-                        evt_g = self._stager.stage(gate_band, group, self._res.arena.view(Proj.GATE),
-                                                   res.warm_stream, prev_done, Proj.GATE)
-                        evt_u = self._stager.stage(up_band, group, self._res.arena.view(Proj.UP),
-                                                   res.warm_stream, None, Proj.UP)
+                        evt_g = self._stage(gate_band, group, gi, prev_done, Proj.GATE, flow)
+                        evt_u = self._stage(up_band, group, gi, None, Proj.UP, flow)
                     cur = torch.cuda.current_stream()
                     cur.wait_event(evt_g)
                     cur.wait_event(evt_u)
@@ -146,18 +249,26 @@ class PrismExecutor:
                     with _nvtx("gemm.up"):
                         up_out = self._warm_gemm(hidden, self._res.arena.view(Proj.UP)[:g], up_band.k_offset)
                     with _nvtx("scatter.gu"):
-                        grouping.scatter_gateup(warm_gu, topk_ids, group, gi, res.spec.n_slots,
-                                                gate_out, up_out, inter)
+                        flow.grouping.scatter_gateup(warm_gu, topk_ids, group, gi, res.spec.n_slots,
+                                                     gate_out, up_out, inter)
                     prev_done = torch.cuda.Event()
                     prev_done.record(cur)
 
         cold_gu = None
         if has_cold:
             with _nvtx("cold.gu.sync(host-block)"):
-                self._cold.sync()                 # S3: CPU 완료 블록
+                # stream 통합 시 sync는 stream에 올라간 host node — host는
+                # 즉시 반환하고, 이후 consumer들이 stream 순서로 보호된다.
+                self._cold.sync(cuda_stream=flow.stream_arg)  # S3: CPU 완료 블록
             _nvtx_pop()                           # cold.gu.window
             with _nvtx("cold.gu.h2d_out"):
-                cold_gu = res.staging.gateup_out(m).to(hidden.device)  # H2D
+                # pinned → cuda H2D. stream 통합 시 non_blocking (기본 .to()의
+                # 말미 streamSynchronize는 캡처 불가). 이 pinned 버퍼의 다음
+                # writer(다음 레이어의 cold task)도 같은 stream의 host node라
+                # WAR는 stream 순서로 보호된다.
+                cold_gu = res.staging.gateup_out(m).to(
+                    hidden.device, non_blocking=flow.use_cold_stream
+                )
 
         # rejoin#1: fp32 합 → act → bf16 (계약 ⑤)
         with _nvtx("rejoin1.acc+silu"):
@@ -168,12 +279,13 @@ class PrismExecutor:
         # ── Phase 2: down ────────────────────────────────────────────────
         if has_cold:
             with _nvtx("cold.dn.fill_act(D2H-block)"):
-                res.staging.fill_act(act)
+                res.staging.fill_act(act, non_blocking=flow.use_cold_stream)
             with _nvtx("cold.dn.submit"):
                 self._cold.submit_down(
-                    layer_idx, self._qlen_pin.data_ptr(), k,
+                    layer_idx, flow.qlen_ptr, k,
                     res.staging.expert_ids_ptr(), res.staging.act_ptr(),
                     res.staging.partial_down_ptr(),
+                    cuda_stream=flow.stream_arg,
                 )
             _nvtx_push("cold.dn.window")
 
@@ -188,27 +300,28 @@ class PrismExecutor:
             #  우연히 직렬화해 숨겨져 있었다 — sync-free 전환에서 발현, 2026-08-20)
             prev_done = torch.cuda.Event()
             prev_done.record(torch.cuda.current_stream())
-            for gi, group in enumerate(groups):
+            for gi, group in enumerate(flow.groups):
                 with _nvtx(f"warm.dn.g{gi}x{len(group)}"):
                     with _nvtx("stage.down(H2D)"):
-                        evt = self._stager.stage(down_band, group, self._res.arena.view(Proj.DOWN),
-                                                 res.warm_stream, prev_done, Proj.DOWN)
+                        evt = self._stage(down_band, group, gi, prev_done, Proj.DOWN, flow)
                     cur = torch.cuda.current_stream()
                     cur.wait_event(evt)
                     w = self._res.arena.view(Proj.DOWN)
                     with _nvtx("gemm+where.dn"):
-                        warm_down = grouping.down_apply(warm_down, topk_ids, group, gi,
-                                                        res.spec.n_slots, act_band, w)
+                        warm_down = flow.grouping.down_apply(warm_down, topk_ids, group, gi,
+                                                             res.spec.n_slots, act_band, w)
                     prev_done = torch.cuda.Event()
                     prev_done.record(cur)
 
         cold_down = None
         if has_cold:
             with _nvtx("cold.dn.sync(host-block)"):
-                self._cold.sync()
+                self._cold.sync(cuda_stream=flow.stream_arg)
             _nvtx_pop()                           # cold.dn.window
             with _nvtx("cold.dn.h2d_out"):
-                cold_down = res.staging.down_out(m).to(hidden.device)
+                cold_down = res.staging.down_out(m).to(
+                    hidden.device, non_blocking=flow.use_cold_stream
+                )
 
         # rejoin#2: fp32 합 → router 가중 expert합 → bf16
         with _nvtx("rejoin2.acc+wsum"):
@@ -218,6 +331,33 @@ class PrismExecutor:
         return out.to(torch.bfloat16)
 
     # ── helpers ──────────────────────────────────────────────────────────
+    def _stage(self, band, group: Sequence[int], gi: int,
+               wait_event: Optional[torch.cuda.Event], proj: Proj,
+               flow: _LayerFlow) -> torch.cuda.Event:
+        """스테이징 디스패치: eager는 주입된 stager(group_ids 경유), graph는
+        GatherKernelStager.stage_from_device(device topk 슬라이스 경유).
+        graph 그룹은 위치 표지이므로 sel은 flat_ids의 같은 위치 절단이다."""
+        arena_view = self._res.arena.view(proj)
+        if flow.graph_flow:
+            j0 = gi * self._res.spec.n_slots
+            sel = flow.flat_ids[j0 : j0 + len(group)]
+            return self._graph_stager_inst().stage_from_device(
+                band, sel, arena_view, self._res.warm_stream, wait_event, proj
+            )
+        return self._stager.stage(
+            band, group, arena_view, self._res.warm_stream, wait_event, proj
+        )
+
+    def _graph_stager_inst(self) -> GatherKernelStager:
+        """graph 경로 전용 stager (지연 생성). eager stager가 이미 gather면
+        재사용 — stage_from_device는 flip/guard 상태를 안 쓰므로 무해하다."""
+        if self._graph_stager is None:
+            if isinstance(self._stager, GatherKernelStager):
+                self._graph_stager = self._stager
+            else:
+                self._graph_stager = GatherKernelStager(self._res)
+        return self._graph_stager
+
     @staticmethod
     def _accumulate(warm: Optional[torch.Tensor], cold: Optional[torch.Tensor],
                     shape, device) -> torch.Tensor:
