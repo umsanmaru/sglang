@@ -210,7 +210,15 @@ def rejoin_down(warm, cold, router_w, hot=None) -> Tensor  # fp32 누산 → 가
   어떤 경우에도 submit에서 하지 않는다 (CPU/GPU overlap의 존립 조건).
 - primitive는 영구 메모리를 절대 할당하지 않는다 — 전부 ExecutionResources
   에서 빌린다. ("Stage 4 이후 graph가 참조하는 storage identity는 바뀌지
-  않는다"가 이 규칙 하나로 지켜진다.)
+  않는다"가 이 규칙 하나로 지켜진다.) `stage`의 host-측 결집 스크래치/인덱스
+  (예: BatchedCopyStager의 `stage_scratch`/`stage_index`)도 예외 없이
+  ExecutionResources 소유 — stager는 매 호출마다 빌릴 뿐 할당하지 않는다.
+  `stage_scratch`는 proj당 2벌(더블버퍼) + 이벤트 가드로 소유한다 — H2D는
+  enqueue-only라 언제 실제로 scratch를 읽는지 host가 모르므로, 단일 버퍼
+  재사용은 "이전 H2D가 다 읽기 전에 host가 재기록"하는 WAR corruption을
+  낸다(2026-08-20 Critical review finding). stager는 버퍼를 flip해 쓰고
+  같은 버퍼로 돌아올 때만 그 버퍼를 마지막에 읽은 H2D 완료 이벤트를
+  host-wait한다 — `stage_index`는 host index_select가 동기 소비라 예외.
 - graph 경로에서 **구현이 교체되는** primitive는 `stage` 하나다 (S1이
   데이터 의존 host 분기이므로 capture 불가 → device worklist + gather
   커널). 단, 나머지가 "같은 호출"로 capture되는 것은 다음 전제 위에서다:

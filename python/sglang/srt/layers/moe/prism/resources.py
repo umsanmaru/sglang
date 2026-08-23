@@ -187,3 +187,53 @@ class ExecutionResources:
         self.warm_stream = torch.cuda.Stream(device=spec.device)
         self.evt_staged = torch.cuda.Event()
         self.evt_act = torch.cuda.Event()
+        # 계약 ④: BatchedCopyStager의 host-측 결집 스크래치도 리소스가 소유한다.
+        # proj당 2벌(더블버퍼) — 이전 H2D가 아직 읽는 중인 버퍼를 다음 호출의
+        # host index_select가 덮어쓰는 WAR를 막기 위함 (stager가 이벤트로 가드).
+        self._stage_scratch = {
+            p: [
+                torch.empty(self.arena.view(p).shape, dtype=torch.bfloat16).pin_memory()
+                for _ in range(2)
+            ]
+            for p in Proj
+        }
+        # stage_index는 1벌만: BatchedCopyStager.stage() 안에서 host
+        # index_select가 동기적으로 다 읽고 끝나므로(H2D처럼 비동기로 남는 게
+        # 아님) 다음 호출이 덮어써도 WAR가 없다 — 더블버퍼 불필요.
+        self._stage_index = torch.empty(spec.n_slots, dtype=torch.int64)
+        # GatherKernelStager의 sel 버퍼. host copy_ → 비동기 H2D → gather 커널
+        # 순으로 warm_stream에 태우므로 BatchedCopyStager의 scratch와 동일한
+        # WAR 위험이 있다 — 2벌(더블버퍼)로 소유한다. sel은 proj별이 아니라
+        # 한 그룹의 gate/up/down 3회 stage() 호출에 동일 내용으로 재사용되므로
+        # (proj, slot) 키가 아니라 slot만으로 충분하다 (stager가 flip+guard로
+        # 관리). sel_device는 디바이스측 쓰기라 스트림 순서로 자동 직렬화되므로
+        # 단일 버퍼면 된다.
+        self._sel_pinned = [
+            torch.empty(spec.n_slots, dtype=torch.int32).pin_memory()
+            for _ in range(2)
+        ]
+        self._sel_device = torch.empty(
+            spec.n_slots, dtype=torch.int32, device=spec.device
+        )
+
+    def stage_scratch(self, proj: Proj, slot: int) -> torch.Tensor:
+        """pinned host 결집 스크래치, arena.view(proj)와 동형 [n_slots, k_warm, N].
+
+        slot은 0/1 — BatchedCopyStager가 소유한 더블버퍼 중 하나를 고른다."""
+        return self._stage_scratch[proj][slot]
+
+    def stage_index(self) -> torch.Tensor:
+        """pinned int64 [n_slots] — BatchedCopyStager의 index_select 인덱스.
+        host에서 동기 소비되므로(index_select가 즉시 다 읽음) 단일 버퍼로 충분."""
+        return self._stage_index
+
+    def sel_pinned(self, slot: int) -> torch.Tensor:
+        """pinned int32 [n_slots] — GatherKernelStager의 expert-index 스테이징.
+        slot은 0/1 더블버퍼 중 하나 (H2D WAR 방지, stagers.py의
+        GatherKernelStager 참조)."""
+        return self._sel_pinned[slot]
+
+    def sel_device(self) -> torch.Tensor:
+        """device int32 [n_slots] — gather 커널의 sel_device 인자.
+        device측 쓰기는 stream-ordered이므로 단일 버퍼로 충분."""
+        return self._sel_device
