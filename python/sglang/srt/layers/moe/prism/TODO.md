@@ -57,17 +57,62 @@ eager decode도 함께 해제 (qlen ≤ max_len 범위 guard로 대체). 테스�
 decode/prefill 파라미터화 (중복 expert 필연 구성 + 정수 비트일치가 좌표
 뒤섞임 검출) + 불균등 shard × prefill 조합.
 
+## ~~stage 일괄화 (H2D 26→3/층)~~ — ✅ 완료 (2026-08-21)
+
+NVTX 실측(2026-08-20)에서 slot당 `copy_` 산란이 층당 H2D 26조각 + dispatch를
+만들어 ~1.4ms/층의 오버헤드였다. `BatchedCopyStager`(host `index_select`로
+결집 → H2D 1회/proj, 스크래치는 더블버퍼 + guard event로 WAR 방어)로 치환해
+`select_stager`의 eager 기본값이 됐다. 등가성은 `PerSlotCopyStager` 대비
+bitwise(`torch.equal`)로 검증 (test/prism/test_stagers.py).
+
+## ~~graph bs=1 (GatherKernelStager)~~ — ✅ 완료 (2026-08-21)
+
+`GatherKernelStager.stage_from_device`(sel을 device 상주 topk_ids 슬라이스에서
+직접 취함 — host copy/H2D/guard 전부 없음)와 cold submit/sync의 stream 통합
+(kt `submit_with_cuda_stream`/`sync_with_cuda_stream` = `cudaLaunchHostFunc`
+host node)을 조합해 M==1 decode를 캡처 가능하게 만들었다. `SlotOrderGrouping`이
+그룹 조성에 host 결정이 없다는 전제(Task 2)와 맞물려 S1(`ids_cpu` D2H)이
+decode 경로에서 완전히 소멸한다.
+
+**30B 단일소켓 실측** (아래 표 참조): eager 106.24ms/tok → graph **56.10ms/tok**
+(17.8 tok/s) — cold-only graph(55.91ms/tok)와 동급. 즉 warm 10% 오프로드가
+주는 CPU 절감(~4.8ms)이 graph 경로의 host-node/오버헤드로 상쇄된다: 단일소켓
+8스레드에서는 cold 대역(이론 바닥 ~43ms/tok) 자체가 지금의 성능 상한이고,
+이 상한을 낮추지 않는 한 warm 비율을 더 키워도 graph에서는 잘 보이지 않는다.
+bs>1 decode는 여전히 eager 폴백(persistent GEMV 전까지 — 아래 순위 참조).
+
+## 다음 후보 순위 (2026-08-21, graph bs=1 완료 후 재평가)
+
+graph bs=1로 "산란 dispatch"와 "S1 host 블록"이라는 두 개의 오버헤드 항목이
+사라지면서, 남은 바닥은 거의 전부 cold 자체의 실행 시간이다. 그 관찰을 반영해
+순위를 다음으로 재정리한다 (이전 순위는 이 관찰이 없던 상태에서 작성됐음):
+
+1. **cold-down deferral** (아래 항목 상세) — 가장 큰 항목이며 여전히 착수
+   전. down partial을 1-layer 지연시켜 다음 층 GEMM 아래로 숨기면, 노출된
+   cold 대역 자체가 줄어든다 — graph가 손대지 못하는 유일한 층.
+2. **warm 비율 확대 / 스레드(소켓) 확장** — 단일소켓 8스레드에서 cold
+   43ms/tok가 이미 이론 바닥이라, graph를 얹어도 56ms/tok에서 멈춘다.
+   다음 이득은 cold 대역 자체를 줄이는 데서만 나온다: warm이 흡수하는
+   expert 비율을 늘리거나(밴드 재산정), 스레드/소켓을 확장해 cold GEMM의
+   실측 시간을 낮춘다. 둘 다 planner/calibration 쪽 작업이라 이 저장소
+   범위 밖일 수 있음 — 착수 전 실측으로 어느 쪽이 더 싼지 확인 필요.
+3. **persistent GEMV** (warm GEMM 커널 교체, 아래 항목 상세) — bs>1 graph의
+   선결 조건이자 torch_bmm placeholder의 낭비(라우팅 안 된 (토큰,expert)
+   쌍까지 계산)를 없앤다. bs=1 decode 성능에는 당장 이득이 작음(그룹이
+   이미 1개) — bs>1 스코프를 열 때 다시 최우선이 된다.
+4. **prefill distinct 카운터** (아래 "warm 전송 ping-pong"의 선행 실측) —
+   ping-pong 착수 여부를 결정할 데이터이지만, prefill 경로 자체가 아직
+   decode보다 우선순위가 낮아 순위 최하단.
+
 ## 기타 미룸 항목 (합의된 것만, 요약)
 
-- **CUDA graph 경로 — 1차 스코프는 decode bs=1** (2026-08-20 결정):
-  M=1이면 distinct ≤ top_k라 그룹이 항상 1개 → 최악치 고정 그룹/패딩
-  낭비 문제가 공짜로 소멸하고 run_warm/rejoin이 자명하게 shape-static.
-  bs>1 decode는 eager 폴백 (`--cuda-graph-bs 1`). bs=1이어도 필요한 것:
-  GatherKernelStager(device dedup+worklist — topk_ids D2H는 bs=1에도
-  capture 불가), 포인터 간접 바인딩(계약 ④ 전제 ①), capture-bs 등록
-  (cuda_graph_runner.py:496 옆), VRAM 예약 회계(model_runner.py:593 옆).
-  bs>1 graph는 그 다음: persistent GEMV(worklist 네이티브)로 그룹 문제
-  자체를 제거하는 planir 방식.
+- **CUDA graph 경로, bs=1** — ✅ 완료 (2026-08-21, 위 "graph bs=1
+  (GatherKernelStager)" 절 참조). M=1이면 distinct ≤ top_k라 그룹이 항상
+  1개 → 최악치 고정 그룹/패딩 낭비 문제가 공짜로 소멸하고 run_warm/rejoin이
+  자명하게 shape-static이라는 2026-08-20 예측이 그대로 구현·실측됨.
+  **bs>1 decode는 여전히 eager 폴백** (`--cuda-graph-bs 1`) — 다음 단계는
+  persistent GEMV(worklist 네이티브)로 그룹 문제 자체를 제거하는 planir
+  방식 (위 "다음 후보 순위" 3번).
 - **cold-down deferral**: down partial의 1-layer 지연 합류 (kt deferral
   기계 재사용). Phase 2 노출 해소책.
 - ~~C++ dual-pack (gate ≠ up K-밴드)~~ — **폐기** (2026-08-20 사용자 결정:
@@ -103,3 +148,21 @@ decode/prefill 파라미터화 (중복 expert 필연 구성 + 정수 비트일�
 - **hot tier**: HotWeights 타입 신설 + loader VRAM 배치 + executor hot
   GEMM 한 줄. 스키마/rejoin은 이미 대비됨.
 - **N-shard rank 분산 (TP>1)**: rank별 자기 inter 샤드만 store/DMA.
+
+## 실측표 (Qwen3-30B-A3B, H100, node1 8스레드 단일소켓, batch1 greedy, uniform10-1node plan, 2026-08-20/21)
+
+| 구성 | decode ms/tok | tok/s |
+|---|---|---|
+| gpu-only eager | 29.95 | 33.4 |
+| gpu-only graph | 6.58 | 152 |
+| kt cold-only eager (8thr) | 61.99 | 16.1 |
+| kt cold-only graph (8thr) | 55.91 | 17.9 |
+| prism eager (개선 전, 산란 dispatch 병목) | 106.24 | 9.4 |
+| prism graph bs=1 (이번 작업 후) | **56.10** | **17.8** |
+
+prism graph가 cold-only graph와 동급이라는 것은 warm 10% 오프로드가 주는
+CPU 절감(~4.8ms)이 graph 경로의 host-node/오버헤드로 상쇄됨을 뜻한다. 단일
+소켓 8스레드에서는 cold 대역(이론 바닥 ~43ms/tok)이 이미 성능 상한이므로,
+다음 이득은 이 표에 없는 두 방향에서만 나온다: cold-down deferral(cold를
+다음 층 아래로 숨겨 노출 대역을 줄임)과 스레드/소켓 확장(cold 자체의 실행
+시간을 낮춤). 위 "다음 후보 순위" 절 참조.
