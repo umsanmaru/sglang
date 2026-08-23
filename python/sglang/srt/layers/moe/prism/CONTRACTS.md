@@ -232,6 +232,12 @@ def rejoin_down(warm, cold, router_w, hot=None) -> Tensor  # fp32 누산 → 가
      같은 callable.)
   primitive 밖에서는 executor 구동 구조(동적 루프 ↔ 고정 패스),
   capture-bs별 버퍼 등록, model_runner 접점 2줄이 graph 경로에서 추가된다.
+- **전략 경계**: 그룹 구성과 (m, j) 좌표 복원은 `GroupingStrategy`(grouping.py)
+  소유, staging 메커니즘(pinned → arena 이동 방식)과 그 스크래치/sel 버퍼의
+  더블버퍼 flip·guard는 해당 `Stager`(stagers.py) 소유, **arena** WAR 이벤트
+  체인(wait_event 발행/소비)은 executor 소유 — 세 축은 각자의 파일 밖으로
+  새지 않는다. env/외부 시스템 읽기는 전부 조립 지점(method.py)이 하고
+  명시 인자로 주입한다.
 
 ---
 

@@ -63,11 +63,17 @@ class _PrismRuntime:
                 ExecutionResources,
                 ResourceSpec,
             )
+            from sglang.srt.layers.moe.prism.stagers import ENV_STAGER, select_stager
 
             spec = ResourceSpec.from_plan(self.plan, max_tokens=self.max_tokens, device=device)
             self._resources = ExecutionResources(spec)
+            # 조립 지점: env 같은 외부 입력은 여기서 읽어 명시 인자로 주입한다
+            # (executor/stagers는 hidden input 없음).
+            stager = select_stager(self._resources, graph_mode=False,
+                                   override=os.environ.get(ENV_STAGER))
             self._executor = PrismExecutor(
-                self.plan, self._resources, self.cold(), resolve_gpu_kernel(self.plan.kernels.gpu_warm)
+                self.plan, self._resources, self.cold(), resolve_gpu_kernel(self.plan.kernels.gpu_warm),
+                stager=stager,
             )
         return self._executor
 

@@ -14,13 +14,15 @@
 - 누산은 전부 fp32, 재료화는 bf16 (계약 ⑤).
 - 그룹 직렬 루프의 arena WAR은 이벤트 체인으로 보장: 그룹 g+1의 stage는
   그룹 g의 GEMM 완료 이벤트를 warm stream에서 기다린다.
+- 이 모듈은 env를 직접 읽지 않는다 (NVTX 태그 게이트 제외): 구성 입력은
+  전부 생성자 주입 — env 읽기는 조립 지점(method.py)의 몫이다.
 """
 
 from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from typing import Optional, Sequence
+from typing import Optional
 
 import torch
 
@@ -52,42 +54,25 @@ def _nvtx_pop() -> None:
         torch.cuda.nvtx.range_pop()
 
 from sglang.srt.layers.moe.prism.cold_backend import ColdBackend
+from sglang.srt.layers.moe.prism.grouping import select_grouping
 from sglang.srt.layers.moe.prism.kernels import WarmGemmFn
 from sglang.srt.layers.moe.prism.plan import Plan, Proj, Tier
 from sglang.srt.layers.moe.prism.resources import ExecutionResources
-from sglang.srt.layers.moe.prism.weights import PreparedWeights, WarmBand
-
-
-def expert_groups(unique_ids: Sequence[int], n_slots: int) -> list[list[int]]:
-    """distinct expert들을 arena slot 수 단위로 절단 (P0: 직렬 루프)."""
-    return [list(unique_ids[i : i + n_slots]) for i in range(0, len(unique_ids), n_slots)]
-
-
-def stage(band: WarmBand, group_ids: Sequence[int], arena_view: torch.Tensor,
-          warm_stream: torch.cuda.Stream, wait_event: Optional[torch.cuda.Event]) -> torch.cuda.Event:
-    """warm 밴드 이동 (pinned store → arena slot). 반환 event = 전송 완료 표지.
-
-    wait_event: 직전 그룹의 GEMM 완료 — arena 재사용 WAR 보호.
-    """
-    with torch.cuda.stream(warm_stream):
-        if wait_event is not None:
-            warm_stream.wait_event(wait_event)
-        for slot, e in enumerate(group_ids):
-            arena_view[slot].copy_(band.weights[e], non_blocking=True)
-    evt = torch.cuda.Event()
-    evt.record(warm_stream)
-    return evt
+from sglang.srt.layers.moe.prism.stagers import Stager
+from sglang.srt.layers.moe.prism.weights import PreparedWeights
 
 
 class PrismExecutor:
     """레이어 상태(warm store, cold 여부)와 공유 리소스로 2-phase를 조율."""
 
     def __init__(self, plan: Plan, resources: ExecutionResources,
-                 cold: Optional[ColdBackend], gpu_warm_kernel: WarmGemmFn):
+                 cold: Optional[ColdBackend], gpu_warm_kernel: WarmGemmFn,
+                 stager: Stager):
         self._plan = plan
         self._res = resources
         self._cold = cold
         self._warm_gemm = gpu_warm_kernel
+        self._stager = stager
         self._layers: dict[int, PreparedWeights] = {}
         self._layer_has_cold: dict[int, bool] = {}
         # cold task가 나중에 읽는 qlen — 주소 고정 멤버 (계약 ④의 포인터 경유)
@@ -119,8 +104,8 @@ class PrismExecutor:
         # S1: topk D2H (P0 유일의 host 블록) + dedup
         with _nvtx("s1.topk_d2h+dedup"):
             ids_cpu = topk_ids.to("cpu")
-            unique_ids = torch.unique(ids_cpu).tolist()
-            groups = expert_groups(unique_ids, res.spec.n_slots)
+            grouping = select_grouping(m)
+            groups = grouping.make_groups(ids_cpu, res.spec.n_slots)
 
         # ── Phase 1: gateup ──────────────────────────────────────────────
         if has_cold:
@@ -131,8 +116,8 @@ class PrismExecutor:
             with _nvtx("cold.gu.submit"):
                 self._cold.submit_gateup(         # enqueue-only, 즉시 반환
                     layer_idx, self._qlen_pin.data_ptr(), k,
-                    res.staging._expert_ids.data_ptr(), res.staging._x.data_ptr(),
-                    res.staging._partial_gateup.data_ptr(),
+                    res.staging.expert_ids_ptr(), res.staging.x_ptr(),
+                    res.staging.partial_gateup_ptr(),
                 )
             _nvtx_push("cold.gu.window")          # CPU expert 연산 재실 구간
 
@@ -148,8 +133,10 @@ class PrismExecutor:
             for gi, group in enumerate(groups):
                 with _nvtx(f"warm.gu.g{gi}x{len(group)}"):
                     with _nvtx("stage.gate+up(H2D)"):
-                        evt_g = stage(gate_band, group, self._res.arena.view(Proj.GATE), res.warm_stream, prev_done)
-                        evt_u = stage(up_band, group, self._res.arena.view(Proj.UP), res.warm_stream, None)
+                        evt_g = self._stager.stage(gate_band, group, self._res.arena.view(Proj.GATE),
+                                                   res.warm_stream, prev_done, Proj.GATE)
+                        evt_u = self._stager.stage(up_band, group, self._res.arena.view(Proj.UP),
+                                                   res.warm_stream, None, Proj.UP)
                     cur = torch.cuda.current_stream()
                     cur.wait_event(evt_g)
                     cur.wait_event(evt_u)
@@ -159,7 +146,8 @@ class PrismExecutor:
                     with _nvtx("gemm.up"):
                         up_out = self._warm_gemm(hidden, self._res.arena.view(Proj.UP)[:g], up_band.k_offset)
                     with _nvtx("scatter.gu"):
-                        self._scatter_gateup(warm_gu, topk_ids, group, gate_out, up_out, inter)
+                        grouping.scatter_gateup(warm_gu, topk_ids, group, gi, res.spec.n_slots,
+                                                gate_out, up_out, inter)
                     prev_done = torch.cuda.Event()
                     prev_done.record(cur)
 
@@ -184,8 +172,8 @@ class PrismExecutor:
             with _nvtx("cold.dn.submit"):
                 self._cold.submit_down(
                     layer_idx, self._qlen_pin.data_ptr(), k,
-                    res.staging._expert_ids.data_ptr(), res.staging._act.data_ptr(),
-                    res.staging._partial_down.data_ptr(),
+                    res.staging.expert_ids_ptr(), res.staging.act_ptr(),
+                    res.staging.partial_down_ptr(),
                 )
             _nvtx_push("cold.dn.window")
 
@@ -203,18 +191,14 @@ class PrismExecutor:
             for gi, group in enumerate(groups):
                 with _nvtx(f"warm.dn.g{gi}x{len(group)}"):
                     with _nvtx("stage.down(H2D)"):
-                        evt = stage(down_band, group, self._res.arena.view(Proj.DOWN), res.warm_stream, prev_done)
+                        evt = self._stager.stage(down_band, group, self._res.arena.view(Proj.DOWN),
+                                                 res.warm_stream, prev_done, Proj.DOWN)
                     cur = torch.cuda.current_stream()
                     cur.wait_event(evt)
                     w = self._res.arena.view(Proj.DOWN)
                     with _nvtx("gemm+where.dn"):
-                        for slot, e in enumerate(group):
-                            # sync-free: 전 (m, j) 좌표를 계산하고 where로 선별 —
-                            # 데이터 의존 host 분기/nonzero 없음 (위 _scatter_gateup 참조).
-                            # slot당 여분 계산은 decode에서 무시 가능(수 µs GEMM).
-                            mask = (topk_ids == e).unsqueeze(-1)          # [M, k, 1]
-                            contrib = act_band @ w[slot].float()          # [M, k, H] fp32 누산 (계약 ⑤)
-                            warm_down = torch.where(mask, contrib, warm_down)
+                        warm_down = grouping.down_apply(warm_down, topk_ids, group, gi,
+                                                        res.spec.n_slots, act_band, w)
                     prev_done = torch.cuda.Event()
                     prev_done.record(cur)
 
@@ -244,19 +228,3 @@ class PrismExecutor:
         if cold is not None:
             total = total + cold.to(torch.float32)
         return total
-
-    @staticmethod
-    def _scatter_gateup(warm_gu: torch.Tensor, topk_ids: torch.Tensor, group: Sequence[int],
-                        gate_out: torch.Tensor, up_out: torch.Tensor, inter: int) -> None:
-        """그룹 GEMM 결과 [G, M, inter]를 (m, slot) 좌표의 [M, k, 2*inter]로 산란.
-
-        sync-free 규칙: host 동기화를 유발하는 연산(nonzero, bool(mask.any()),
-        item, 데이터 의존 shape) 금지 — slot당 동기화가 층당 수 ms를 차지했던
-        실측(2026-08-20)의 재발 방지. broadcast where는 전부 device에 머문다.
-        """
-        for slot, e in enumerate(group):
-            mask = (topk_ids == e).unsqueeze(-1)       # [M, k, 1] device bool
-            g = gate_out[slot].float().unsqueeze(1)    # [M, 1, inter] → k로 broadcast
-            u = up_out[slot].float().unsqueeze(1)
-            warm_gu[:, :, :inter] = torch.where(mask, g, warm_gu[:, :, :inter])
-            warm_gu[:, :, inter:] = torch.where(mask, u, warm_gu[:, :, inter:])

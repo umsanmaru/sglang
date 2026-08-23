@@ -17,6 +17,7 @@ from sglang.srt.layers.moe.prism.kernels import resolve_gpu_kernel
 from sglang.srt.layers.moe.prism.numa import numa_node_count
 from sglang.srt.layers.moe.prism.plan import Tier, parse_plan, validate_static
 from sglang.srt.layers.moe.prism.resources import ExecutionResources, ResourceSpec
+from sglang.srt.layers.moe.prism.stagers import PerSlotCopyStager
 from sglang.srt.layers.moe.prism.weights import prepare_layer_weights
 
 DIMS = {
@@ -70,7 +71,9 @@ def make_weights(seed=0):
     return w13, w2
 
 
-def build_executor(plan, w13, w2):
+def build_executor(plan, w13, w2, **executor_kwargs):
+    """executor_kwargs는 PrismExecutor 생성자에 그대로 전달된다
+    (예: force_graph_path=True, cold_stream=True, capture_mode_fn=...)."""
     from sglang.srt.layers.moe.prism.plan import Proj
 
     prepared = prepare_layer_weights(0, w13, w2, plan)
@@ -83,7 +86,8 @@ def build_executor(plan, w13, w2):
         cold.load_layer(0, prepared.cold)
     spec = ResourceSpec.from_plan(plan, max_tokens=MAX_TOKENS, device=torch.device("cuda"))
     res = ExecutionResources(spec)
-    ex = PrismExecutor(plan, res, cold, resolve_gpu_kernel(plan.kernels.gpu_warm))
+    ex = PrismExecutor(plan, res, cold, resolve_gpu_kernel(plan.kernels.gpu_warm),
+                       stager=PerSlotCopyStager(), **executor_kwargs)
     ex.register_layer(0, prepared)
     return ex
 

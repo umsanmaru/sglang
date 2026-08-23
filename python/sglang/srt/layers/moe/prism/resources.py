@@ -169,6 +169,24 @@ class ColdStaging:
     def fill_act(self, act: torch.Tensor) -> torch.Tensor:
         return self._fill(self._act, act)
 
+    # ── cold submit에 넘기는 원시 주소들 ──────────────────────────────────
+    # C++ 경계는 포인터가 곧 인터페이스다 — executor가 내부 버퍼(_x 등)를
+    # 직접 만지지 않도록 노출면을 이 다섯 개로 한정한다.
+    def x_ptr(self) -> int:
+        return self._x.data_ptr()
+
+    def expert_ids_ptr(self) -> int:
+        return self._expert_ids.data_ptr()
+
+    def act_ptr(self) -> int:
+        return self._act.data_ptr()
+
+    def partial_gateup_ptr(self) -> int:
+        return self._partial_gateup.data_ptr()
+
+    def partial_down_ptr(self) -> int:
+        return self._partial_down.data_ptr()
+
     def gateup_out(self, num_tokens: int) -> torch.Tensor:
         return self._partial_gateup[:num_tokens]
 
