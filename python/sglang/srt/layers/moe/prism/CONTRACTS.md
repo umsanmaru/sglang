@@ -40,6 +40,32 @@ Prism = K-split hot/warm/cold 티어링 MoE 오프로드. 패키지명이자 프
   (AMX pack 타일 단위 — 상수 값은 pack 코드 확인 후 조정될 수 있으나
   "정렬 배수여야 한다"는 계약은 불변)
 
+**입력기반 sparsity (schema_version 2, 2026-08-24 추가):**
+
+- 마스크는 **각 proj의 K(contraction) 축**에 걸린다. 점수는 그 proj의
+  **입력**에서만 나오므로(gate/up은 layer 입력 x, down은 rejoin#1의 act)
+  각 티어가 자기 밴드 안에서 로컬하게 적용할 수 있다 — 티어 간 rejoin을
+  기다릴 필요가 없다. (출력 축 마스킹이 아니다 — N shard와 무관.)
+- score 변종은 `k2wl2` 하나로 고정 (2026-08-24 사용자 결정). 인접 입력채널
+  **페어**의 실제 에너지 `sqrt(a0·x0² + a1·x1² + 2c·x0·x1)`이므로 열 노름
+  `wn`과 인접열 내적 `pair_dot` 둘 다를 요구하고, 마스크 길이는
+  `K / PAIR_GROUP`이다. `ROW_GROUP % PAIR_GROUP == 0`이 밴드 경계가 페어를
+  쪼개는 것을 막는다 (쪼개지면 어느 티어도 점수를 재구성할 수 없다).
+- threshold **값은 Plan에 없다.** Plan이 갖는 것은 예산
+  `(sparsity_p, sparsity_lambda)`(per-(layer, expert, proj) 스칼라)와
+  model-global `SparsitySpec`(score, calib 참조, pmax/grid/ng/renorm_it)뿐이다.
+  실제 threshold는 step마다 조회된다:
+  `s = clip(p − λ(g_e − ḡ), 0, pmax)` → `thr = table[layer, expert, round(s/grid)]`.
+- threshold/노름 테이블은 **full-K 분포로 캘리브된 것을 그대로 쓴다**
+  (2026-08-24 사용자 결정 — 밴드별 재캘리브 안 함). 마스크는 full-K 기준과
+  동일하지만 밴드별 nnz 비율은 균일하지 않으므로, **cold 밴드의 nnz는 실측
+  대상**이다 (부하 예측 불가가 이 결정의 대가).
+- 테이블 자산은 Plan 밖의 파일이고 Plan은 경로 + sha256만 갖는다(≈130MB
+  텐서를 JSON에 넣을 수 없다). 자산의 shape 검증은 `validate_static`에
+  `calib_probe`를 주입해 수행한다 — plan.py는 순수 stdlib을 유지하며 자산을
+  열지 않고, "논리 테이블명 → shape" 대조만 소유한다. 논리명 ↔ 자산 키
+  매핑은 로더의 몫이다.
+
 **커널 선택 위치 (co-variance 선언):**
 
 - `gpu_warm`, `cpu_cold` 모두 **model-global** (`Plan.kernels`).
@@ -62,6 +88,11 @@ Prism = K-split hot/warm/cold 티어링 MoE 오프로드. 패키지명이자 프
 5. dims가 실제 모델 config와 일치 — 다른 모델/ckpt에 Plan을 적용하는 것이
    이 시스템 최대의 silent failure이므로 startup 즉사.
 6. 모든 (layer, expert)에 대해 plan이 존재 (완전 커버, 암묵 fallback 금지).
+7. sparsity는 all-or-nothing: model-global 블록이 있으면 **모든** proj가
+   `(p, lambda)`를 갖고, 없으면 **어느** proj도 갖지 않는다 (cold_shards와
+   같은 대칭 규칙). `0 ≤ p ≤ pmax`, `lambda ≥ 0`, `(ng−1)·grid ≥ pmax`
+   — 마지막 것은 격자가 pmax에 못 닿으면 idx가 clamp되어 threshold가 조용히
+   포화하기 때문이다. calib_probe 주입 시 자산 테이블 shape까지 대조.
 
 스키마는 티어당 다중 밴드(interleave)를 허용한다. P0 plan은 밴드 ≤ 3개
 (hot=∅, warm=첫 10%, cold=나머지)인 퇴화형일 뿐이다.

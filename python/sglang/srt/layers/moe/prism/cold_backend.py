@@ -4,7 +4,10 @@
 - Plan → kt `MOEConfig` 번역 (K 밴드, NUMA N-shard 테이블, dims). kt는
   Plan 타입을 절대 보지 않는다 — 여기가 유일한 번역 지점이다.
 - 레이어별 `PartialMoEWrapper` 생성 + `PendingColdTensors` 주입 →
-  이후 cold weight의 소유권은 C++ (계약 ③; 이 객체가 ColdHandle 역할).
+  이후 cold weight의 소유권은 C++ (계약 ③; 이 객체가 ColdHandle 역할)
+- sparsity 점수 테이블(wn², pair_dot) 주입. weight와 달리 C++가 **매 step
+  원시 포인터로 읽으므로** wrapper가 참조를 계속 들고 있어야 한다 —
+  PartialMoEWrapper가 그 역할을 한다 (experts_partial.py 수명 규칙).
 - P0 실행 제약의 집행: gate == up (K 밴드·N shard), expert 간 균일 기하.
 
 인터페이스 `ColdBackend`는 구현 교체(테스트 mock, 미래의 다른 CPU 백엔드)를
@@ -30,10 +33,12 @@ class ColdBackend(Protocol):
     def load_layer(self, layer_idx: int, cold: PendingColdTensors) -> None: ...
     def submit_gateup(self, layer_idx: int, qlen_ptr: int, k: int,
                       expert_ids_ptr: int, x_ptr: int, out_ptr: int,
-                      cuda_stream: Optional[int] = None) -> None: ...
+                      cuda_stream: Optional[int] = None,
+                      thr_ptr: int = 0) -> None: ...
     def submit_down(self, layer_idx: int, qlen_ptr: int, k: int,
                     expert_ids_ptr: int, act_ptr: int, out_ptr: int,
-                    cuda_stream: Optional[int] = None) -> None: ...
+                    cuda_stream: Optional[int] = None,
+                    thr_ptr: int = 0) -> None: ...
     def sync(self, cuda_stream: Optional[int] = None) -> None: ...
 
 
@@ -126,9 +131,31 @@ class KtColdBackend:
         if cold.gate.k_offset != cfg.partial.gateup.offset or cold.down.k_offset != cfg.partial.down.offset:
             raise PlanError(f"layer {layer_idx}: PendingColdTensors offsets disagree with plan")
 
+        tables = None
+        if self._plan.sparsity is not None:
+            for name, band in (("gate", cold.gate), ("up", cold.up), ("down", cold.down)):
+                if band.calib is None:
+                    raise PlanError(
+                        f"layer {layer_idx}: plan has sparsity but cold {name} "
+                        f"band carries no calib tables"
+                    )
+            # wn_sq(=a)는 CalibBand가 정의한다 — GPU 측과 같은 형태를 쓰기
+            # 위한 단일 정의점 (wn을 그냥 넘기면 마스크가 조용히 갈린다).
+            tables = {
+                "gate_wn_sq": cold.gate.calib.wn_sq,
+                "gate_pair_dot": cold.gate.calib.pair_dot,
+                "up_wn_sq": cold.up.calib.wn_sq,
+                "up_pair_dot": cold.up.calib.pair_dot,
+                "down_wn_sq": cold.down.calib.wn_sq,
+                "down_pair_dot": cold.down.calib.pair_dot,
+            }
+
         kernel_key = self._plan.kernels.cpu_cold
         wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=kernel_key)
-        wrapper.load_weights_from_tensors(cold.gate.weights, cold.up.weights, cold.down.weights)
+        wrapper.load_weights_from_tensors(
+            cold.gate.weights, cold.up.weights, cold.down.weights,
+            sparsity_tables=tables,
+        )
         self._wrappers[layer_idx] = wrapper
 
     def _wrapper(self, layer_idx: int):
@@ -138,11 +165,15 @@ class KtColdBackend:
             raise RuntimeError(f"layer {layer_idx} not loaded") from None
 
     # ── step-time: 포인터 pass-through (staging은 호출자 소유 — 계약 ④) ──
-    def submit_gateup(self, layer_idx, qlen_ptr, k, expert_ids_ptr, x_ptr, out_ptr, cuda_stream=None):
-        self._wrapper(layer_idx).submit_forward_gateup(qlen_ptr, k, expert_ids_ptr, x_ptr, out_ptr, cuda_stream)
+    def submit_gateup(self, layer_idx, qlen_ptr, k, expert_ids_ptr, x_ptr, out_ptr, cuda_stream=None,
+                      thr_ptr=0):
+        self._wrapper(layer_idx).submit_forward_gateup(
+            qlen_ptr, k, expert_ids_ptr, x_ptr, out_ptr, cuda_stream, thr_ptr)
 
-    def submit_down(self, layer_idx, qlen_ptr, k, expert_ids_ptr, act_ptr, out_ptr, cuda_stream=None):
-        self._wrapper(layer_idx).submit_forward_down(qlen_ptr, k, expert_ids_ptr, act_ptr, out_ptr, cuda_stream)
+    def submit_down(self, layer_idx, qlen_ptr, k, expert_ids_ptr, act_ptr, out_ptr, cuda_stream=None,
+                    thr_ptr=0):
+        self._wrapper(layer_idx).submit_forward_down(
+            qlen_ptr, k, expert_ids_ptr, act_ptr, out_ptr, cuda_stream, thr_ptr)
 
     def sync(self, cuda_stream=None):
         if cuda_stream is None:

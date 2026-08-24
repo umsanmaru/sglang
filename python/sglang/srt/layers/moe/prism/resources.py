@@ -149,6 +149,12 @@ class ColdStaging:
         # fp32 누산은 GPU rejoin에서 upcast로 수행)
         self._partial_gateup = torch.empty(m, k, 2 * i, dtype=torch.bfloat16, **kw)
         self._partial_down = torch.empty(m, k, h, dtype=torch.bfloat16, **kw)
+        # sparsity threshold: kt가 [qlen][k][3] (gate, up, down)으로 읽는다.
+        # 슬롯 2개로 gateup/down을 **격리**한다 — stream 통합 경로에서 host는
+        # cold sync를 기다리지 않으므로, 한 버퍼를 쓰면 gateup task가 아직
+        # 읽는 중에 down thr를 쓰게 된다 (_qlen_pin / _qlen_pin_graph를
+        # 분리한 것과 같은 이유).
+        self._thr = torch.zeros(2, m, k, 3, dtype=torch.float32, **kw)
 
     def _fill(self, buf: torch.Tensor, value: torch.Tensor,
               non_blocking: bool = False) -> torch.Tensor:
@@ -176,6 +182,22 @@ class ColdStaging:
     def fill_act(self, act: torch.Tensor, non_blocking: bool = False) -> torch.Tensor:
         return self._fill(self._act, act, non_blocking)
 
+    def fill_thr(self, slot: int, col: int, value: torch.Tensor,
+                 non_blocking: bool = False) -> torch.Tensor:
+        """thr[slot][:m, :, col] ← value [m, k]. slot 0 = gateup, 1 = down.
+
+        col은 kt가 읽는 proj 축이다 (0=gate, 1=up, 2=down). 같은 slot 안의
+        다른 col은 같은 submit이 함께 읽으므로 순서 문제가 없다.
+        """
+        m = value.shape[0]
+        if m > self.spec.max_tokens:
+            raise ValueError(
+                f"{m} tokens exceed staging capacity {self.spec.max_tokens}"
+            )
+        view = self._thr[slot, :m, :, col]
+        view.copy_(value, non_blocking=non_blocking)
+        return view
+
     # ── cold submit에 넘기는 원시 주소들 ──────────────────────────────────
     # C++ 경계는 포인터가 곧 인터페이스다 — executor가 내부 버퍼(_x 등)를
     # 직접 만지지 않도록 노출면을 이 다섯 개로 한정한다.
@@ -193,6 +215,10 @@ class ColdStaging:
 
     def partial_down_ptr(self) -> int:
         return self._partial_down.data_ptr()
+
+    def thr_ptr(self, slot: int) -> int:
+        """slot 0 = gateup submit용, 1 = down submit용 (WAR 격리)."""
+        return self._thr[slot].data_ptr()
 
     def gateup_out(self, num_tokens: int) -> torch.Tensor:
         return self._partial_gateup[:num_tokens]

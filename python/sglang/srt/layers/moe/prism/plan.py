@@ -17,9 +17,15 @@ Plan 파일(JSON) 형식::
         "dtype": "bfloat16"
       },
       "kernels": {"gpu_warm": "torch_bmm", "cpu_cold": "kt_amx_bf16"},
+      "sparsity": {
+        "score": "k2wl2",
+        "calib": {"path": "assets/qwen35/gatedyn_calib.pt", "sha256": "<64 hex>"},
+        "pmax": 0.9, "grid": 0.005, "ng": 201, "renorm_it": 3
+      },
       "default": {
         "gate": {"bands": [[0, 192, "warm"], [192, 2048, "cold"]],
-                  "cold_shards": [[0, 0, 384], [1, 384, 768]]},
+                  "cold_shards": [[0, 0, 384], [1, 384, 768]],
+                  "p": 0.5, "lambda": 4.305},
         "up":   {...},
         "down": {...}
       },
@@ -27,6 +33,13 @@ Plan 파일(JSON) 형식::
         {"layer": 3, "expert": 17, "gate": {...}, "up": {...}, "down": {...}}
       ]
     }
+
+"sparsity"는 model-global이고 생략 가능하다 (없으면 dense = 현행 동작).
+있으면 모든 proj가 예산 (p, lambda)를 가져야 한다 — threshold **값**은
+Plan에 없다. calib 자산의 곡선에서 step마다 조회된다:
+
+    s   = clip(p - lambda*(g_e - g_mean), 0, pmax)   # renorm_it회 재정규화 후
+    thr = table[layer, expert, round(s / grid)]
 
 "default"는 모든 (layer, expert)에 적용되고 "overrides"가 개별 항목을
 대체한다. 파싱 결과(메모리 표현)는 항상 (layer, expert) 완전 명시형이다 —
@@ -39,14 +52,27 @@ import json
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Mapping, Optional, Sequence, Union
+from typing import Callable, Mapping, Optional, Sequence, Union
 
 # K-축 밴드 경계 정렬 단위 (계약 ①)
 ROW_GROUP = 64
 # N-축 shard 경계 정렬 단위 (AMX pack N-타일; 값은 pack 확인 후 조정 가능)
 COL_GROUP = 32
+# 인접 입력채널 페어 마스킹 단위. k2wl2 점수가 페어 단위이므로
+# (calib pairimp: sqrt(a0*x0^2 + a1*x1^2 + 2c*x0*x1)) 마스크 길이는
+# K/PAIR_GROUP이다. 밴드 경계가 페어를 쪼개면 두 티어가 같은 페어의 반쪽씩
+# 갖게 되어 어느 쪽도 점수를 재구성할 수 없다 — ROW_GROUP이 PAIR_GROUP의
+# 배수라는 사실이 그것을 막는다 (import 시 확인).
+PAIR_GROUP = 2
+assert ROW_GROUP % PAIR_GROUP == 0, "band 경계가 마스킹 페어를 쪼갤 수 있다"
 
-SUPPORTED_SCHEMA_VERSIONS = (1,)
+SUPPORTED_SCHEMA_VERSIONS = (1, 2)
+# sparsity 블록이 등장할 수 있는 최소 schema_version
+SPARSITY_SCHEMA_VERSION = 2
+# sparsity score 변종 — calib 자산의 어느 테이블 계열을 쓰는지.
+# k2wl2 = 인접 페어의 실제 에너지(교차항 포함)이므로 wn(열 노름)과
+# pair_dot(인접열 내적)을 모두 요구한다.
+KNOWN_SPARSITY_SCORES = ("k2wl2",)
 
 
 class PlanError(ValueError):
@@ -84,6 +110,53 @@ class ModelDims:
 
 
 @dataclass(frozen=True)
+class CalibRef:
+    """sparsity 테이블 자산의 참조. 내용은 이 모듈이 열지 않는다 (순수 stdlib).
+
+    경로 해석과 로드는 로더의 몫이고, 여기는 참조와 무결성 해시만 소유한다.
+    """
+
+    path: str
+    sha256: str
+
+
+@dataclass(frozen=True)
+class SparsitySpec:
+    """model-global sparsity 설정 (계약 ①의 kernels와 같은 급).
+
+    per-(layer, expert, proj)로 갈리는 것은 ExpertProjPlan의
+    (sparsity_p, sparsity_lambda)뿐이다. threshold **값**은 Plan에 없다 —
+    calib 곡선에서 step마다 조회된다. 마스크는 각 proj의 K(contraction) 축에
+    걸리고 점수는 그 proj의 입력에서만 나오므로(gate/up은 layer 입력, down은
+    act), 티어별로 로컬하게 적용할 수 있다 — rejoin을 기다릴 필요가 없다.
+    """
+
+    score: str
+    calib: CalibRef
+    pmax: float
+    grid: float
+    ng: int
+    renorm_it: int
+
+    def expected_calib_shapes(self, dims: ModelDims) -> Mapping[str, tuple[int, ...]]:
+        """calib 자산이 가져야 하는 논리 테이블 -> shape.
+
+        논리명과 자산 키의 매핑은 로더가 소유한다 (이 모듈은 자산 포맷의
+        어휘를 모른다). validate_static에 calib_probe가 주어지면 이 shape와
+        대조된다 — 다른 모델/설정의 calib을 적용하는 것은 dims 불일치와 같은
+        급의 silent failure이므로 startup 즉사다.
+        """
+        L, E = dims.num_layers, dims.num_experts
+        shapes: dict[str, tuple[int, ...]] = {}
+        for proj in Proj:
+            K = dims.k_of(proj)
+            shapes[f"thr_{proj.value}"] = (L, E, self.ng)
+            shapes[f"wn_{proj.value}"] = (L, E, K)
+            shapes[f"pair_dot_{proj.value}"] = (L, E, K // PAIR_GROUP)
+        return shapes
+
+
+@dataclass(frozen=True)
 class BandSpec:
     """K-축 반개구간 [start, end)와 그 티어. 경계는 ROW_GROUP 배수."""
 
@@ -107,6 +180,10 @@ class ExpertProjPlan:
 
     bands: tuple[BandSpec, ...]
     cold_shards: tuple[NumaShard, ...]
+    # sparsity 예산 (threshold가 아니다 — 곡선 조회의 입력). Plan.sparsity가
+    # 있으면 반드시 둘 다 존재, 없으면 반드시 둘 다 None (validate가 강제).
+    sparsity_p: Optional[float] = None
+    sparsity_lambda: Optional[float] = None
 
     def rows(self, tier: Tier) -> int:
         return sum(b.end - b.start for b in self.bands if b.tier is tier)
@@ -146,6 +223,8 @@ class Plan:
     kernels: KernelSpec
     # (layer, expert) → ExpertPlan. 항상 완전 명시형 (validate가 강제).
     experts: Mapping[tuple[int, int], ExpertPlan]
+    # None이면 dense. schema_version 1 plan은 항상 None이다.
+    sparsity: Optional[SparsitySpec] = None
 
     def expert(self, layer: int, expert: int) -> ExpertPlan:
         return self.experts[(layer, expert)]
@@ -165,9 +244,33 @@ def _parse_proj(obj: dict, where: str) -> ExpertProjPlan:
             NumaShard(int(n), int(a), int(b))
             for n, a, b in obj.get("cold_shards", [])
         )
+        # p/lambda는 쌍으로만 유효 — 한쪽만 있으면 KeyError로 즉사한다.
+        p = lam = None
+        if "p" in obj or "lambda" in obj:
+            p, lam = float(obj["p"]), float(obj["lambda"])
     except (KeyError, TypeError, ValueError) as err:
         raise PlanError(f"{where}: malformed proj entry: {err}") from err
-    return ExpertProjPlan(bands=bands, cold_shards=shards)
+    return ExpertProjPlan(
+        bands=bands, cold_shards=shards, sparsity_p=p, sparsity_lambda=lam
+    )
+
+
+def _parse_sparsity(obj: Optional[dict]) -> Optional[SparsitySpec]:
+    """model-global sparsity 블록. 없으면 None (dense)."""
+    if obj is None:
+        return None
+    try:
+        calib = obj["calib"]
+        return SparsitySpec(
+            score=str(obj["score"]),
+            calib=CalibRef(path=str(calib["path"]), sha256=str(calib["sha256"])),
+            pmax=float(obj["pmax"]),
+            grid=float(obj["grid"]),
+            ng=int(obj["ng"]),
+            renorm_it=int(obj["renorm_it"]),
+        )
+    except (KeyError, TypeError, ValueError) as err:
+        raise PlanError(f"malformed sparsity block: {err}") from err
 
 
 def _parse_expert(obj: dict, where: str) -> ExpertPlan:
@@ -218,6 +321,13 @@ def parse_plan(source: Union[str, Path, dict]) -> Plan:
             f"(supported: {SUPPORTED_SCHEMA_VERSIONS})"
         )
 
+    if "sparsity" in raw and version < SPARSITY_SCHEMA_VERSION:
+        raise PlanError(
+            f"sparsity block requires schema_version >= "
+            f"{SPARSITY_SCHEMA_VERSION}, got {version}"
+        )
+    sparsity = _parse_sparsity(raw.get("sparsity"))
+
     experts: dict[tuple[int, int], ExpertPlan] = {}
     default = raw.get("default")
     if default is not None:
@@ -240,6 +350,7 @@ def parse_plan(source: Union[str, Path, dict]) -> Plan:
         dims=dims,
         kernels=kernels,
         experts=experts,
+        sparsity=sparsity,
     )
 
 
@@ -308,14 +419,93 @@ def _validate_shards(
         raise PlanError(f"{where}: shards cover [0, {cursor}) but N={N}")
 
 
+def _validate_sparsity_spec(
+    spec: SparsitySpec,
+    dims: ModelDims,
+    calib_probe: Optional[Callable[[CalibRef], Mapping[str, Sequence[int]]]],
+) -> None:
+    if spec.score not in KNOWN_SPARSITY_SCORES:
+        raise PlanError(
+            f"unknown sparsity.score '{spec.score}' "
+            f"(known: {sorted(KNOWN_SPARSITY_SCORES)})"
+        )
+    if not 0.0 < spec.pmax <= 1.0:
+        raise PlanError(f"sparsity.pmax must be in (0, 1], got {spec.pmax}")
+    if spec.grid <= 0.0:
+        raise PlanError(f"sparsity.grid must be positive, got {spec.grid}")
+    if spec.ng < 2:
+        raise PlanError(f"sparsity.ng must be >= 2, got {spec.ng}")
+    # 격자가 pmax를 못 덮으면 idx가 상단에서 clamp되어 threshold가 조용히
+    # 포화한다 — 의도보다 덜/더 자르는 무증상 오차가 되므로 즉사.
+    span = (spec.ng - 1) * spec.grid
+    if span + 1e-9 < spec.pmax:
+        raise PlanError(
+            f"sparsity grid spans [0, {span}] but pmax={spec.pmax} — "
+            f"(ng-1)*grid must reach pmax"
+        )
+    if spec.renorm_it < 0:
+        raise PlanError(f"sparsity.renorm_it must be >= 0, got {spec.renorm_it}")
+    if not spec.calib.path:
+        raise PlanError("sparsity.calib.path must be non-empty")
+    digest = spec.calib.sha256.lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        raise PlanError(
+            f"sparsity.calib.sha256 must be 64 hex chars, got {spec.calib.sha256!r}"
+        )
+    for proj in Proj:
+        if dims.k_of(proj) % PAIR_GROUP:
+            raise PlanError(
+                f"K of {proj.value} ({dims.k_of(proj)}) not divisible by "
+                f"PAIR_GROUP={PAIR_GROUP}"
+            )
+
+    if calib_probe is None:
+        return
+    expected = spec.expected_calib_shapes(dims)
+    actual = calib_probe(spec.calib)
+    missing = sorted(set(expected) - set(actual))
+    if missing:
+        raise PlanError(f"calib asset missing tables: {missing}")
+    for name in sorted(expected):
+        got = tuple(int(v) for v in actual[name])
+        if got != expected[name]:
+            raise PlanError(
+                f"calib table '{name}' shape {got} != expected {expected[name]} — "
+                f"calib이 다른 모델/설정에 대해 생성된 것일 가능성"
+            )
+
+
+def _validate_proj_sparsity(
+    proj_plan: ExpertProjPlan, spec: Optional[SparsitySpec], where: str
+) -> None:
+    """예산 존재 여부는 all-or-nothing (cold_shards와 같은 대칭 규칙)."""
+    p, lam = proj_plan.sparsity_p, proj_plan.sparsity_lambda
+    if spec is None:
+        if p is not None or lam is not None:
+            raise PlanError(
+                f"{where}: sparsity budget present but no model-global "
+                f"sparsity block"
+            )
+        return
+    if p is None or lam is None:
+        raise PlanError(f"{where}: sparsity block exists but proj has no (p, lambda)")
+    if not 0.0 <= p <= spec.pmax:
+        raise PlanError(f"{where}: p={p} not in [0, pmax={spec.pmax}]")
+    if lam < 0.0:
+        raise PlanError(f"{where}: lambda={lam} must be >= 0")
+
+
 def validate_static(
     plan: Plan,
     known_gpu_kernels: Optional[Sequence[str]] = None,
     known_cpu_kernels: Optional[Sequence[str]] = None,
+    calib_probe: Optional[Callable[[CalibRef], Mapping[str, Sequence[int]]]] = None,
 ) -> None:
     """Plan 자체의 정합성 검증. 위반은 전부 PlanError (startup hard error).
 
-    커널 registry가 주어지면 이름 존재도 확인한다. dims와 실제 모델 config의
+    커널 registry가 주어지면 이름 존재도 확인한다. calib_probe가 주어지면
+    sparsity 자산의 테이블 shape까지 확인한다 (probe는 CalibRef를 받아
+    "논리 테이블명 -> shape"를 돌려주는 콜러블 — 자산을 여는 것은 호출자다). dims와 실제 모델 config의
     대조는 호출자(로더)가 이 함수 호출 직전에 수행한다 — 이 모듈은 모델
     config의 존재를 모른다.
     """
@@ -354,6 +544,9 @@ def validate_static(
             f"(known: {sorted(known_cpu_kernels)})"
         )
 
+    if plan.sparsity is not None:
+        _validate_sparsity_spec(plan.sparsity, dims, calib_probe)
+
     expected_keys = {
         (layer, expert)
         for layer in range(dims.num_layers)
@@ -381,3 +574,4 @@ def validate_static(
             where = f"{where_prefix}.{proj.value}"
             _validate_bands(pp, dims.k_of(proj), where)
             _validate_shards(pp, dims.n_of(proj), where)
+            _validate_proj_sparsity(pp, plan.sparsity, where)

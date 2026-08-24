@@ -25,6 +25,12 @@ w13/w2에 대한 참조를 보관하지 않으며, 호출자는 반환 즉시 �
   패턴 + cuBLAS T-경로 회피를 위해 통일). cold 슬라이스는 ckpt 방향
   [E, N, k_cold] 유지 — 소비자인 kt-kernel pack이 기대하는 방향이다.
 
+sparsity(계약 ①, schema_version 2): `wn`/`pair_dot`은 K축이라 weight와 **같은
+밴드 절단**을 받아 각 밴드에 동행한다 (WarmBand/ColdBand.calib). `thr` 곡선은
+밴드와 무관한 per-(layer, expert)라 PreparedWeights.thr에 통째로 둔다. 셋 다
+CPU fp32로 남긴다 — warm 쪽 device 배치는 device 메모리 소유자(resources/
+executor)의 결정이라 여기서 앞질러 정하지 않는다.
+
 P0 loader capability gap (스키마 제약이 아님, NotImplementedError로 명시):
 - HOT 밴드 미지원
 - 티어당 다중 밴드 미지원
@@ -34,10 +40,11 @@ P0 loader capability gap (스키마 제약이 아님, NotImplementedError로 명
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Mapping, Optional
 
 import torch
 
+from sglang.srt.layers.moe.prism.calib import CalibBand, CalibTables
 from sglang.srt.layers.moe.prism.plan import (
     ExpertProjPlan,
     Plan,
@@ -53,6 +60,8 @@ class WarmBand:
 
     k_offset: int
     weights: torch.Tensor
+    # sparsity 점수 재료 (이 밴드 구간만). plan.sparsity가 있으면 존재.
+    calib: Optional[CalibBand] = None
 
     @property
     def k_rows(self) -> int:
@@ -75,6 +84,8 @@ class ColdBand:
 
     k_offset: int
     weights: torch.Tensor
+    # sparsity 점수 재료 (이 밴드 구간만). plan.sparsity가 있으면 존재.
+    calib: Optional[CalibBand] = None
 
     @property
     def k_rows(self) -> int:
@@ -101,6 +112,8 @@ class PreparedWeights:
     hot: None  # P0: hot = ∅
     warm: WarmStore
     cold: PendingColdTensors  # S5 이후: ColdHandle
+    # proj → [E, ng] fp32 threshold 곡선. dense plan이면 None.
+    thr: Optional[Mapping[Proj, torch.Tensor]] = None
 
 
 def _uniform_proj_plan(plan: Plan, layer_idx: int, proj: Proj) -> ExpertProjPlan:
@@ -144,6 +157,7 @@ def prepare_layer_weights(
     w2: torch.Tensor,
     plan: Plan,
     *,
+    calib: Optional[CalibTables] = None,
     pin_memory: bool = True,
 ) -> PreparedWeights:
     """한 레이어의 full weight를 Plan대로 절단·변환·배치한다.
@@ -151,9 +165,20 @@ def prepare_layer_weights(
     process_weights_after_loading 훅(rank 0)에서 호출된다. 반환 후 호출자는
     w13/w2 참조를 놓아야 한다 (full 텐서 소멸 계약).
 
+    calib은 plan.sparsity의 존재와 짝이어야 한다 (all-or-nothing) — 한쪽만
+    있으면 마스킹이 조용히 사라지거나 테이블이 버려지므로 즉사한다.
+
     pin_memory=False는 CUDA 없는 테스트용 탈출구다.
     """
     dims = plan.dims
+    if (plan.sparsity is None) != (calib is None):
+        raise PlanError(
+            f"layer {layer_idx}: plan.sparsity and calib must both be present "
+            f"or both absent (sparsity={plan.sparsity is not None}, "
+            f"calib={calib is not None})"
+        )
+    if calib is not None:
+        calib.check_dims(dims, plan.sparsity)
     expected_w13 = (dims.num_experts, 2 * dims.intermediate_size, dims.hidden_size)
     expected_w2 = (dims.num_experts, dims.hidden_size, dims.intermediate_size)
     if tuple(w13.shape) != expected_w13 or tuple(w2.shape) != expected_w2:
@@ -185,7 +210,16 @@ def prepare_layer_weights(
                 sliced.shape, dtype=w13.dtype, pin_memory=pin_memory
             )
             store.copy_(sliced)
-            warm_bands[proj] = WarmBand(k_offset=warm.start, weights=store)
+            warm_bands[proj] = WarmBand(
+                k_offset=warm.start,
+                weights=store,
+                calib=(
+                    None if calib is None
+                    else calib.slice_band(
+                        layer_idx, proj, warm.start, warm.end, f"{where} warm"
+                    )
+                ),
+            )
 
         cold = _single_band(pp, Tier.COLD, where)
         if cold is None:
@@ -195,6 +229,12 @@ def prepare_layer_weights(
             cold_bands[proj] = ColdBand(
                 k_offset=cold.start,
                 weights=src[:, :, cold.start : cold.end].contiguous(),
+                calib=(
+                    None if calib is None
+                    else calib.slice_band(
+                        layer_idx, proj, cold.start, cold.end, f"{where} cold"
+                    )
+                ),
             )
 
         got = (warm.end - warm.start if warm else 0) + (
@@ -214,5 +254,9 @@ def prepare_layer_weights(
         ),
         cold=PendingColdTensors(
             gate=cold_bands[Proj.GATE], up=cold_bands[Proj.UP], down=cold_bands[Proj.DOWN]
+        ),
+        thr=(
+            None if calib is None
+            else {proj: calib.thr(layer_idx, proj) for proj in Proj}
         ),
     )
