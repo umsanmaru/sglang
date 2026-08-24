@@ -235,7 +235,7 @@ class PrismMoEMethod(FusedMoEMethodBase):
         prepared = prepare_layer_weights(self.layer_id, w13, w2, runtime.plan)
         ep = runtime.plan.expert(self.layer_id, 0)
         if any(ep.proj(p).has_tier(Tier.COLD) for p in Proj):
-            runtime.cold().load_layer(self.layer_id, prepared.cold)
+            runtime.cold().load_layer(self.layer_id, prepared.cold, prepared.thr)
             prepared.cold = None  # 주입 완료 — 소유권은 C++ (계약 ③)
 
         device = torch.device(torch.cuda.current_device())

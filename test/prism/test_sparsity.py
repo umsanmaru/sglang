@@ -1,11 +1,14 @@
-"""입력기반 sparsity 테스트 — threshold 조회(GPU)와 cold 마스킹(kt).
+"""입력기반 sparsity 테스트 — cold 마스킹 end-to-end.
 
-warm/hot은 dense로 계산한다 (2026-08-24 결정). 그래서 이 파일이 검증하는
-것은 두 가지다:
+warm/hot은 dense로 계산하고, sparsity 수식 전체(예산 → s → 격자 조회 →
+페어 판정)는 kt에 있다. 그래서 prism 쪽에서 검증할 수 있는 것은 두 가지다:
 
-1. 예산 → threshold 변환 (`slot_thr`) — 루프 레퍼런스와 대조.
-2. cold 밴드만 마스킹된 결과 — full-K가 아니라 **cold 구간만** 마스킹한
+1. **cold 밴드만** 마스킹된 결과 — full-K가 아니라 cold 구간만 마스킹한
    레퍼런스와 대조한다. warm이 dense라는 것이 여기서 검증된다.
+2. 자산 → kt 주입의 정합성 (wn² 여부, 밴드 절단 offset).
+
+threshold를 특정 값으로 고정하려면 calib 자산의 thr 곡선을 그 값으로 채운다
+— 격자 인덱스가 무엇이든 조회 결과가 같아지므로 s를 우회할 수 있다.
 """
 
 import math
@@ -14,66 +17,8 @@ import pytest
 import torch
 
 from sglang.srt.layers.moe.prism.plan import PAIR_GROUP, Proj
-from sglang.srt.layers.moe.prism.sparsity import (
-    LayerSparsity,
-    normalized_router_weights,
-)
 
 NG, GRID, PMAX, RENORM = 201, 0.005, 0.9, 3
-
-
-# ===========================================================================
-# Part A — threshold 변환 (CPU)
-# ===========================================================================
-
-
-def test_slot_thr_matches_loop_reference():
-    """s_mat + 격자 조회를 요소별 루프로 재계산해 대조."""
-    E, k, M, p, lam = 6, 4, 3, 0.4, 3.0
-    torch.manual_seed(7)
-    table = torch.rand(E, NG)
-    sp = LayerSparsity(
-        {pr: table for pr in Proj},
-        {pr: (p, lam) for pr in Proj},
-        pmax=PMAX, grid=GRID, ng=NG, renorm_it=RENORM,
-    )
-    ids = torch.stack([torch.randperm(E)[:k] for _ in range(M)])
-    twn = normalized_router_weights(torch.rand(M, k))
-    got = sp.slot_thr(Proj.GATE, ids, twn)
-
-    ref = torch.empty(M, k)
-    for m in range(M):
-        row = [float(v) for v in twn[m]]
-        gbar = sum(row) / k
-        s = [min(max(p - lam * (v - gbar), 0.0), PMAX) for v in row]
-        for _ in range(RENORM):
-            mean = max(sum(s) / k, 1e-6)
-            s = [min(max(v * (p / mean), 0.0), PMAX) for v in s]
-        for j in range(k):
-            idx = min(max(int(round(s[j] / GRID)), 0), NG - 1)
-            ref[m, j] = table[int(ids[m, j]), idx]
-    assert torch.allclose(got, ref, rtol=1e-5, atol=1e-6)
-
-
-def test_slot_thr_zero_budget_hits_grid_origin():
-    """p=0, lam=0이면 s=0 → 격자 0번 — calib이 그 자리에 0을 둔다."""
-    E, k = 4, 2
-    table = torch.rand(E, NG)
-    table[:, 0] = 0.0
-    sp = LayerSparsity(
-        {pr: table for pr in Proj}, {pr: (0.0, 0.0) for pr in Proj},
-        pmax=PMAX, grid=GRID, ng=NG, renorm_it=RENORM,
-    )
-    ids = torch.tensor([[0, 1]])
-    twn = normalized_router_weights(torch.rand(1, k))
-    assert torch.equal(sp.slot_thr(Proj.DOWN, ids, twn), torch.zeros(1, k))
-
-
-def test_normalized_router_weights_is_idempotent():
-    w = torch.rand(4, 8)
-    once = normalized_router_weights(w)
-    assert torch.allclose(once.sum(-1), torch.ones(4), atol=1e-6)
-    assert torch.allclose(normalized_router_weights(once), once, atol=1e-7)
 
 
 # ===========================================================================
@@ -194,7 +139,7 @@ def build_exec(plan, w13, w2, calib=None):
 
         cold = KtColdBackend(plan, max_tokens=MAX_TOKENS,
                              num_numa_nodes=numa_node_count())
-        cold.load_layer(0, prepared.cold)
+        cold.load_layer(0, prepared.cold, prepared.thr)
     spec = ResourceSpec.from_plan(plan, max_tokens=MAX_TOKENS,
                                   device=torch.device("cuda"))
     ex = PrismExecutor(
@@ -326,13 +271,16 @@ def test_cold_backend_passes_wn_squared(tmp_path):
     prepared = prepare_layer_weights(0, w13, w2, plan, calib=calib)
     cold = KtColdBackend(plan, max_tokens=MAX_TOKENS,
                          num_numa_nodes=numa_node_count())
-    cold.load_layer(0, prepared.cold)
+    cold.load_layer(0, prepared.cold, prepared.thr)
 
     tables = cold._wrappers[0]._sparsity_tables
     assert set(tables) == {
         "gate_wn_sq", "gate_pair_dot", "up_wn_sq", "up_pair_dot",
-        "down_wn_sq", "down_pair_dot",
+        "down_wn_sq", "down_pair_dot", "thr_gate", "thr_up", "thr_down",
     }
+    # thr 곡선은 밴드와 무관하므로 절단되지 않고 [E, ng]로 그대로 간다.
+    assert tables["thr_gate"].shape == (E, NG)
+    assert torch.equal(tables["thr_down"], blob["td2l"][0])
     wn_cold = blob["wn_g"][0][:, WARM_ROWS:H]
     assert torch.allclose(tables["gate_wn_sq"], wn_cold * wn_cold, atol=0)
     assert torch.equal(tables["down_pair_dot"],
@@ -394,14 +342,15 @@ def test_cold_masked_matches_reference(tmp_path):
     x, ids, w = make_exec_inputs(1, seed=34)
     calib, blob = make_exec_calib(tmp_path, 0.0)
     plan = make_exec_plan("mixed")
-    ex = build_exec(plan, w13, w2, calib)
 
+    # thr 곡선을 고른 값으로 채운 자산으로 다시 만든다 — wn/pair_dot은
+    # 같은 seed라 동일하므로 probe로 구한 분위수가 그대로 유효하다.
     picked = probe_thresholds(x, ids, w13, w2, plan, blob, q=0.5)
-    sp = ex._sparsity[0]
-    for proj, value in picked.items():
-        sp._thr[proj] = torch.full_like(sp._thr[proj], value)
-    twn = normalized_router_weights(w.cuda())
-    thr = {p: sp.slot_thr(p, ids.cuda(), twn).cpu() for p in Proj}
+    value = float(sum(picked.values()) / len(picked))
+    calib2, blob2 = make_exec_calib(tmp_path, value)
+    assert torch.equal(blob2["wn_g"], blob["wn_g"])  # 자산 재생성이 재현적인지
+    ex = build_exec(plan, w13, w2, calib2)
+    thr = {p: torch.full((1, K), value) for p in Proj}
 
     out = run_exec(ex, x, ids, w)
     ref = cold_masked_reference(x, ids, w, w13, w2, plan, blob, thr)

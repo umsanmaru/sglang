@@ -25,9 +25,9 @@ graph-safe 경로 (Task 8, M==1 전용 — 캡처 중 자동 선택):
   SGLANG_PRISM_COLD_STREAM 읽기는 조립 지점 method.py의 몫).
 
 sparsity (계약 ①, 선택): plan.sparsity가 있으면 **cold만** 마스킹된다.
-warm/hot은 dense로 계산한다 (2026-08-24 — warm GEMM이 latency 바운드라
-마스킹이 순손실이었다; sparsity.py 참조). 예산·격자 조회는 GPU 한 곳에
-남고 threshold 값만 kt로 내려가며, 마스크 계산·적용은 kt의 몫이다.
+warm/hot은 dense로 계산한다 (warm GEMM이 latency 바운드라 마스킹이 순손실이
+었다 — CONTRACTS.md ①). sparsity 수식 전체가 kt에 있고, 이 모듈이 하는 일은
+라우터 가중을 staging에 내려 포인터를 넘기는 것뿐이다.
 **M==1(decode)에서만** 적용된다 (prefill-dense/decode-sparse).
 
 이 모듈은 env/외부 시스템을 직접 읽지 않는다: 모드 결정 입력(cold_stream,
@@ -76,10 +76,6 @@ from sglang.srt.layers.moe.prism.grouping import GroupingStrategy, select_groupi
 from sglang.srt.layers.moe.prism.kernels import WarmGemmFn
 from sglang.srt.layers.moe.prism.plan import Plan, Proj, Tier
 from sglang.srt.layers.moe.prism.resources import ExecutionResources
-from sglang.srt.layers.moe.prism.sparsity import (
-    LayerSparsity,
-    normalized_router_weights,
-)
 from sglang.srt.layers.moe.prism.stagers import GatherKernelStager, Stager
 from sglang.srt.layers.moe.prism.weights import PreparedWeights
 
@@ -125,12 +121,12 @@ class PrismExecutor:
         self._cold = cold
         self._warm_gemm = gpu_warm_kernel
         self._stager = stager
-        self._sparsity: dict = {}
         self._cold_stream = cold_stream
         self._force_graph_path = force_graph_path
         self._capture_mode_fn = capture_mode_fn or (lambda: False)
         self._layers: dict[int, PreparedWeights] = {}
         self._layer_has_cold: dict[int, bool] = {}
+        self._sparse = plan.sparsity is not None
         # cold task가 나중에 읽는 qlen — 주소 고정 멤버 (계약 ④의 포인터 경유)
         self._qlen_pin = torch.zeros(1, dtype=torch.int32)
         # graph 경로 전용 qlen 버퍼 — eager의 _qlen_pin과 절대 공유하지 않는다.
@@ -152,12 +148,6 @@ class PrismExecutor:
             raise RuntimeError(f"layer {layer_idx} has COLD bands but no cold backend")
         self._layers[layer_idx] = prepared
         self._layer_has_cold[layer_idx] = has_cold
-        if self._plan.sparsity is not None:
-            # device는 arena에서 얻는다 (warm store는 pinned host라 출처가 못 된다).
-            device = self._res.arena.view(Proj.GATE).device
-            self._sparsity[layer_idx] = LayerSparsity.from_prepared(
-                self._plan, layer_idx, prepared, device
-            )
 
     # ── 모드 결정 ──────────────────────────────────────────────────────────
     def _plan_flow(self, m: int, k: int, topk_ids: torch.Tensor) -> _LayerFlow:
@@ -221,16 +211,9 @@ class PrismExecutor:
         # sparsity: M==1(decode)에서만 마스킹한다 (prefill-dense/decode-sparse).
         # threshold는 세 proj 모두 topk_weights만으로 정해지므로 여기서 한 번에
         # 구한다 — 전부 device 연산이라 graph 캡처에 안전하다.
-        # sparsity: cold만 마스킹한다 (warm/hot은 dense — sparsity.py 참조).
-        # threshold는 세 proj 모두 topk_weights만으로 정해지므로 여기서 한 번에
-        # 구한다 — 전부 device 연산이라 graph 캡처에 안전하다.
-        sp = self._sparsity.get(layer_idx)
-        masking = sp is not None and m == 1
-        thr = None
-        if masking:
-            with _nvtx("sparsity.thr"):
-                twn = normalized_router_weights(topk_weights)
-                thr = {p: sp.slot_thr(p, topk_ids, twn) for p in Proj}  # [M, k]
+        # sparsity: cold만 마스킹한다 (warm/hot은 dense). 라우터 가중만
+        # 내려보내면 kt가 예산·격자 조회·마스크 판정을 전부 처리한다.
+        masking = self._sparse and m == 1
         flat_ids = topk_ids.view(-1)
 
         # ── Phase 1: gateup ──────────────────────────────────────────────
@@ -254,24 +237,21 @@ class PrismExecutor:
                 else:
                     res.staging.fill_expert_ids(flow.ids_cpu)
                     self._qlen_pin[0] = m
-            # sparsity: cold도 자기 밴드를 마스킹한다 (계약 ①). threshold는
-            # GPU가 정한 값을 그대로 내려보낸다 — 마스크 계산만 CPU가 하고
-            # 예산·격자 조회는 한 곳(sparsity.py)에 남는다.
-            gu_thr_ptr = 0
+            # sparsity: 라우터 가중을 한 번 내리면 gateup/down 양쪽이 쓴다
+            # (레이어 안에서 다시 쓰지 않으므로 버퍼 하나로 충분하다).
+            w_ptr = 0
             if masking:
-                with _nvtx("cold.gu.fill_thr"):
-                    res.staging.fill_thr(0, 0, thr[Proj.GATE],
-                                         non_blocking=flow.use_cold_stream)
-                    res.staging.fill_thr(0, 1, thr[Proj.UP],
-                                         non_blocking=flow.use_cold_stream)
-                gu_thr_ptr = res.staging.thr_ptr(0)
+                with _nvtx("cold.fill_topk_w"):
+                    res.staging.fill_topk_w(
+                        topk_weights, non_blocking=flow.use_cold_stream)
+                w_ptr = res.staging.topk_w_ptr()
             with _nvtx("cold.gu.submit"):
                 self._cold.submit_gateup(         # enqueue-only, 즉시 반환
                     layer_idx, flow.qlen_ptr, k,
                     res.staging.expert_ids_ptr(), res.staging.x_ptr(),
                     res.staging.partial_gateup_ptr(),
                     cuda_stream=flow.stream_arg,
-                    thr_ptr=gu_thr_ptr,
+                    weights_ptr=w_ptr,
                 )
             _nvtx_push("cold.gu.window")          # CPU expert 연산 재실 구간
 
@@ -329,19 +309,13 @@ class PrismExecutor:
         if has_cold:
             with _nvtx("cold.dn.fill_act(D2H-block)"):
                 res.staging.fill_act(act, non_blocking=flow.use_cold_stream)
-            dn_thr_ptr = 0
-            if masking:
-                with _nvtx("cold.dn.fill_thr"):
-                    res.staging.fill_thr(1, 2, thr[Proj.DOWN],
-                                         non_blocking=flow.use_cold_stream)
-                dn_thr_ptr = res.staging.thr_ptr(1)
             with _nvtx("cold.dn.submit"):
                 self._cold.submit_down(
                     layer_idx, flow.qlen_ptr, k,
                     res.staging.expert_ids_ptr(), res.staging.act_ptr(),
                     res.staging.partial_down_ptr(),
                     cuda_stream=flow.stream_arg,
-                    thr_ptr=dn_thr_ptr,
+                    weights_ptr=w_ptr,
                 )
             _nvtx_push("cold.dn.window")
 

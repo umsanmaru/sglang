@@ -83,7 +83,7 @@ def build_executor(plan, w13, w2, **executor_kwargs):
     cold = None
     if has_cold:
         cold = KtColdBackend(plan, max_tokens=MAX_TOKENS, num_numa_nodes=NUM_NODES)
-        cold.load_layer(0, prepared.cold)
+        cold.load_layer(0, prepared.cold, prepared.thr)
     spec = ResourceSpec.from_plan(plan, max_tokens=MAX_TOKENS, device=torch.device("cuda"))
     res = ExecutionResources(spec)
     ex = PrismExecutor(plan, res, cold, resolve_gpu_kernel(plan.kernels.gpu_warm),
