@@ -77,7 +77,9 @@ def main():
                     help="gate-dynamic λ (기본: 자산의 lam0)")
     args = ap.parse_args()
 
-    cfg = json.loads((Path(args.model_dir) / "config.json").read_text())
+    raw = json.loads((Path(args.model_dir) / "config.json").read_text())
+    # VLM config(Qwen3.5/3.6 계열)는 언어모델 치수를 text_config 아래에 둔다.
+    cfg = raw.get("text_config", raw)
     hidden = cfg["hidden_size"]
     inter = cfg["moe_intermediate_size"]
     experts = (cfg.get("num_experts") or cfg.get("n_routed_experts")
@@ -99,7 +101,7 @@ def main():
 
     plan = {
         "schema_version": 2 if sparsity else 1,
-        "model_id": cfg.get("_name_or_path") or Path(args.model_dir).name,
+        "model_id": raw.get("_name_or_path") or cfg.get("_name_or_path") or Path(args.model_dir).name,
         "dims": {
             "hidden_size": hidden,
             "intermediate_size": inter,
