@@ -1,7 +1,7 @@
 """Stage 2: weight 절단·변환·배치. 산출물은 PreparedWeights (계약 ③).
 
 소유권 (계약 ③):
-- hot  → Python 소유 device 텐서 (P0: None)
+- hot  → Python 소유 device 텐서 (VRAM 상주, 전송 없음)
 - warm → Python 소유 pinned 텐서 + (proj) → k_offset
 - cold → C++ MOE 객체 핸들. 단, cold backend(K3/S5)가 붙기 전까지는
   PendingColdTensors가 슬라이스본을 임시 소유한다 — backend 접속 시
@@ -18,6 +18,9 @@ w13/w2에 대한 참조를 보관하지 않으며, 호출자는 반환 즉시 �
   trtllm cutlass 계열)를 세팅하면 w13 내부 순서가 뒤집힌다. 이 로더는
   기본 순서를 가정하므로, method 통합(S7)에서 해당 플래그가 False임을
   assert해야 한다 — 위반 시 gate/up이 조용히 뒤바뀐다.
+- hot store는 warm과 **같은 방향** [E, k_rows, N] (K-major, device). 같은
+  warm GEMM 커널(kernels.py 계약)에 그대로 들어간다 — hot이 warm과 다른 것은
+  '어디 상주하고 step마다 옮기는가' 하나뿐이고 계산 계약은 동일하다.
 - warm store는 [E, k_rows, N] (K-major) — transpose 표기 없이 GEMM에
   들어가는 no-transpose 정준 방향을 로드 시점에 한 번 고정한 것
   (kernels.py의 warm GEMM 계약이 이 방향 하나만 가정; N-major도 GEMM
@@ -32,7 +35,6 @@ CPU fp32로 남긴다 — warm 쪽 device 배치는 device 메모리 소유자(r
 executor)의 결정이라 여기서 앞질러 정하지 않는다.
 
 P0 loader capability gap (스키마 제약이 아님, NotImplementedError로 명시):
-- HOT 밴드 미지원
 - 티어당 다중 밴드 미지원
 - 레이어 내 expert 간 기하 불일치 미지원 (store가 [E, ...] 균일 적층이므로)
 """
@@ -52,6 +54,37 @@ from sglang.srt.layers.moe.prism.plan import (
     Proj,
     Tier,
 )
+
+
+@dataclass
+class HotBand:
+    """한 proj의 hot 밴드: device bf16 [E, k_rows, N] (warm과 동일 K-major).
+
+    warm과 방향이 같은 이유는 같은 GEMM 커널을 타기 때문이다. 차이는 상주
+    위치뿐이라 executor에서 stager/arena 경유가 사라지고 index_select 하나로
+    [g, k_rows, N]가 나온다.
+    """
+
+    k_offset: int
+    weights: torch.Tensor
+    # sparsity 점수 재료 (이 밴드 구간만). plan.sparsity가 있으면 존재.
+    # hot은 dense로 계산하므로(계약 ①) 현재 소비자가 없다 — warm과 대칭을
+    # 유지해 밴드 재배치 시 특례가 생기지 않게 두는 것.
+    calib: Optional[CalibBand] = None
+
+    @property
+    def k_rows(self) -> int:
+        return self.weights.shape[1]
+
+
+@dataclass
+class HotStore:
+    gate: Optional[HotBand]
+    up: Optional[HotBand]
+    down: Optional[HotBand]
+
+    def band(self, proj: Proj) -> Optional[HotBand]:
+        return {Proj.GATE: self.gate, Proj.UP: self.up, Proj.DOWN: self.down}[proj]
 
 
 @dataclass
@@ -109,7 +142,7 @@ class PendingColdTensors:
 class PreparedWeights:
     """Stage 2의 유일한 산출물이자 weight lifetime owner (계약 ③)."""
 
-    hot: None  # P0: hot = ∅
+    hot: Optional[HotStore]  # VRAM 상주 밴드 (없으면 세 proj 모두 None)
     warm: WarmStore
     cold: PendingColdTensors  # S5 이후: ColdHandle
     # proj → [E, ng] fp32 threshold 곡선. dense plan이면 None.
@@ -159,6 +192,7 @@ def prepare_layer_weights(
     *,
     calib: Optional[CalibTables] = None,
     pin_memory: bool = True,
+    device: Optional[torch.device] = None,
 ) -> PreparedWeights:
     """한 레이어의 full weight를 Plan대로 절단·변환·배치한다.
 
@@ -169,6 +203,8 @@ def prepare_layer_weights(
     있으면 마스킹이 조용히 사라지거나 테이블이 버려지므로 즉사한다.
 
     pin_memory=False는 CUDA 없는 테스트용 탈출구다.
+    device는 HOT 밴드가 있을 때만 필요하다 (없으면 요구하지 않는다 — CPU
+    전용 테스트가 hot 없는 plan으로 계속 돌 수 있어야 하므로).
     """
     dims = plan.dims
     if (plan.sparsity is None) != (calib is None):
@@ -189,16 +225,45 @@ def prepare_layer_weights(
             f"plan이 다른 모델에 적용되고 있을 가능성"
         )
 
+    hot_bands: dict[Proj, Optional[HotBand]] = {}
     warm_bands: dict[Proj, Optional[WarmBand]] = {}
     cold_bands: dict[Proj, Optional[ColdBand]] = {}
+
+    any_hot = any(
+        _uniform_proj_plan(plan, layer_idx, p).has_tier(Tier.HOT) for p in Proj
+    )
+    if any_hot and device is None:
+        raise PlanError(
+            f"layer {layer_idx}: plan has HOT bands but no device was given — "
+            f"hot store는 VRAM 상주라 배치 device가 로더의 입력이어야 한다"
+        )
 
     for proj in Proj:
         pp = _uniform_proj_plan(plan, layer_idx, proj)
         where = f"layer {layer_idx} {proj.value}"
-        if pp.has_tier(Tier.HOT):
-            raise NotImplementedError(f"{where}: P0 loader does not support HOT bands")
 
         src = _proj_source(w13, w2, dims.intermediate_size, proj)  # [E, N, K]
+
+        hot = _single_band(pp, Tier.HOT, where)
+        if hot is None:
+            hot_bands[proj] = None
+        else:
+            # warm과 같은 [E, N, k] → [E, k, N] 변환. 차이는 목적지가 device라는
+            # 것뿐 — .to()가 H2D까지 한 번에 한다 (transpose가 non-contiguous라
+            # copy는 어차피 발생하므로 중간 CPU contiguous 사본을 만들지 않는다).
+            hot_bands[proj] = HotBand(
+                k_offset=hot.start,
+                weights=src[:, :, hot.start : hot.end]
+                .transpose(1, 2)
+                .contiguous()
+                .to(device, non_blocking=False),
+                calib=(
+                    None if calib is None
+                    else calib.slice_band(
+                        layer_idx, proj, hot.start, hot.end, f"{where} hot"
+                    )
+                ),
+            )
 
         warm = _single_band(pp, Tier.WARM, where)
         if warm is None:
@@ -237,8 +302,10 @@ def prepare_layer_weights(
                 ),
             )
 
-        got = (warm.end - warm.start if warm else 0) + (
-            cold.end - cold.start if cold else 0
+        got = (
+            (hot.end - hot.start if hot else 0)
+            + (warm.end - warm.start if warm else 0)
+            + (cold.end - cold.start if cold else 0)
         )
         if got != dims.k_of(proj):
             # validate_static이 커버리지를 이미 보증하므로, 여기 도달은
@@ -248,7 +315,9 @@ def prepare_layer_weights(
             )
 
     return PreparedWeights(
-        hot=None,
+        hot=HotStore(
+            gate=hot_bands[Proj.GATE], up=hot_bands[Proj.UP], down=hot_bands[Proj.DOWN]
+        ),
         warm=WarmStore(
             gate=warm_bands[Proj.GATE], up=warm_bands[Proj.UP], down=warm_bands[Proj.DOWN]
         ),

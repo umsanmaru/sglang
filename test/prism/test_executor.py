@@ -1,8 +1,10 @@
 """Prism vertical slice의 심장 테스트: 3-tier rejoin 정확성 (GPU + kt AMX 필요).
 
 - torch fp32 full-MoE 레퍼런스 대비 tolerance (decode/prefill)
-- plan 불변성: "warm+cold 혼합", "전부 cold", "전부 warm"이 동일 입력에서
-  일치 — rejoin의 이중계산/누락 검출 (계약 ⑤)
+- plan 불변성: "warm+cold 혼합", "전부 cold", "전부 warm", "전부 hot",
+  "hot+warm+cold"가 동일 입력에서 일치 — rejoin의 이중계산/누락 검출 (계약 ⑤).
+  티어 경계를 어디로 옮겨도 출력이 같다는 것이 K-split의 정의이므로, HOT
+  구현의 검증도 여기에 얹는 것이 맞다.
 """
 
 import pytest
@@ -51,6 +53,16 @@ def make_plan(kind):
     elif kind == "all_warm":
         gate_up = proj_entry([[0, 256, "warm"]], 128)
         down = proj_entry([[0, 128, "warm"]], 256)
+    elif kind == "all_hot":
+        gate_up = proj_entry([[0, 256, "hot"]], 128)
+        down = proj_entry([[0, 128, "hot"]], 256)
+    elif kind == "three_tier":
+        # down의 K=128은 ROW_GROUP=64로 밴드 2개가 한계라 hot+cold로 둔다
+        # (proj마다 티어 조합이 달라도 되는 것 자체가 검증 대상).
+        gate_up = proj_entry([[0, 64, "hot"], [64, 128, "warm"], [128, 256, "cold"]], 128)
+        down = proj_entry([[0, 64, "hot"], [64, 128, "cold"]], 256)
+    else:
+        raise ValueError(f"unknown plan kind {kind!r}")
     raw = {
         "schema_version": 1,
         "model_id": "test/tiny",
@@ -76,7 +88,7 @@ def build_executor(plan, w13, w2, **executor_kwargs):
     (예: force_graph_path=True, cold_stream=True, capture_mode_fn=...)."""
     from sglang.srt.layers.moe.prism.plan import Proj
 
-    prepared = prepare_layer_weights(0, w13, w2, plan)
+    prepared = prepare_layer_weights(0, w13, w2, plan, device=torch.device("cuda"))
     ep = plan.expert(0, 0)
     has_cold = any(ep.proj(p).has_tier(Tier.COLD) for p in Proj)
 
@@ -127,7 +139,7 @@ def rel_diff(a, b):
 
 @cuda_required
 @pytest.mark.parametrize("qlen", [1, 16])
-@pytest.mark.parametrize("kind", ["mixed", "all_cold", "all_warm"])
+@pytest.mark.parametrize("kind", ["mixed", "all_cold", "all_warm", "all_hot", "three_tier"])
 def test_layer_matches_reference(kind, qlen):
     plan = make_plan(kind)
     w13, w2 = make_weights()
@@ -147,11 +159,15 @@ def test_plan_invariance(qlen):
     어디에 있든 결과가 같다는 K-split의 핵심 성질 (이중계산/누락 검출)."""
     w13, w2 = make_weights(seed=1)
     x, ids, w = make_inputs(qlen, seed=20 + qlen)
+    kinds = ["mixed", "all_cold", "all_warm", "all_hot", "three_tier"]
     outs = {}
-    for kind in ["mixed", "all_cold", "all_warm"]:
+    for kind in kinds:
         ex = build_executor(make_plan(kind), w13, w2)
         outs[kind] = run(ex, x, ids, w)
-    d1 = rel_diff(outs["mixed"], outs["all_cold"])
-    d2 = rel_diff(outs["mixed"], outs["all_warm"])
-    print(f"invariance qlen={qlen}: mixed~cold {d1:.6f}, mixed~warm {d2:.6f}")
-    assert d1 < 0.02 and d2 < 0.02
+    # 기준을 all_cold 하나로 잡는다: 모든 티어 배치가 같은 값에 수렴해야 하므로
+    # 쌍별 비교가 아니라 공통 기준 대비가 결함 위치를 좁혀준다.
+    diffs = {kind: rel_diff(outs[kind], outs["all_cold"]) for kind in kinds}
+    print(f"invariance qlen={qlen}: " +
+          ", ".join(f"{kind}~cold {d:.6f}" for kind, d in diffs.items()))
+    for kind, d in diffs.items():
+        assert d < 0.02, f"{kind} diverges from all_cold: {d:.6f}"

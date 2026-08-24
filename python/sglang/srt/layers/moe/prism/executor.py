@@ -3,10 +3,19 @@
 제어 흐름 (CONTRACTS.md / P0 스펙):
 
     topk D2H(S1) → dedup·그룹
-    cold gateup submit ∥ warm: [stage → GEMM] 그룹 직렬 루프
+    cold gateup submit ∥ hot: [gather → GEMM] ∥ warm: [stage → GEMM] 그룹 직렬 루프
     cold sync(S3) → rejoin#1 (fp32 합 → act → bf16)
     cold down submit ∥ warm down
     cold sync → rejoin#2 (fp32 합 → router 가중 expert합 → bf16)
+
+hot 티어 (계약 ①): VRAM 상주라 stager도 arena도 타지 않는다 — warm 경로에서
+전송 단계만 빠진 형태이고, GEMM 커널·grouping 계약은 warm과 **완전히 동일**하다
+(hot store가 warm과 같은 [E, k_rows, N] K-major이기 때문). 그룹 루프를 warm과
+공유하는 이유는 slot 제약 때문이 아니라(hot에는 없다) scatter_gateup/down_apply의
+(m, j) 좌표 복원 규약을 하나로 유지하기 위해서다.
+발행 순서는 `WAR 시드 record → hot GEMM → warm 루프`다: hot은 arena를 건드리지
+않으므로 warm의 첫 H2D가 hot GEMM 뒤로 밀릴 이유가 없고, 이 순서에서만 warm
+전송이 hot 연산 뒤에 겹친다.
 
 원칙:
 - primitive는 영구 메모리를 할당하지 않는다 — arena/staging은
@@ -83,6 +92,11 @@ from sglang.srt.layers.moe.prism.weights import PreparedWeights
 def _band_slice(x: torch.Tensor, band) -> torch.Tensor:
     """x[..., k_offset : k_offset + k_rows] — 마스킹 대상 밴드 구간."""
     return x[..., band.k_offset : band.k_offset + band.k_rows]
+
+
+def _hot_band(prepared: PreparedWeights, proj: Proj):
+    """hot store가 아예 없는 PreparedWeights(구 테스트 픽스처)도 받아준다."""
+    return None if prepared.hot is None else prepared.hot.band(proj)
 
 
 @dataclass(frozen=True)
@@ -255,15 +269,36 @@ class PrismExecutor:
                 )
             _nvtx_push("cold.gu.window")          # CPU expert 연산 재실 구간
 
+        # WAR 시드: 이전 레이어의 down GEMM이 같은 arena 바이트를 읽는 중일 수
+        # 있다 (down이 gate/up storage를 alias + 레이어 간 재사용). 첫 stage가
+        # current stream의 기왕 작업 완료를 기다리게 한다.
+        # **hot GEMM보다 먼저** 기록한다 — hot은 arena를 안 건드리므로 warm의
+        # 첫 H2D가 hot 연산을 기다릴 이유가 없다 (순서가 뒤집히면 hot이 클수록
+        # warm 전송이 통째로 직렬화된다).
+        prev_done = torch.cuda.Event()
+        prev_done.record(torch.cuda.current_stream())
+
+        hot_gu = None
+        hot_g, hot_u = _hot_band(prepared, Proj.GATE), _hot_band(prepared, Proj.UP)
+        if hot_g is not None:
+            hot_gu = torch.zeros(m, k, 2 * inter, dtype=torch.float32, device=hidden.device)
+            for gi, group in enumerate(flow.groups):
+                with _nvtx(f"hot.gu.g{gi}x{len(group)}"):
+                    with _nvtx("gather.gate+up"):
+                        wg = self._hot_stack(hot_g, group, gi, flow)
+                        wu = self._hot_stack(hot_u, group, gi, flow)
+                    with _nvtx("gemm.gate"):
+                        gate_out = self._warm_gemm(hidden, wg, hot_g.k_offset)
+                    with _nvtx("gemm.up"):
+                        up_out = self._warm_gemm(hidden, wu, hot_u.k_offset)
+                    with _nvtx("scatter.gu"):
+                        flow.grouping.scatter_gateup(hot_gu, topk_ids, group, gi,
+                                                     res.spec.n_slots, gate_out, up_out, inter)
+
         warm_gu = None
         gate_band, up_band = prepared.warm.band(Proj.GATE), prepared.warm.band(Proj.UP)
         if gate_band is not None:
             warm_gu = torch.zeros(m, k, 2 * inter, dtype=torch.float32, device=hidden.device)
-            # WAR 시드: 이전 레이어의 down GEMM이 같은 arena 바이트를 읽는 중일 수
-            # 있다 (down이 gate/up storage를 alias + 레이어 간 재사용). 첫 stage가
-            # current stream의 기왕 작업 완료를 기다리게 한다.
-            prev_done = torch.cuda.Event()
-            prev_done.record(torch.cuda.current_stream())
             for gi, group in enumerate(flow.groups):
                 with _nvtx(f"warm.gu.g{gi}x{len(group)}"):
                     with _nvtx("stage.gate+up(H2D)"):
@@ -301,7 +336,8 @@ class PrismExecutor:
 
         # rejoin#1: fp32 합 → act → bf16 (계약 ⑤)
         with _nvtx("rejoin1.acc+silu"):
-            gu = self._accumulate(warm_gu, cold_gu, (m, k, 2 * inter), hidden.device)
+            gu = self._accumulate((hot_gu, warm_gu, cold_gu),
+                                  (m, k, 2 * inter), hidden.device)
             gate, up = gu.split(inter, dim=2)
             act = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)  # [M, k, inter]
 
@@ -319,17 +355,31 @@ class PrismExecutor:
                 )
             _nvtx_push("cold.dn.window")
 
+        # WAR 시드: down arena는 gate/up storage를 alias — 첫 down stage는
+        # gateup GEMM(current stream)이 arena를 다 읽은 뒤에만 덮어야 한다.
+        # (이전의 prev_done=None은 잠복 레이스였고, slot당 host 동기화가
+        #  우연히 직렬화해 숨겨져 있었다 — sync-free 전환에서 발현, 2026-08-20)
+        prev_done = torch.cuda.Event()
+        prev_done.record(torch.cuda.current_stream())
+
+        hot_down = None
+        hot_d = _hot_band(prepared, Proj.DOWN)
+        if hot_d is not None:
+            hot_down = torch.zeros(m, k, h, dtype=torch.float32, device=hidden.device)
+            hot_act = _band_slice(act, hot_d).float()
+            for gi, group in enumerate(flow.groups):
+                with _nvtx(f"hot.dn.g{gi}x{len(group)}"):
+                    with _nvtx("gather.down"):
+                        wd = self._hot_stack(hot_d, group, gi, flow)
+                    with _nvtx("gemm+where.dn"):
+                        hot_down = flow.grouping.down_apply(
+                            hot_down, topk_ids, group, gi, res.spec.n_slots, hot_act, wd)
+
         warm_down = None
         down_band = prepared.warm.band(Proj.DOWN)
         if down_band is not None:
             warm_down = torch.zeros(m, k, h, dtype=torch.float32, device=hidden.device)
             act_band = act[:, :, down_band.k_offset : down_band.k_offset + down_band.k_rows].float()
-            # WAR 시드: down arena는 gate/up storage를 alias — 첫 down stage는
-            # gateup GEMM(current stream)이 arena를 다 읽은 뒤에만 덮어야 한다.
-            # (이전의 prev_done=None은 잠복 레이스였고, slot당 host 동기화가
-            #  우연히 직렬화해 숨겨져 있었다 — sync-free 전환에서 발현, 2026-08-20)
-            prev_done = torch.cuda.Event()
-            prev_done.record(torch.cuda.current_stream())
             for gi, group in enumerate(flow.groups):
                 with _nvtx(f"warm.dn.g{gi}x{len(group)}"):
                     with _nvtx("stage.down(H2D)"):
@@ -355,7 +405,8 @@ class PrismExecutor:
 
         # rejoin#2: fp32 합 → router 가중 expert합 → bf16
         with _nvtx("rejoin2.acc+wsum"):
-            down = self._accumulate(warm_down, cold_down, (m, k, h), hidden.device)
+            down = self._accumulate((hot_down, warm_down, cold_down),
+                                    (m, k, h), hidden.device)
             out = (down * topk_weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
         _nvtx_pop()                               # prism.L{layer_idx}
         return out.to(torch.bfloat16)
@@ -389,13 +440,35 @@ class PrismExecutor:
                 self._graph_stager = GatherKernelStager(self._res)
         return self._graph_stager
 
+    def _hot_stack(self, band, group: Sequence[int], gi: int,
+                   flow: _LayerFlow) -> torch.Tensor:
+        """hot store에서 그룹의 [g, k_rows, N] GEMM 입력을 모은다.
+
+        sel 원천은 _stage와 같은 규약이다: graph 경로의 그룹은 위치 표지라
+        flat_ids의 같은 위치 절단이고, eager 그룹은 expert id 목록 그 자체다.
+
+        index_select는 [g, k_rows, N] 사본을 만든다 — bmm이 연속 배치 축을
+        요구하므로 피할 수 없다 (읽기+쓰기로 GEMM 자체 읽기량의 2배가 추가
+        HBM 트래픽이다). 상주 티어라 PCIe는 전혀 타지 않으므로 warm 대비
+        이득이 압도적이지만, hot 비율이 커지면 여기가 먼저 보인다.
+        """
+        if flow.graph_flow:
+            j0 = gi * self._res.spec.n_slots
+            sel = flow.flat_ids[j0 : j0 + len(group)]
+        else:
+            sel = torch.as_tensor(group, dtype=torch.long, device=band.weights.device)
+        return band.weights.index_select(0, sel)
+
     @staticmethod
-    def _accumulate(warm: Optional[torch.Tensor], cold: Optional[torch.Tensor],
+    def _accumulate(parts: Sequence[Optional[torch.Tensor]],
                     shape, device) -> torch.Tensor:
         """티어 partial들의 fp32 합 (없는 티어는 0 기여)."""
-        if warm is None and cold is None:
+        total: Optional[torch.Tensor] = None
+        for part in parts:
+            if part is None:
+                continue
+            p32 = part if part.dtype == torch.float32 else part.to(torch.float32)
+            total = p32 if total is None else total + p32
+        if total is None:
             return torch.zeros(shape, dtype=torch.float32, device=device)
-        total = warm if warm is not None else torch.zeros(shape, dtype=torch.float32, device=device)
-        if cold is not None:
-            total = total + cold.to(torch.float32)
         return total

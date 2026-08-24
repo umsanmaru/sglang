@@ -95,7 +95,7 @@ def test_stage_from_device_bitwise():
 # ── 2. 경로 등가 (캡처 없이 강제) ─────────────────────────────────────────
 
 @cuda_required
-@pytest.mark.parametrize("kind", ["mixed", "all_cold", "all_warm"])
+@pytest.mark.parametrize("kind", ["mixed", "all_cold", "all_warm", "all_hot", "three_tier"])
 def test_graph_path_matches_eager(kind):
     """graph-safe 경로(더미 그룹 + device sel + stream 통합 cold)가 일반
     eager 경로와 bitwise 일치 — 같은 바이트를 같은 커널에 넣으므로
@@ -160,11 +160,16 @@ def _warmup_and_capture(ex, x_buf, ids_buf, w_buf):
 
 
 @cuda_required
-def test_capture_replay_matches_eager():
+@pytest.mark.parametrize("kind", ["mixed", "three_tier"])
+def test_capture_replay_matches_eager(kind):
     """run_layer를 실제 CUDA graph로 캡처하고, 입력 버퍼 값만 갈아끼운
     replay 출력이 같은 값의 eager 출력과 bitwise 일치하는지 — kt host node
-    (submit/sync cudaLaunchHostFunc)의 캡처·재생 포함."""
-    plan = make_plan("mixed")
+    (submit/sync cudaLaunchHostFunc)의 캡처·재생 포함.
+
+    three_tier는 hot의 index_select가 캡처 가능한지를 본다: sel이 device
+    텐서(flat_ids 절단)여야만 캡처되고, host 리스트에서 만들면 캡처 중
+    pageable H2D로 죽는다."""
+    plan = make_plan(kind)
     w13, w2 = make_weights()
     toggle = _Toggle()
     ex = build_executor(plan, w13, w2, capture_mode_fn=toggle)

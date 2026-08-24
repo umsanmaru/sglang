@@ -94,8 +94,17 @@ Prism = K-split hot/warm/cold 티어링 MoE 오프로드. 패키지명이자 프
    — 마지막 것은 격자가 pmax에 못 닿으면 idx가 clamp되어 threshold가 조용히
    포화하기 때문이다. calib_probe 주입 시 자산 테이블 shape까지 대조.
 
-스키마는 티어당 다중 밴드(interleave)를 허용한다. P0 plan은 밴드 ≤ 3개
-(hot=∅, warm=첫 10%, cold=나머지)인 퇴화형일 뿐이다.
+스키마는 티어당 다중 밴드(interleave)를 허용한다. 현 실행 계층은 **티어당
+단일 밴드**까지 집행한다 — `[hot | warm | cold]` 순서의 3-tier가 최대이고,
+빈 티어는 밴드를 만들지 않는다 (hot=∅면 기존 2-tier와 동일).
+
+**HOT 실행 계약 (2026-08-24 구현):** hot store는 warm과 **같은** `[E, k_rows, N]`
+K-major 방향이고 **같은 warm GEMM 커널**을 탄다. 티어 간 유일한 차이는
+"어디 상주하며 step마다 무엇을 옮기는가"이지 계산 계약이 아니다 — 그래서
+executor에서 hot 경로는 warm 경로에서 stager·arena만 빠진 형태이고, `[g, k_rows, N]`
+배치는 `index_select`(device sel) 하나로 만들어진다. 이것이 `all_hot`과
+`all_warm`의 출력이 **완전히 동일**해야 하는 이유이고, test_executor의
+plan 불변성 테스트가 그 등호를 지킨다.
 
 **Plan 파일에는 `schema_version`, `model_id`, dims가 반드시 포함된다.**
 Plan 생성기는 이 코드베이스 밖이며, 여기는 스키마·파서·검증기만 소유한다.
@@ -193,18 +202,20 @@ void forward_down_partial(int qlen, int k,
 ```python
 @dataclass
 class PreparedWeights:          # Stage 2의 유일한 산출물이자 lifetime owner
-    hot:  HotWeights | None     # Python 소유 device 텐서 (P0: None)
+    hot:  HotStore              # Python 소유 device 텐서 (밴드 없으면 멤버가 전부 None)
     warm: WarmStore             # Python 소유 pinned 텐서 + (expert, proj) → offset
     cold: ColdHandle            # C++ MOE 객체 핸들 — packed NUMA 메모리는 C++ 소유
 ```
 
-(`HotWeights`/`ColdHandle`은 미구현 자리 표시 — hot tier/K3 시점에 실물이
-생긴다. 현 구현(weights.py)에서 hot은 `None`, cold는 `PendingColdTensors`
-(backend 접속 전 임시 소유자)다.)
+(`ColdHandle`은 자리 표시 — K3 시점에 실물이 생긴다. 현 구현(weights.py)에서
+cold는 `PendingColdTensors`(backend 접속 전 임시 소유자)다.)
 
 - Stage 2 종료 후 full-K 텐서는 어디에도 존재하지 않는다.
 - weight 수명 = PreparedWeights의 수명.
 - warm의 pinned 메모리는 GPU DMA만 읽는다 (C++는 warm의 존재를 모른다).
+- hot의 device 메모리는 로더가 배치한다 — 배치 device는 `prepare_layer_weights`
+  의 **입력**이지 로더가 정하는 값이 아니다. hot 밴드가 있는데 device가 없으면
+  즉사한다(조용히 CPU에 두면 티어 의미가 사라진다).
 - cold 핸들 해제 전에는 in-flight CPU task의 drain이 선행돼야 한다.
 
 ---

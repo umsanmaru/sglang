@@ -1,15 +1,20 @@
 #!/usr/bin/env python
 """P0 uniform plan 생성기 (개발 도구 — 실제 생성기는 코드베이스 밖).
 
-모델 config.json에서 dims를 읽어 hot=∅ / warm=선두 fraction(64-정렬) /
-cold=나머지의 uniform plan을 만든다. NUMA shard는 32-정렬 반반.
+모델 config.json에서 dims를 읽어 K축 선두부터
+hot(--hot-frac) / warm(--warm-frac) / cold(나머지)로 자른 uniform plan을
+만든다. 경계는 전부 64-정렬, NUMA shard는 32-정렬 반반.
+
+hot 비율은 VRAM 예산이 정한다: expert weight 총량 = NL·NE·(2·I·H + H·I)·2B
+이고 hot이 그 fraction만큼 상주한다 (Qwen3.6-35B-A3B는 60 GiB → f=0.5면
+30 GiB). --hot-frac 0이면 기존 2-tier plan과 완전히 동일한 출력이다.
 
 --calib을 주면 schema_version 2 (sparsity) plan을 만든다: pmax/grid/ng/
 renorm_it과 λ0는 **자산에서 읽어** 넣는다 (하드코딩하면 Plan과 자산이
 조용히 어긋난다). torch import는 이때만 발생한다.
 
 사용:
-  python gen_uniform_plan.py <model_dir> <out.json> [--warm-frac 0.1]
+  python gen_uniform_plan.py <model_dir> <out.json> [--hot-frac 0] [--warm-frac 0.1]
   python gen_uniform_plan.py <model_dir> <out.json> \
       --calib assets/qwen35/gatedyn_calib.pt [--target-p 0.5] [--lam 8.0]
 """
@@ -23,14 +28,24 @@ ROW_GROUP = 64
 COL_GROUP = 32
 
 
-def bands(K: int, warm_frac: float):
+def bands(K: int, hot_frac: float, warm_frac: float):
+    """K축을 [hot | warm | cold] 순으로 자른다. 빈 티어는 밴드를 안 만든다.
+
+    잘림(floor)은 항상 cold로 흘러간다 — hot/warm이 계획보다 커지는 쪽으로
+    반올림하면 VRAM/pinned 예산을 조용히 초과한다.
+    """
+    hot = int(K * hot_frac) // ROW_GROUP * ROW_GROUP
     warm = int(K * warm_frac) // ROW_GROUP * ROW_GROUP
+    if hot + warm > K:
+        raise SystemExit(f"hot+warm={hot + warm} exceeds K={K}")
     out = []
+    if hot > 0:
+        out.append([0, hot, "hot"])
     if warm > 0:
-        out.append([0, warm, "warm"])
-    if warm < K:
-        out.append([warm, K, "cold"])
-    return out, warm < K
+        out.append([hot, hot + warm, "warm"])
+    if hot + warm < K:
+        out.append([hot + warm, K, "cold"])
+    return out, hot + warm < K
 
 
 def shards(N: int, num_nodes: int = 2):
@@ -69,6 +84,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir")
     ap.add_argument("out")
+    ap.add_argument("--hot-frac", type=float, default=0.0,
+                    help="VRAM 상주 비율 (0이면 기존 2-tier plan과 동일)")
     ap.add_argument("--warm-frac", type=float, default=0.1)
     ap.add_argument("--numa-nodes", type=int, default=2)
     ap.add_argument("--calib", help="gatedyn calib .pt (주면 schema_version 2)")
@@ -87,8 +104,8 @@ def main():
     top_k = cfg.get("num_experts_per_tok") or cfg.get("top_k")
     layers = cfg["num_hidden_layers"]
 
-    gu_bands, gu_cold = bands(hidden, args.warm_frac)
-    dn_bands, dn_cold = bands(inter, args.warm_frac)
+    gu_bands, gu_cold = bands(hidden, args.hot_frac, args.warm_frac)
+    dn_bands, dn_cold = bands(inter, args.hot_frac, args.warm_frac)
     gate_up = {"bands": gu_bands, "cold_shards": shards(inter, args.numa_nodes) if gu_cold else []}
     down = {"bands": dn_bands, "cold_shards": shards(hidden, args.numa_nodes) if dn_cold else []}
 
@@ -117,6 +134,21 @@ def main():
         plan["sparsity"] = sparsity
     Path(args.out).write_text(json.dumps(plan, indent=1))
     tag = f"  sparsity={sparsity['score']} p={gate_up['p']} λ={gate_up['lambda']}" if sparsity else ""
+    # VRAM/pinned 예산을 눈으로 확인할 수 있게 실제 밴드에서 역산해 찍는다
+    # (요청한 fraction이 아니라 64-정렬 후의 값이라야 예산과 맞는다).
+    def _bytes(bs, tier):
+        tot = 0
+        for (st, en, t) in bs:
+            if t == tier:
+                tot += (en - st)
+        return tot
+    per_row = experts * inter * 2                      # gate/up: row 1개 = [E, I] bf16
+    dn_row = experts * hidden * 2                      # down:  row 1개 = [E, H] bf16
+    for tier in ("hot", "warm"):
+        gib = layers * (2 * _bytes(gu_bands, tier) * per_row
+                        + _bytes(dn_bands, tier) * dn_row) / 2**30
+        if gib:
+            print(f"[budget] {tier:4s} = {gib:6.2f} GiB")
     print(f"plan written: {args.out}  (gateup {gu_bands}, down {dn_bands}){tag}")
 
 

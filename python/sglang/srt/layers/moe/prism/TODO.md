@@ -145,8 +145,13 @@ graph bs=1로 "산란 dispatch"와 "S1 host 블록"이라는 두 개의 오버�
   (offset 테이블 store) + warm GEMM을 persistent GEMV로 교체 (위 항목).
 - **pinned store NUMA 바인딩**: kt-kernel에 set_memory_to_numa 노출 추가
   후 numa.py에 연결 (현재는 first-touch 방임).
-- **hot tier**: HotWeights 타입 신설 + loader VRAM 배치 + executor hot
-  GEMM 한 줄. 스키마/rejoin은 이미 대비됨.
+- ~~**hot tier**~~ — **완료** (2026-08-24). HotBand/HotStore + loader VRAM
+  배치(`prepare_layer_weights(device=)`) + executor hot 경로(stager·arena
+  없이 `index_select` → 같은 warm GEMM). 검증: 3-tier 재조립 bitexact,
+  plan 불변성에 `all_hot`/`three_tier` 추가(all_hot ≡ all_warm 수치 일치),
+  CUDA graph 캡처·replay bitwise 일치. plan 생성기 `--hot-frac`.
+  남은 것: hot 비율 스윕 실측, `index_select` 사본 비용(GEMM 읽기량의 2배
+  추가 HBM 트래픽) 측정 후 필요시 gather-free 커널.
 - **N-shard rank 분산 (TP>1)**: rank별 자기 inter 샤드만 store/DMA.
 
 ## 실측표 (Qwen3-30B-A3B, H100, node1 8스레드 단일소켓, batch1 greedy, uniform10-1node plan, 2026-08-20/21)

@@ -249,22 +249,25 @@ class PrismMoEMethod(FusedMoEMethodBase):
             w13 = w13.cpu()
         if w2.is_cuda:
             w2 = w2.cpu()
+        # hot 밴드는 이 device에 상주한다 — 로더가 배치까지 끝낸다 (계약 ③).
+        device = torch.device(torch.cuda.current_device())
         prepared = prepare_layer_weights(
-            self.layer_id, w13, w2, runtime.plan, calib=runtime.calib
+            self.layer_id, w13, w2, runtime.plan,
+            calib=runtime.calib, device=device,
         )
         ep = runtime.plan.expert(self.layer_id, 0)
         if any(ep.proj(p).has_tier(Tier.COLD) for p in Proj):
             runtime.cold().load_layer(self.layer_id, prepared.cold, prepared.thr)
             prepared.cold = None  # 주입 완료 — 소유권은 C++ (계약 ③)
 
-        device = torch.device(torch.cuda.current_device())
         runtime.executor(device).register_layer(self.layer_id, prepared)
 
         # full 텐서 소멸 (계약 ③) — host RAM 회수
         layer.w13_weight.data = torch.empty(0, dtype=layer.w13_weight.dtype)
         layer.w2_weight.data = torch.empty(0, dtype=layer.w2_weight.dtype)
         self._registered = True
-        logger.info("[prism] layer %d registered (cold=%s)", self.layer_id,
+        logger.info("[prism] layer %d registered (hot=%s cold=%s)", self.layer_id,
+                    any(ep.proj(p).has_tier(Tier.HOT) for p in Proj),
                     any(ep.proj(p).has_tier(Tier.COLD) for p in Proj))
 
     # ── step-time ────────────────────────────────────────────────────────

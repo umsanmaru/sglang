@@ -1,8 +1,11 @@
 """Stage 2 로더 테스트: 절단·변환이 정보를 보존하는지 (재조립 = 원본).
 
-핵심 성질: 어떤 plan이든 warm 슬라이스(방향 복원) + cold 슬라이스를 K축으로
-이어 붙이면 원본과 비트 단위로 같아야 한다 — 이게 깨지면 이후 모든 수치
+핵심 성질: 어떤 plan이든 hot·warm 슬라이스(방향 복원) + cold 슬라이스를 K축
+으로 이어 붙이면 원본과 비트 단위로 같아야 한다 — 이게 깨지면 이후 모든 수치
 테스트가 의미를 잃는다.
+
+hot은 device 텐서지만 CPU device로도 로드되므로 이 파일은 CUDA를 요구하지
+않는다 (경로 검증이 목적이고, VRAM 상주 여부는 로더 로직과 무관).
 """
 
 import copy
@@ -31,6 +34,7 @@ DIMS = {
 }
 
 PIN = torch.cuda.is_available()  # CUDA 없으면 pinned 없이 로직만 검증
+CPU = torch.device("cpu")        # hot 배치 device — CPU여도 로더 경로는 동일
 
 
 def make_plan(gate_bands=None, up_bands=None, down_bands=None):
@@ -71,8 +75,11 @@ def sources(w13, w2):
 
 
 def reassemble(prepared, proj, K):
-    """warm(방향 복원) + cold를 K축 순서대로 이어 붙인 [E, N, K]."""
+    """hot·warm(방향 복원) + cold를 K축 순서대로 이어 붙인 [E, N, K]."""
     pieces = []
+    hot = None if prepared.hot is None else prepared.hot.band(proj)
+    if hot is not None:
+        pieces.append((hot.k_offset, hot.weights.cpu().transpose(1, 2)))
     warm = prepared.warm.band(proj)
     if warm is not None:
         pieces.append((warm.k_offset, warm.weights.transpose(1, 2)))
@@ -144,11 +151,84 @@ def test_all_cold_and_all_warm():
         )
 
 
-def test_hot_band_not_implemented():
-    plan = make_plan(gate_bands=[[0, 64, "hot"], [64, 256, "cold"]])
+# ── HOT 티어 ───────────────────────────────────────────────────────────────
+
+# down의 K=intermediate_size=128이라 ROW_GROUP=64로는 밴드가 2개까지다 —
+# 3-tier는 gate/up에서 검증하고 down은 hot+cold로 둔다 (로더는 proj별로 독립
+# 처리하므로 proj마다 티어 조합이 달라도 되는 것 자체가 검증 대상이다).
+HOT3 = dict(
+    gate_bands=[[0, 64, "hot"], [64, 128, "warm"], [128, 256, "cold"]],
+    up_bands=[[0, 64, "hot"], [64, 128, "warm"], [128, 256, "cold"]],
+    down_bands=[[0, 64, "hot"], [64, 128, "cold"]],
+)
+
+
+def test_three_tier_reassembly_bitexact():
+    """hot+warm+cold 재조립 = 원본. HOT 도입의 유일한 정합성 조건이다."""
+    plan = make_plan(**HOT3)
     w13, w2 = make_weights()
-    with pytest.raises(NotImplementedError, match="HOT"):
+    src = sources(w13, w2)
+    prepared = prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN, device=CPU)
+    for proj in Proj:
+        assert torch.equal(reassemble(prepared, proj, plan.dims.k_of(proj)), src[proj])
+
+
+def test_hot_store_layout_matches_warm_direction():
+    """hot은 warm과 **같은** [E, k, N] K-major여야 한다 — 같은 GEMM 커널을 탄다."""
+    plan = make_plan(**HOT3)
+    w13, w2 = make_weights()
+    prepared = prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN, device=CPU)
+    for proj, N in ((Proj.GATE, 128), (Proj.UP, 128), (Proj.DOWN, 256)):
+        hot = prepared.hot.band(proj)
+        assert hot.k_offset == 0 and hot.k_rows == 64
+        assert hot.weights.shape == (4, 64, N)
+        assert hot.weights.dtype == torch.bfloat16
+        assert hot.weights.is_contiguous()
+    # 다음 티어가 구멍 없이 이어받는다
+    assert prepared.warm.band(Proj.GATE).k_offset == 64
+    assert prepared.warm.band(Proj.UP).k_offset == 64
+    assert prepared.cold.band(Proj.DOWN).k_offset == 64
+
+
+def test_all_hot():
+    """cold/warm이 전혀 없는 plan — 세 store 중 hot만 채워진다."""
+    plan = make_plan(
+        gate_bands=[[0, 256, "hot"]],
+        up_bands=[[0, 256, "hot"]],
+        down_bands=[[0, 128, "hot"]],
+    )
+    w13, w2 = make_weights()
+    src = sources(w13, w2)
+    prepared = prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN, device=CPU)
+    for proj in Proj:
+        assert prepared.warm.band(proj) is None
+        assert prepared.cold.band(proj) is None
+        assert torch.equal(reassemble(prepared, proj, plan.dims.k_of(proj)), src[proj])
+
+
+def test_hot_without_device_rejected():
+    """hot 밴드가 있는데 device가 없으면 즉사 — 조용히 CPU에 두면 티어 의미가 사라진다."""
+    plan = make_plan(**HOT3)
+    w13, w2 = make_weights()
+    with pytest.raises(PlanError, match="HOT bands but no device"):
         prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN)
+
+
+def test_no_hot_band_needs_no_device():
+    """hot이 없으면 device를 요구하지 않는다 (CPU 전용 경로 보존)."""
+    plan = make_plan()
+    w13, w2 = make_weights()
+    prepared = prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN)
+    assert all(prepared.hot.band(p) is None for p in Proj)
+
+
+def test_hot_multi_band_not_implemented():
+    plan = make_plan(
+        gate_bands=[[0, 64, "hot"], [64, 128, "cold"], [128, 192, "hot"], [192, 256, "cold"]]
+    )
+    w13, w2 = make_weights()
+    with pytest.raises(NotImplementedError, match="one hot band"):
+        prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN, device=CPU)
 
 
 def test_multi_band_not_implemented():
