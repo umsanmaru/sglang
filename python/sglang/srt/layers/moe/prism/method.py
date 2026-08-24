@@ -73,8 +73,11 @@ class _PrismRuntime:
     per-layer 호출이라 cross-layer 상태를 전역이 들어야 한다)
     """
 
-    def __init__(self, plan: Plan):
+    def __init__(self, plan: Plan, calib=None):
         self.plan = plan
+        # sparsity 점수·threshold 테이블 (dense plan이면 None). 프로세스에 1벌 —
+        # 레이어마다 다시 열면 382MB 자산을 40번 읽게 된다.
+        self.calib = calib
         self.max_tokens = int(os.environ.get(_ENV_MAX_TOKENS, "4096"))
         self._resources = None
         self._cold = None
@@ -150,9 +153,23 @@ def _get_runtime() -> _PrismRuntime:
     if _RUNTIME is None:
         plan_path = os.environ[_ENV_PLAN]
         plan = parse_plan(plan_path)
-        validate_static(plan)
-        logger.info("[prism] plan loaded: %s (model_id=%s)", plan_path, plan.model_id)
-        _RUNTIME = _PrismRuntime(plan)
+        # sparsity plan이면 자산을 먼저 열어 shape까지 검증한다 (계약 ①):
+        # 다른 모델의 calib을 적용하는 것은 dims 불일치와 같은 급의 silent
+        # failure이므로 startup에서 죽는 편이 낫다.
+        calib = None
+        if plan.sparsity is not None:
+            from sglang.srt.layers.moe.prism.calib import CalibTables
+
+            calib = CalibTables.load(plan.sparsity)
+        validate_static(
+            plan, calib_probe=None if calib is None else calib.probe()
+        )
+        logger.info(
+            "[prism] plan loaded: %s (model_id=%s, sparsity=%s)",
+            plan_path, plan.model_id,
+            "none" if plan.sparsity is None else plan.sparsity.score,
+        )
+        _RUNTIME = _PrismRuntime(plan, calib)
     return _RUNTIME
 
 
@@ -232,7 +249,9 @@ class PrismMoEMethod(FusedMoEMethodBase):
             w13 = w13.cpu()
         if w2.is_cuda:
             w2 = w2.cpu()
-        prepared = prepare_layer_weights(self.layer_id, w13, w2, runtime.plan)
+        prepared = prepare_layer_weights(
+            self.layer_id, w13, w2, runtime.plan, calib=runtime.calib
+        )
         ep = runtime.plan.expert(self.layer_id, 0)
         if any(ep.proj(p).has_tier(Tier.COLD) for p in Proj):
             runtime.cold().load_layer(self.layer_id, prepared.cold, prepared.thr)
