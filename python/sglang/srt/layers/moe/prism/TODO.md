@@ -236,6 +236,58 @@ PCIe 대역폭 그대로 임계경로에 앉는다 — warm 0.125 → 0.25에서
 - "warm 전송은 cold 뒤에 숨어 있다" → warm 0.125↔0.25 대조로 기각(위 4항).
 
 
+## 실측표 (Qwen3.6-35B-A3B, bs 스윕, worklist graph vs eager, RTX PRO 6000 96GB, 2026-08-25)
+
+치수는 위 표와 동일 (NL=40 NE=256 I=512 H=2048). `--attention-backend triton
+--context-length 4096 --max-running-requests {bs}`, ntok=64 차분법(warmup 8tok
+제외). h375=warm-frac 0(cold-only sparse), h125=warm-frac 0.125. `_wl` = worklist
+GEMV 커널, 접미사 없음(torch_bmm) = 현행 placeholder. graph일 때 `--cuda-graph-bs
+1 2 4 8`. 측정 중 GPU0에 타 사용자 프로세스(`sglang::scheduler`, 12~29GiB
+변동)가 run01~04 구간에 걸쳐 있었다 — bs=1/2/4/8 graph 4건은 공유 상태,
+eager 6건과 h125 교차검증 1건은 GPU0 단독 점유(quiet) 상태에서 측정.
+
+| plan | bs | graph | ms/step | tok/s aggregate |
+|---|---|---|---|---|
+| h375_w0000_wl | 1 | O | 20.32 | 49.2 |
+| h375_w0000_wl | 2 | O | 31.47 | 63.5 |
+| h375_w0000_wl | 4 | O | 49.42 | 80.9 |
+| h375_w0000_wl | 8 | O | 57.08 | 140.2 |
+| h375_w0000_wl | 2 | eager | 67.26 | 29.7 |
+| h375_w0000_wl | 4 | eager | 80.37 | 49.8 |
+| h375_w0000_wl | 8 | eager | 95.20 | 84.0 |
+| h375_w0000 (torch_bmm, 현행 기준선) | 2 | eager | 119.48 | 16.7 |
+| h375_w0000 (torch_bmm, 현행 기준선) | 4 | eager | 178.77 | 22.4 |
+| h375_w0000 (torch_bmm, 현행 기준선) | 8 | eager | 145.45 | 55.0 |
+| h125_w0125_wl (warm/UVA 교차검증) | 4 | O | 67.78 | 59.0 |
+
+**bs=1 회귀 없음.** 20.32ms/step은 기존 실측 대역(17.7–20.9ms, GPU 조용할 때)
+안에 있다 — 단, 이 값 자체는 GPU0 공유 상태에서 잰 것이라 대역 상단 쪽으로
+치우쳤을 수 있다.
+
+**worklist graph vs 같은 plan eager**: bs=2에서 2.14배, bs=4에서 1.63배,
+bs=8에서 1.67배 — graph가 여전히 크게 이긴다(GatherKernelStager가 bs>1도
+캡처 가능해졌으므로 당연하지만, S1 host 블록 소멸의 효과가 bs가 커져도
+유지됨을 확인).
+
+**worklist graph vs torch_bmm eager(현행 기준선) 배율**: bs=2 3.80배, bs=4
+3.62배, bs=8 2.55배. bs=8에서 배율이 줄어드는 것은 분자(graph)가 커져서가
+아니라 분모인 torch_bmm eager bs=8(145.45ms)이 bs=4(178.77ms)보다 오히려
+빠른 비정상 패턴 때문 — placeholder가 전 expert를 broadcast 계산하는 고정비
+성격(①번 한계, 위 "warm GEMM 커널 교체" 항목)과 GPU0 비공유 상태였다는 점을
+감안해도 재현성 미검증. bs=8 torch_bmm 수치는 그대로 기록하되 액면가로
+신뢰하지 말 것 — 재측정 필요.
+
+**bs>1에서 cold는 dense로 돈다.** `executor.py`의 `masking = self._sparse and
+m == 1`이 sparsity 마스킹을 M==1(decode 단일 토큰)로 게이트한다 — 즉 이 표의
+bs≥2 행은 모두 cold가 sparse가 아니라 dense 경로다. bs 스윕에서 보이는 이득은
+전부 "worklist GEMV vs torch_bmm 낭비 계산" 및 "graph vs eager"에서만 오고,
+sparsity 자체의 bs>1 효과는 아직 미측정(별도 스코프).
+
+**h125_w0125_wl bs=4 graph(67.78ms)가 h375_w0000_wl bs=4 graph(49.42ms)보다
+느리다** — warm 12.5% 추가가 이 조건에서도 순손실이라는 위 §4 결론과 방향이
+같다(warm PCIe가 cold보다 비싸다는 관찰이 bs>1·graph 경로에도 이어짐, 크기
+비교는 참고용 — 서로 다른 mem-frac/실행 시각).
+
 ## 실측표 (Qwen3-30B-A3B, H100, node1 8스레드 단일소켓, batch1 greedy, uniform10-1node plan, 2026-08-20/21)
 
 | 구성 | decode ms/tok | tok/s |
