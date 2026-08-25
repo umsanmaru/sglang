@@ -38,6 +38,12 @@ class ResourceSpec:
     k_warm_down: int
     n_slots: int  # arena slot 수 = 한 그룹에서 동시에 다루는 distinct expert 수
     device: torch.device
+    # hot gather 목적지 크기 (0 = 해당 proj에 hot 없음). warm과 같은 규칙:
+    # 전 레이어 최대치. 기본값 0은 hot 이전에 쓰인 직접 생성자 호출(테스트)이
+    # 그대로 유효하도록 하기 위함.
+    k_hot_gate: int = 0
+    k_hot_up: int = 0
+    k_hot_down: int = 0
 
     @classmethod
     def from_plan(
@@ -48,8 +54,9 @@ class ResourceSpec:
         device: torch.device,
         n_slots: Optional[int] = None,
     ) -> "ResourceSpec":
-        """arena는 전 레이어가 공유하므로 warm 크기는 레이어 전체의 최대치."""
+        """arena는 전 레이어가 공유하므로 warm/hot 크기는 레이어 전체의 최대치."""
         k_warm = {proj: 0 for proj in Proj}
+        k_hot = {proj: 0 for proj in Proj}
         seen: set[int] = set()
         for ep in plan.experts.values():
             if id(ep) in seen:
@@ -57,6 +64,7 @@ class ResourceSpec:
             seen.add(id(ep))
             for proj in Proj:
                 k_warm[proj] = max(k_warm[proj], ep.proj(proj).rows(Tier.WARM))
+                k_hot[proj] = max(k_hot[proj], ep.proj(proj).rows(Tier.HOT))
         return cls(
             max_tokens=max_tokens,
             top_k=plan.dims.top_k,
@@ -67,6 +75,9 @@ class ResourceSpec:
             k_warm_down=k_warm[Proj.DOWN],
             n_slots=n_slots if n_slots is not None else plan.dims.top_k,
             device=torch.device(device),
+            k_hot_gate=k_hot[Proj.GATE],
+            k_hot_up=k_hot[Proj.UP],
+            k_hot_down=k_hot[Proj.DOWN],
         )
 
     def k_warm_of(self, proj: Proj) -> int:
@@ -74,6 +85,13 @@ class ResourceSpec:
             Proj.GATE: self.k_warm_gate,
             Proj.UP: self.k_warm_up,
             Proj.DOWN: self.k_warm_down,
+        }[proj]
+
+    def k_hot_of(self, proj: Proj) -> int:
+        return {
+            Proj.GATE: self.k_hot_gate,
+            Proj.UP: self.k_hot_up,
+            Proj.DOWN: self.k_hot_down,
         }[proj]
 
     def n_of(self, proj: Proj) -> int:
@@ -252,6 +270,25 @@ class ExecutionResources:
         self._sel_device = torch.empty(
             spec.n_slots, dtype=torch.int32, device=spec.device
         )
+        # hot gather 목적지: [n_slots, k_hot, N] bf16, proj별 (hot 없는 proj는
+        # 미할당). warm arena와 달리 down을 gate/up storage에 aliasing하지
+        # 않는다 — 크기가 작고(슬롯 수 × 밴드), 단순함이 낫다. hot 경로는
+        # current stream에서만 읽고 쓰므로 그룹/레이어 간 WAR는 stream 순서로
+        # 자동 충족된다 (warm arena처럼 event 가드가 필요 없다).
+        self._hot_arena = {
+            p: torch.empty(
+                spec.n_slots, spec.k_hot_of(p), spec.n_of(p),
+                dtype=torch.bfloat16, device=spec.device,
+            )
+            for p in Proj
+            if spec.k_hot_of(p) > 0
+        }
+        # hot gather의 sel 버퍼. warm의 _sel_device와 분리하는 이유: warm은
+        # warm_stream에서, hot은 current stream에서 쓰므로 한 버퍼를 공유하면
+        # 스트림 간 순서 보장이 필요해진다. device측 쓰기라 단일 버퍼면 된다.
+        self._hot_sel_device = torch.empty(
+            spec.n_slots, dtype=torch.int32, device=spec.device
+        )
 
     def stage_scratch(self, proj: Proj, slot: int) -> torch.Tensor:
         """pinned host 결집 스크래치, arena.view(proj)와 동형 [n_slots, k_warm, N].
@@ -274,3 +311,11 @@ class ExecutionResources:
         """device int32 [n_slots] — gather 커널의 sel_device 인자.
         device측 쓰기는 stream-ordered이므로 단일 버퍼로 충분."""
         return self._sel_device
+
+    def hot_view(self, proj: Proj) -> torch.Tensor:
+        """[n_slots, k_hot, N] bf16 — hot gather의 목적지. identity 불변."""
+        return self._hot_arena[proj]
+
+    def hot_sel_device(self) -> torch.Tensor:
+        """device int32 [n_slots] — hot gather의 sel 버퍼 (current stream 전용)."""
+        return self._hot_sel_device

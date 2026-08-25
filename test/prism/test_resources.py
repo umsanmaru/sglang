@@ -58,6 +58,61 @@ def test_spec_from_plan_takes_max_warm_rows():
     assert spec.k_warm_down == 64
     assert spec.n_slots == DIMS["top_k"]
     assert spec.n_of(Proj.GATE) == 128 and spec.n_of(Proj.DOWN) == 256
+    # hot 밴드가 없는 plan은 k_hot 전부 0
+    assert (spec.k_hot_gate, spec.k_hot_up, spec.k_hot_down) == (0, 0, 0)
+
+
+def make_hot_plan():
+    raw = {
+        "schema_version": 1,
+        "model_id": "test/tiny-hot",
+        "dims": dict(DIMS),
+        "kernels": {"gpu_warm": "torch_bmm", "cpu_cold": "kt_amx_bf16"},
+        "default": {
+            "gate": {"bands": [[0, 64, "hot"], [64, 128, "warm"], [128, 256, "cold"]],
+                      "cold_shards": [[0, 0, 128]]},
+            "up": {"bands": [[0, 64, "hot"], [64, 128, "warm"], [128, 256, "cold"]],
+                    "cold_shards": [[0, 0, 128]]},
+            "down": {"bands": [[0, 64, "hot"], [64, 128, "cold"]],
+                      "cold_shards": [[0, 0, 256]]},
+        },
+    }
+    plan = parse_plan(raw)
+    validate_static(plan)
+    return plan
+
+
+def test_spec_from_plan_takes_max_hot_rows():
+    spec = ResourceSpec.from_plan(
+        make_hot_plan(), max_tokens=8, device=torch.device("cpu")
+    )
+    assert (spec.k_hot_gate, spec.k_hot_up, spec.k_hot_down) == (64, 64, 64)
+    assert spec.k_hot_of(Proj.GATE) == 64
+
+
+@cuda_required
+def test_hot_arena_views_and_sel():
+    spec = ResourceSpec.from_plan(
+        make_hot_plan(), max_tokens=8, device=torch.device("cuda")
+    )
+    res = ExecutionResources(spec)
+    gate = res.hot_view(Proj.GATE)
+    assert gate.shape == (spec.n_slots, 64, 128)
+    assert gate.dtype == torch.bfloat16 and gate.is_cuda
+    assert res.hot_view(Proj.DOWN).shape == (spec.n_slots, 64, 256)
+    # storage identity 불변 (계약 ④)
+    assert res.hot_view(Proj.GATE).data_ptr() == gate.data_ptr()
+    sel = res.hot_sel_device()
+    assert sel.dtype == torch.int32 and sel.is_cuda and sel.shape == (spec.n_slots,)
+    # warm sel과 물리적으로 분리 (스트림 간 공유 금지)
+    assert sel.data_ptr() != res.sel_device().data_ptr()
+
+
+@cuda_required
+def test_hot_arena_absent_without_hot_bands():
+    res = ExecutionResources(make_spec())
+    with pytest.raises(KeyError):
+        res.hot_view(Proj.GATE)
 
 
 @cuda_required

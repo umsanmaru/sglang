@@ -8,14 +8,18 @@
     cold down submit ∥ warm down
     cold sync → rejoin#2 (fp32 합 → router 가중 expert합 → bf16)
 
-hot 티어 (계약 ①): VRAM 상주라 stager도 arena도 타지 않는다 — warm 경로에서
-전송 단계만 빠진 형태이고, GEMM 커널·grouping 계약은 warm과 **완전히 동일**하다
-(hot store가 warm과 같은 [E, k_rows, N] K-major이기 때문). 그룹 루프를 warm과
-공유하는 이유는 slot 제약 때문이 아니라(hot에는 없다) scatter_gateup/down_apply의
-(m, j) 좌표 복원 규약을 하나로 유지하기 위해서다.
-발행 순서는 `WAR 시드 record → hot GEMM → warm 루프`다: hot은 arena를 건드리지
-않으므로 warm의 첫 H2D가 hot GEMM 뒤로 밀릴 이유가 없고, 이 순서에서만 warm
-전송이 hot 연산 뒤에 겹친다.
+hot 티어 (계약 ①): VRAM 상주라 stager(PCIe 전송)를 타지 않는다 — warm 경로에서
+호스트 교차만 빠진 형태이고, GEMM 커널·grouping 계약은 warm과 **완전히 동일**하다
+(hot store가 warm과 같은 [E, k_rows, N] K-major이기 때문). gather 커널도 warm과
+같은 uint4 커널(device-src 변형)이며 목적지만 전용 hot arena다 — bmm이 연속 배치
+축을 요구해 VRAM→VRAM 복사 한 번은 남는다 (torch index_select였을 때 지연 바운드
+~40 µs/proj → gather 커널로 대역폭 수준; 복사 자체의 제거는 grouped GEMM TODO).
+그룹 루프를 warm과 공유하는 이유는 slot 제약 때문이 아니라(hot arena는 current
+stream 순서로 자급) scatter_gateup/down_apply의 (m, j) 좌표 복원 규약을 하나로
+유지하기 위해서다.
+발행 순서는 `WAR 시드 record → hot GEMM → warm 루프`다: hot은 warm arena를
+건드리지 않으므로 warm의 첫 H2D가 hot GEMM 뒤로 밀릴 이유가 없고, 이 순서에서만
+warm 전송이 hot 연산 뒤에 겹친다.
 
 원칙:
 - primitive는 영구 메모리를 할당하지 않는다 — arena/staging은
@@ -80,6 +84,7 @@ def _nvtx_pop() -> None:
     if _NVTX:
         torch.cuda.nvtx.range_pop()
 
+from sglang.jit_kernel.prism_gather import gather_bands_from_device
 from sglang.srt.layers.moe.prism.cold_backend import ColdBackend
 from sglang.srt.layers.moe.prism.grouping import GroupingStrategy, select_grouping
 from sglang.srt.layers.moe.prism.kernels import WarmGemmFn
@@ -285,8 +290,9 @@ class PrismExecutor:
             for gi, group in enumerate(flow.groups):
                 with _nvtx(f"hot.gu.g{gi}x{len(group)}"):
                     with _nvtx("gather.gate+up"):
-                        wg = self._hot_stack(hot_g, group, gi, flow)
-                        wu = self._hot_stack(hot_u, group, gi, flow)
+                        sel_d = self._hot_sel(group, gi, flow)
+                        wg = self._hot_gather(hot_g, Proj.GATE, sel_d)
+                        wu = self._hot_gather(hot_u, Proj.UP, sel_d)
                     with _nvtx("gemm.gate"):
                         gate_out = self._warm_gemm(hidden, wg, hot_g.k_offset)
                     with _nvtx("gemm.up"):
@@ -370,7 +376,8 @@ class PrismExecutor:
             for gi, group in enumerate(flow.groups):
                 with _nvtx(f"hot.dn.g{gi}x{len(group)}"):
                     with _nvtx("gather.down"):
-                        wd = self._hot_stack(hot_d, group, gi, flow)
+                        sel_d = self._hot_sel(group, gi, flow)
+                        wd = self._hot_gather(hot_d, Proj.DOWN, sel_d)
                     with _nvtx("gemm+where.dn"):
                         hot_down = flow.grouping.down_apply(
                             hot_down, topk_ids, group, gi, res.spec.n_slots, hot_act, wd)
@@ -440,24 +447,44 @@ class PrismExecutor:
                 self._graph_stager = GatherKernelStager(self._res)
         return self._graph_stager
 
-    def _hot_stack(self, band, group: Sequence[int], gi: int,
-                   flow: _LayerFlow) -> torch.Tensor:
-        """hot store에서 그룹의 [g, k_rows, N] GEMM 입력을 모은다.
+    def _hot_sel(self, group: Sequence[int], gi: int,
+                 flow: _LayerFlow) -> torch.Tensor:
+        """그룹의 expert 인덱스를 hot 전용 device int32 버퍼에 올린다.
 
         sel 원천은 _stage와 같은 규약이다: graph 경로의 그룹은 위치 표지라
-        flat_ids의 같은 위치 절단이고, eager 그룹은 expert id 목록 그 자체다.
-
-        index_select는 [g, k_rows, N] 사본을 만든다 — bmm이 연속 배치 축을
-        요구하므로 피할 수 없다 (읽기+쓰기로 GEMM 자체 읽기량의 2배가 추가
-        HBM 트래픽이다). 상주 티어라 PCIe는 전혀 타지 않으므로 warm 대비
-        이득이 압도적이지만, hot 비율이 커지면 여기가 먼저 보인다.
+        flat_ids의 같은 위치 절단(device cast-copy — 캡처 가능), eager 그룹은
+        expert id 목록 그 자체(소형 H2D)다. 반환 버퍼는 current stream에서만
+        읽고 쓰이므로 (gather·GEMM과 같은 stream) 그룹/phase 간 재사용 WAR가
+        stream 순서로 자동 충족된다 — warm sel처럼 더블버퍼가 필요 없다.
         """
+        g = len(group)
+        sel_d = self._res.hot_sel_device()[:g]
         if flow.graph_flow:
             j0 = gi * self._res.spec.n_slots
-            sel = flow.flat_ids[j0 : j0 + len(group)]
+            sel_d.copy_(flow.flat_ids[j0 : j0 + g])
         else:
-            sel = torch.as_tensor(group, dtype=torch.long, device=band.weights.device)
-        return band.weights.index_select(0, sel)
+            sel_d.copy_(torch.as_tensor(group, dtype=torch.int32))
+        return sel_d
+
+    def _hot_gather(self, band, proj: Proj, sel_d: torch.Tensor) -> torch.Tensor:
+        """hot store에서 그룹의 [g, k_rows, N] GEMM 입력을 hot arena로 모은다.
+
+        bmm이 연속 배치 축을 요구하므로 복사 자체는 피할 수 없다 (제거는
+        grouped GEMM 몫 — TODO). 이전의 `index_select`는 torch 범용 커널
+        (indexSelectSmallIndex)이라 지연 바운드(2 B 스칼라 접근 + 인덱스 순차
+        루프)로 slab 크기와 무관하게 ~40 µs가 들었다. warm과 같은 uint4
+        gather 커널의 device-src 변형으로 g개 slab을 한 웨이브에 옮긴다
+        (2026-08-25 nsys, h125 35B: proj당 42 µs → HBM 대역폭 수준).
+
+        목적지는 영구 hot arena — warm arena와 같은 레이어-최대 크기 가정이라
+        band.k_rows가 spec.k_hot_of(proj)와 다르면 커널 shape 검증이 즉사한다
+        (uniform plan에서는 항상 일치; warm 경로와 같은 제약).
+        """
+        dst = self._res.hot_view(proj)[: sel_d.numel()]
+        gather_bands_from_device(
+            band.weights, sel_d, dst, torch.cuda.current_stream()
+        )
+        return dst
 
     @staticmethod
     def _accumulate(parts: Sequence[Optional[torch.Tensor]],

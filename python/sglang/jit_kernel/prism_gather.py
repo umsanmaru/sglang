@@ -15,7 +15,10 @@ def _jit_prism_gather_module() -> Module:
     return load_jit(
         "prism_gather",
         cuda_files=["moe/prism_gather.cuh"],
-        cuda_wrappers=[("gather_bands_from_pinned", "gather_bands_from_pinned")],
+        cuda_wrappers=[
+            ("gather_bands_from_pinned", "gather_bands_from_pinned"),
+            ("gather_bands_from_device", "gather_bands_from_device"),
+        ],
     )
 
 
@@ -63,3 +66,34 @@ def gather_bands_from_pinned(
     module = _jit_prism_gather_module()
     with torch.cuda.stream(stream):
         module.gather_bands_from_pinned(pinned_src, sel_device, dst)
+
+
+def gather_bands_from_device(
+    device_src: torch.Tensor,
+    sel_device: torch.Tensor,
+    dst: torch.Tensor,
+    stream: torch.cuda.Stream,
+) -> None:
+    """dst[g] = device_src[sel_device[g]], VRAM -> VRAM.
+
+    `gather_bands_from_pinned`의 쌍둥이 — 커널·launch geometry·stream 규약이
+    전부 같고 소스가 device 상주 텐서라는 점만 다르다. prism HOT 티어용:
+    torch `index_select`의 범용 커널(2 B 스칼라 접근, 인덱스 순차 루프,
+    지연 바운드)을 16 B 벡터화 + g-슬랩 동시 발행으로 대체한다.
+
+    Parameters
+    ----------
+    device_src : Tensor[E, rows, N], bf16, CUDA
+        Hot expert-weight bands, resident on the same device as `dst`.
+    sel_device : Tensor[g], int32, CUDA
+        Per-gathered-slot expert index into `device_src`'s first dimension.
+    dst : Tensor[g, rows, N], bf16, CUDA
+        Destination slots. `g == sel_device.numel() == dst.shape[0]`.
+    stream : torch.cuda.Stream
+        Stream the gather is launched on (same convention as the pinned
+        variant: the kernel takes no stream argument, so the wrapper enters
+        `torch.cuda.stream(stream)` around the launch).
+    """
+    module = _jit_prism_gather_module()
+    with torch.cuda.stream(stream):
+        module.gather_bands_from_device(device_src, sel_device, dst)

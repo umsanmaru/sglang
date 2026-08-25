@@ -62,8 +62,8 @@ class HotBand:
     """한 proj의 hot 밴드: device bf16 [E, k_rows, N] (warm과 동일 K-major).
 
     warm과 방향이 같은 이유는 같은 GEMM 커널을 타기 때문이다. 차이는 상주
-    위치뿐이라 executor에서 stager/arena 경유가 사라지고 index_select 하나로
-    [g, k_rows, N]가 나온다.
+    위치뿐이라 executor에서 PCIe stager가 빠지고, warm과 같은 uint4 gather
+    커널(device-src 변형)이 hot arena로 [g, k_rows, N]를 모은다.
     """
 
     k_offset: int

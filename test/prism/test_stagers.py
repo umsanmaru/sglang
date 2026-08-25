@@ -158,3 +158,28 @@ def test_gather_kernel_bitwise():
     gather_bands_from_pinned(band.weights, sel, dst, torch.cuda.current_stream())
     torch.cuda.synchronize()
     assert torch.equal(dst.cpu(), band.weights[[5, 17, 2]])
+
+
+def test_gather_kernel_device_bitwise():
+    """device-src 변형(hot 티어용): index_select 참조와 비트 일치."""
+    from sglang.jit_kernel.prism_gather import gather_bands_from_device
+
+    src = (torch.arange(32 * 8 * 64, dtype=torch.bfloat16, device="cuda")
+           .reshape(32, 8, 64))
+    sel = torch.tensor([5, 17, 2], dtype=torch.int32, device="cuda")
+    dst = torch.zeros(3, 8, 64, dtype=torch.bfloat16, device="cuda")
+    gather_bands_from_device(src, sel, dst, torch.cuda.current_stream())
+    torch.cuda.synchronize()
+    ref = src.index_select(0, sel.long())
+    assert torch.equal(dst, ref)
+
+
+def test_gather_kernel_device_rejects_host_src():
+    """device 변형은 CPU/pinned 소스를 즉사시켜야 한다 (pinned 변형과 계약 분리)."""
+    from sglang.jit_kernel.prism_gather import gather_bands_from_device
+
+    band = _band(e=8, rows=8, n=64)  # pinned host store
+    sel = torch.tensor([1], dtype=torch.int32, device="cuda")
+    dst = torch.zeros(1, 8, 64, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(Exception):
+        gather_bands_from_device(band.weights, sel, dst, torch.cuda.current_stream())

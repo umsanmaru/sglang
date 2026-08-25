@@ -103,4 +103,67 @@ void gather_bands_from_pinned(
       stride16);
 }
 
+// gather_bands_from_device(device_src[E, rows, N] bf16 (CUDA),
+//                          sel[g] int32 (CUDA), dst[g, rows, N] bf16 (CUDA))
+//
+// Twin of gather_bands_from_pinned with a VRAM-resident source: same kernel,
+// same launch geometry, same stream contract (launches on the caller's
+// current stream) -- only the source-device constraint differs. src, sel and
+// dst must live on the same CUDA device. Used by the prism HOT tier, whose
+// store is device-resident: the generic torch index_select kernel it replaces
+// is latency-bound (2-byte scalar accesses, sequential index loop), while
+// this one moves 16 bytes per thread with all g slabs in flight at once.
+void gather_bands_from_device(
+    tvm::ffi::TensorView device_src, tvm::ffi::TensorView sel, tvm::ffi::TensorView dst) {
+  using namespace host;
+
+  auto E = SymbolicSize{"num_experts"};
+  auto R = SymbolicSize{"rows"};
+  auto N = SymbolicSize{"cols"};
+  auto G = SymbolicSize{"num_gathered"};
+  auto cuda_device = SymbolicDevice{};
+
+  TensorMatcher({G})  //
+      .with_dtype<int32_t>()
+      .with_device<kDLCUDA>(cuda_device)
+      .verify(sel);
+
+  TensorMatcher({E, R, N})  //
+      .with_dtype<bf16_t>()
+      .with_device(cuda_device)
+      .verify(device_src);
+
+  TensorMatcher({G, R, N})  //
+      .with_dtype<bf16_t>()
+      .with_device(cuda_device)
+      .verify(dst);
+
+  const int64_t rows = R.unwrap();
+  const int64_t cols = N.unwrap();
+  const int64_t g = G.unwrap();
+  const int64_t band_bytes = rows * cols * static_cast<int64_t>(sizeof(bf16_t));
+
+  RuntimeCheck(
+      band_bytes % 16 == 0,
+      "gather_bands_from_device: rows*N*dtype_size (",
+      band_bytes,
+      " bytes) must be a multiple of 16 bytes for uint4-vectorized gather");
+
+  RuntimeCheck(g > 0, "gather_bands_from_device: sel/dst must be non-empty (g > 0)");
+
+  const int64_t stride16 = band_bytes / 16;
+  const DLDevice device = cuda_device.unwrap();
+
+  const dim3 block(kBlockSize);
+  const dim3 grid(static_cast<unsigned int>(div_ceil(stride16, static_cast<int64_t>(kBlockSize))),
+                   static_cast<unsigned int>(g));
+
+  LaunchKernel(grid, block, device)(
+      prism_gather_bands,
+      static_cast<const uint4*>(device_src.data_ptr()),
+      static_cast<const int32_t*>(sel.data_ptr()),
+      static_cast<uint4*>(dst.data_ptr()),
+      stride16);
+}
+
 }  // namespace
