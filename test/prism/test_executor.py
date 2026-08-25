@@ -149,8 +149,10 @@ def make_inputs(m, seed=0, exact=False):
         w = torch.randint(0, 3, (m, DIMS["top_k"])).to(torch.float32)
     else:
         x = (torch.randn(m, DIMS["hidden_size"]) / 10.0).to(torch.bfloat16)
+        ids = torch.stack([torch.randperm(DIMS["num_experts"])[: DIMS["top_k"]] for _ in range(m)])
         w = torch.rand(m, DIMS["top_k"], dtype=torch.float32)
-    ids = torch.stack([torch.randperm(DIMS["num_experts"])[: DIMS["top_k"]] for _ in range(m)])
+    if exact:
+        ids = torch.stack([torch.randperm(DIMS["num_experts"])[: DIMS["top_k"]] for _ in range(m)])
     return x, ids, w
 
 

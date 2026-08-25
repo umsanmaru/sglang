@@ -322,8 +322,10 @@ class PrismExecutor:
         # **hot GEMM보다 먼저** 기록한다 — hot은 arena를 안 건드리므로 warm의
         # 첫 H2D가 hot 연산을 기다릴 이유가 없다 (순서가 뒤집히면 hot이 클수록
         # warm 전송이 통째로 직렬화된다).
-        prev_done = torch.cuda.Event()
-        prev_done.record(torch.cuda.current_stream())
+        # worklist 모드는 arena를 건드리지 않으므로 WAR 시드가 불필요하다.
+        if not flow.worklist:
+            prev_done = torch.cuda.Event()
+            prev_done.record(torch.cuda.current_stream())
 
         hot_gu = None
         hot_g, hot_u = _hot_band(prepared, Proj.GATE), _hot_band(prepared, Proj.UP)
@@ -426,8 +428,10 @@ class PrismExecutor:
         # gateup GEMM(current stream)이 arena를 다 읽은 뒤에만 덮어야 한다.
         # (이전의 prev_done=None은 잠복 레이스였고, slot당 host 동기화가
         #  우연히 직렬화해 숨겨져 있었다 — sync-free 전환에서 발현, 2026-08-20)
-        prev_done = torch.cuda.Event()
-        prev_done.record(torch.cuda.current_stream())
+        # worklist 모드는 arena를 건드리지 않으므로 WAR 시드가 불필요하다.
+        if not flow.worklist:
+            prev_done = torch.cuda.Event()
+            prev_done.record(torch.cuda.current_stream())
 
         hot_down = None
         hot_d = _hot_band(prepared, Proj.DOWN)
