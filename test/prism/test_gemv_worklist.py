@@ -73,3 +73,58 @@ def test_gemv_worklist_out_col_offset_slice():
     torch.cuda.synchronize()
     assert torch.equal(gu[:, :, :I].cpu(), _ref(x, ids, w, 0, False).to(torch.bfloat16))
     assert torch.equal(gu[:, :, I:].cpu(), _ref(x, ids, w, 32, False).to(torch.bfloat16))
+
+
+@cuda_required
+def test_gemv_worklist_pinned_matches_device():
+    """W가 pinned CPU(UVA)여도 device 변형과 비트 동일 — warm 티어 경로."""
+    from sglang.jit_kernel.prism_gemv import gemv_worklist, gemv_worklist_pinned
+    x, w, ids = _mk(exact=True)
+    out_d = torch.zeros(2, 4, 96, dtype=torch.bfloat16, device="cuda")
+    out_p = torch.zeros_like(out_d)
+    s = torch.cuda.current_stream()
+    gemv_worklist(x.cuda(), ids.int().cuda(), w.cuda(), out_d, 0, 0, False, s)
+    gemv_worklist_pinned(x.cuda(), ids.int().cuda(), w.pin_memory(), out_p, 0, 0, False, s)
+    torch.cuda.synchronize()
+    assert torch.equal(out_d.cpu(), out_p.cpu())
+
+
+@cuda_required
+def test_gemv_worklist_pinned_rejects_device_src():
+    from sglang.jit_kernel.prism_gemv import gemv_worklist_pinned
+    x, w, ids = _mk()
+    out = torch.zeros(2, 4, 96, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(Exception):
+        gemv_worklist_pinned(x.cuda(), ids.int().cuda(), w.cuda(), out, 0, 0, False,
+                             torch.cuda.current_stream())
+
+
+@cuda_required
+def test_gemv_worklist_perf_smoke():
+    """35B h375 hot gate 치수(g=8, 768x512)에서 (gather+bmm) 대비 과도한
+    회귀가 없는지 — 상한 2배의 러프 가드 (튜닝 회귀 감지용, 마이크로벤치 아님)."""
+    import time
+    from sglang.jit_kernel.prism_gemv import gemv_worklist
+    E, k_rows, N, M, k = 64, 768, 512, 1, 8
+    w = torch.randn(E, k_rows, N).to(torch.bfloat16).cuda()
+    x = torch.randn(M, 2048).to(torch.bfloat16).cuda()
+    ids = torch.randint(0, E, (M, k)).int().cuda()
+    out = torch.zeros(M, k, N, dtype=torch.bfloat16, device="cuda")
+    s = torch.cuda.current_stream()
+
+    def bench(fn, iters=200):
+        for _ in range(20):
+            fn()
+        torch.cuda.synchronize(); t0 = time.perf_counter()
+        for _ in range(iters):
+            fn()
+        torch.cuda.synchronize(); return (time.perf_counter() - t0) / iters * 1e6
+
+    t_wl = bench(lambda: gemv_worklist(x, ids, w, out, 0, 0, False, s))
+    sel = ids.view(-1).long()
+    def ref():
+        wg = w.index_select(0, sel)
+        torch.bmm(x[:, :k_rows].unsqueeze(0).expand(k, -1, -1), wg)
+    t_ref = bench(ref)
+    print(f"worklist {t_wl:.1f}us vs gather+bmm {t_ref:.1f}us")
+    assert t_wl < 2.0 * t_ref
