@@ -4,6 +4,45 @@ P0에서 결정만 해두고 구현을 미룬 항목들. 각 항목은 "왜 미�
 "구현 시 건드릴 곳"을 함께 기록한다. (P0 범위 자체는 CONTRACTS.md와
 커밋 계획 참조)
 
+## cold 커널 교체 — 두 포팅이 같은 레이아웃을 다른 방법으로 만든다 (2026-08-25 밤)
+
+두 커널이 도착했고 **둘 다 n-contiguous B 레이아웃을 전제**하는데, 그 레이아웃을
+만드는 방법이 서로 배타적이다. 이건 어느 한쪽을 조용히 고르면 안 되는 갈래다.
+
+| | AMX (`rmnc-port`) | AVX (`cpu-mm-platform`) |
+|---|---|---|
+| 방법 | **새 버퍼 타입** `BufferBBF16NContigImpl`. kt의 `BufferBBF16Impl`은 무변경 | kt의 `BufferBBF16Impl`을 **제자리 변경** (`pack_block`/`get_submat`/`to_mat`/`from_bb_transposed` 4곳 + writeback 1곳) |
+| 커널 struct | standalone (`GemmKernel224BF16RowMajorNC`), 자기 BufferA/B/C | **상속** (`GemmKernelTileK2BF16 : GemmKernel224BF16`) → kt의 BufferB를 그대로 씀 |
+| writeback | 레이아웃 가드로 **거부** | `get_submat` 호출로 치환해 **해결** |
+
+AVX 쪽이 상속으로 버퍼를 공유하는데, 그 버퍼가 제자리 변경되지 않으면 AVX 커널은
+구 레이아웃을 읽는다. 반대로 제자리 변경하면 AMX 쪽의 별도 버퍼 타입이 잉여가 된다.
+
+**권고: AVX 안(제자리 변경)**. 근거 셋 —
+1. 목표가 "weight 한 벌"인데 버퍼 타입이 둘이면 그 목표가 타입 수준에서 깨진다.
+2. AMX 커널의 `BufferB` typedef를 kt 것으로 돌리면 되고, 두 레이아웃의 **2 KB 단위
+   내부가 이미 동일**하므로(AMX B-타일 그 자체) 커널 본문은 안 바뀐다.
+3. `write_weights_to_buffer`가 가드가 아니라 `get_submat` 치환으로 닫히고, 같은
+   함수의 full-K 결함(§10.7)도 같이 닫힌다.
+
+**착수 전 확인 하나**: 제자리 변경은 kt **원본 커널**의 packed 순서도 바꾼다.
+§8.2는 AMX 타일 내부가 불변이라 `load_b`/`amx_kernel`이 영향받지 않는다고 하지만,
+그건 게이트로 확인할 것 — `test/prism` 39종 + per_commit 306종이 전부 그 판정이다.
+
+### 오늘 밤 붙인 것 / 안 붙인 것
+
+- **AMX NC 커널**: 파일 3개 배치 + 배선 완료. **비트일치 게이트 6/6 통과**
+  (`bf16_rowmajor-test`). 단 `WithPartial=false`로 바인딩했다 — partial의 sparse
+  분기가 `amx::vec_mul_sparse`를 부르는데 그 오버로드가 `GemmKernel224BF16` 버퍼에
+  하드코딩돼 있어 NC 타입에서 인스턴스화가 안 된다. 그래서 **prism은 아직 이 커널을
+  쓰지 않는다** (`cpu_cold: kt_amx_bf16` 그대로).
+- `do_*_gemm`의 sparse 분기에 `kHasSparseGemv` 컴파일 가드를 넣었다 — sparse 짝이
+  없는 커널에서 조용히 dense로 떨어지는 대신 즉사한다 (마스킹이 조용히 사라지면
+  성능만 달라져 어떤 테스트도 안 잡는다).
+- **AVX tile_k2**: 미착수. 위 갈래가 정해져야 시작할 수 있다.
+
+---
+
 ## grouped GEMM prefill (worklist 대비 1.7배 회수)
 
 - **현상**: prefill이 decode와 같은 pair-native worklist GEMV를 탄다 (2026-08-25,
