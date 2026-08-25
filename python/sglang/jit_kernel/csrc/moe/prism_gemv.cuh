@@ -73,11 +73,50 @@ __global__ void prism_gemv_worklist(
   const __nv_bfloat16* we = w + o0 * n_cols;
   const uint16_t* ie = INDEXED ? kidx + o0 : nullptr;
 
+  // 이 블록이 쓰는 activation 조각을 smem에 한 번 모은다.
+  //
+  // 인덱스 경로에서 이게 없으면 내부 루프가 `idx[r] → x[idx[r]]` **의존 로드
+  // 사슬**을 원소마다 탄다. gate/up 치수(k=768, N=512)는 grid가 (8, 8) = 64
+  // 블록뿐이라 188 SM에서 순수 지연 바운드이고, 그 사슬이 1:1로 벽시계에
+  // 드러난다 (2026-08-25 실측: 10.5 → 19.3 µs, 1.83배). 블록당 1회 협력
+  // gather로 바꾸면 내부 루프는 의존성 없는 smem 읽기가 된다.
+  //
+  // K를 KTILE 단위로 끊는 이유는 smem을 상수로 묶기 위해서다 (k[e]가
+  // 가변이라 최대치를 host가 모른다). KTILE이 blockDim.y(4)의 배수이므로
+  // 스레드별 누산 순서는 청킹 전과 **완전히 같다** — 연속 인덱스에서 밴드
+  // 경로와의 비트일치가 이 변경으로 깨지지 않는 이유다.
+  //
+  // 스테이징은 인덱스 경로에만 건다: 밴드 경로는 x를 순차로 읽어 끊을 사슬이
+  // 없고, syncthreads만 늘어 순손실이었다 (실측 bs=1 10.5 → 12.0 µs).
+  constexpr int KTILE = 2048;
+
   float acc = 0.f;
-  if (n < n_cols) {
-    for (long long r = threadIdx.y; r < kr; r += 4) {
-      const long long xi = INDEXED ? static_cast<long long>(ie[r]) : k_offset + r;
-      acc += __bfloat162float(xr[xi]) * __bfloat162float(we[r * n_cols + n]);
+  if constexpr (INDEXED) {
+    __shared__ __nv_bfloat16 xs[KTILE];
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    const int nthreads = blockDim.x * blockDim.y;
+    for (long long base = 0; base < kr; base += KTILE) {
+      const int cnt = static_cast<int>(min(static_cast<long long>(KTILE), kr - base));
+      __syncthreads();
+      for (int t = tid; t < cnt; t += nthreads) {
+        xs[t] = xr[static_cast<long long>(ie[base + t])];
+      }
+      __syncthreads();
+      if (n < n_cols) {
+        for (int r = threadIdx.y; r < cnt; r += 4) {
+          acc += __bfloat162float(xs[r]) *
+                 __bfloat162float(we[(base + r) * n_cols + n]);
+        }
+      }
+    }
+  } else {
+    // 밴드 경로는 x를 순차로 읽어 의존 사슬이 없다 — 스테이징이 순손실이라
+    // (실측 bs=1 10.5 → 12.0 µs) 원래 루프를 그대로 둔다.
+    if (n < n_cols) {
+      for (long long r = threadIdx.y; r < kr; r += 4) {
+        acc += __bfloat162float(xr[k_offset + r]) *
+               __bfloat162float(we[r * n_cols + n]);
+      }
     }
   }
   __shared__ float red[4][64];
