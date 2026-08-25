@@ -118,6 +118,7 @@ class _LayerFlow:
     groups: list[list[int]]
     flat_ids: Optional[torch.Tensor]    # graph 경로 sel 원천 (device int64 [k]) / eager는 None
     ids_cpu: Optional[torch.Tensor]     # eager 경로 expert_ids 원천 / graph는 None
+    worklist: bool = False              # decode worklist 모드 (spec 2026-08-25)
 
 
 class PrismExecutor:
@@ -128,13 +129,20 @@ class PrismExecutor:
                  stager: Stager, *,
                  cold_stream: bool = False,
                  force_graph_path: bool = False,
-                 capture_mode_fn: Optional[Callable[[], bool]] = None):
+                 capture_mode_fn: Optional[Callable[[], bool]] = None,
+                 worklist_kernels=None,
+                 worklist_max_m: int = 32):
         """cold_stream: eager에서도 cold submit/sync를 stream 통합으로 (opt-in).
         force_graph_path: 캡처 없이 graph-safe 경로 강제 (테스트/디버그).
         capture_mode_fn: sglang CudaGraphRunner의 capture 구간(캡처 전 워밍업
         포함) 신호 — 조립 지점이 주입한다. None이면 실제 stream 캡처 중에만
         graph 경로를 탄다 (워밍업의 lazy init이 캡처 안으로 밀리므로, sglang
-        통합 실행에서는 반드시 주입할 것 — method.py 참조)."""
+        통합 실행에서는 반드시 주입할 것 — method.py 참조).
+        worklist_kernels: (device_fn, pinned_fn) 쌍 (kernels.resolve_worklist_kernels
+        반환) 또는 None. None이면 worklist 경로가 아예 존재하지 않는다 (기존
+        dedup/hot-gather-scatter 경로만).
+        worklist_max_m: worklist 경로를 태우는 M 상한 (decode 전용, eager) —
+        이보다 크면(prefill) 기존 dedup 경로로 폴백한다."""
         self._plan = plan
         self._res = resources
         self._cold = cold
@@ -157,6 +165,16 @@ class PrismExecutor:
         # 이 stale 공유 포인터였다).
         self._qlen_pin_graph = torch.ones(1, dtype=torch.int32)
         self._graph_stager: Optional[GatherKernelStager] = None
+        # worklist GEMV (decode 전용). None이면 기존 경로만 존재한다.
+        self._worklist_fns = worklist_kernels          # (device_fn, pinned_fn)
+        self._worklist_max_m = worklist_max_m
+        # graph qlen pin — bs(M)별로 격리 (Finding A의 일반화: 절대 공유 금지).
+        # 위 _qlen_pin_graph 주석의 stale-pointer 사고가 재발하지 않으려면,
+        # bs가 다른 replay가 같은 버퍼를 절대 나눠 쓰지 않아야 한다 — worklist가
+        # M>1 graph를 열면서 상수 1 버퍼 하나로는 부족해져 dict로 일반화한다.
+        self._qlen_pins_graph: dict[int, torch.Tensor] = {
+            1: self._qlen_pin_graph  # 기존 상수 1 버퍼를 bs=1 항목으로 흡수
+        }
 
     def register_layer(self, layer_idx: int, prepared: PreparedWeights) -> None:
         """Stage 2 산출물 등록. cold 밴드가 있으면 backend에 이미 load_layer된
@@ -173,6 +191,7 @@ class PrismExecutor:
         """호출별 실행 모드를 1회 확정. graph-safe 경로는 캡처 중 불법 연산
         (pageable D2H, tolist, event.synchronize, blocking copy)을 전부
         우회해야 하므로, 여기서 갈라진 결정이 본문의 유일한 분기 원천이다."""
+        worklist = self._worklist_fns is not None and m <= self._worklist_max_m
         graph_flow = (
             torch.cuda.is_current_stream_capturing()
             or self._force_graph_path
@@ -187,30 +206,50 @@ class PrismExecutor:
         if graph_flow:
             # 그룹 조성에 host 결정 없음: M==1 + slot-order 전제에서 그룹은
             # 항상 위치 표지 [0..k) 절단 — ids_cpu D2H 자체가 사라진다.
-            # qlen도 격리된 상수 버퍼(1)를 쓴다 (Finding A).
-            if m != 1:
+            # worklist가 없으면 여전히 M==1만 허용(P0 그대로); worklist가
+            # 있으면 M<=worklist_max_m까지 열어준다 (pair-native라 그룹/슬롯
+            # 제약이 없다).
+            if m != 1 and not worklist:
                 raise RuntimeError(
-                    f"prism graph path requires M==1 (bs=1), got M={m} — "
-                    f"capture with cuda_graph_bs=[1] (and cuda_graph_max_bs=1)"
+                    f"prism graph path requires M==1 (bs=1) without a worklist "
+                    f"kernel, got M={m} — use kernels.gpu_warm='gemv_worklist' "
+                    f"or capture with cuda_graph_bs=[1]"
                 )
+            # qlen pin — bs(M)별로 격리 (Finding A, 절대 공유 금지: 위
+            # _qlen_pins_graph 주석 참조). bs=1은 생성자가 이미 심어둔 항목.
+            qlen_pin = self._qlen_pins_graph.get(m)
+            if qlen_pin is None:
+                # 캡처 전 워밍업 호출(capture_mode_fn)에서 생성된다 — 실제
+                # 캡처 중 신규 bs가 나타나면 이 할당은 캡처 밖 host alloc이라
+                # 안전하지만, sglang 워밍업 순서상 도달하지 않는 것이 정상.
+                qlen_pin = torch.full((1,), m, dtype=torch.int32)
+                self._qlen_pins_graph[m] = qlen_pin
             grouping = select_grouping(1)  # SlotOrderGrouping 싱글턴
             return _LayerFlow(
                 graph_flow=True, use_cold_stream=True, stream_arg=stream_arg,
-                qlen_ptr=self._qlen_pin_graph.data_ptr(),
+                qlen_ptr=qlen_pin.data_ptr(),
                 grouping=grouping,
-                groups=grouping.make_groups_for_graph(k, self._res.spec.n_slots),
+                groups=[] if worklist else grouping.make_groups_for_graph(k, self._res.spec.n_slots),
                 flat_ids=topk_ids.view(-1),  # device int64 [k] — stager의 sel 원천
                 ids_cpu=None,
+                worklist=worklist,
             )
-        # S1: topk D2H (P0 유일의 host 블록) + dedup
-        with _nvtx("s1.topk_d2h+dedup"):
+        # S1: topk D2H (P0 유일의 host 블록). cold submit이 expert_ids를
+        # ids_cpu에서 채우므로 worklist 모드에서도 여전히 계산한다 — dedup
+        # (make_groups)만 건너뛴다 (worklist는 그룹/gather/scatter가 없다).
+        with _nvtx("s1.topk_d2h"):
             ids_cpu = topk_ids.to("cpu")
-            grouping = select_grouping(m)
-            groups = grouping.make_groups(ids_cpu, self._res.spec.n_slots)
+        if worklist:
+            grouping, groups = select_grouping(1), []
+        else:
+            with _nvtx("s1.dedup"):
+                grouping = select_grouping(m)
+                groups = grouping.make_groups(ids_cpu, self._res.spec.n_slots)
         return _LayerFlow(
             graph_flow=False, use_cold_stream=use_cold_stream, stream_arg=stream_arg,
             qlen_ptr=self._qlen_pin.data_ptr(),
             grouping=grouping, groups=groups, flat_ids=None, ids_cpu=ids_cpu,
+            worklist=worklist,
         )
 
     # ── 본체 ──────────────────────────────────────────────────────────────
@@ -246,11 +285,14 @@ class PrismExecutor:
                     # device topk_ids → pinned int64 async D2H (캡처 가능;
                     # kt는 pinned를 읽는다). ids_cpu는 이 경로에 존재하지 않음.
                     res.staging.fill_expert_ids(topk_ids, non_blocking=True)
-                    # qlen_pin_graph는 상수 1(M==1 guard가 보장) — 아무도
+                    # qlen_pins_graph[m]은 상수 m(위 guard가 보장) — 아무도
                     # 다시 쓰지 않는다. 격리가 깨지지 않았는지만 방어적으로
-                    # 확인 (host 메모리 읽기라 capture-safe).
-                    assert int(self._qlen_pin_graph[0]) == 1, (
-                        f"qlen_pin_graph={int(self._qlen_pin_graph[0])} != 1 — "
+                    # 확인 (host 메모리 읽기라 capture-safe). bs별 버퍼가
+                    # 절대 공유되지 않아야 한다는 Finding A의 불변식을 여기서
+                    # per-bs로 재확인한다.
+                    pin = self._qlen_pins_graph[m]
+                    assert int(pin[0]) == m, (
+                        f"qlen_pin_graph[{m}]={int(pin[0])} != {m} — "
                         f"graph path must never write this buffer"
                     )
                 else:
@@ -285,7 +327,16 @@ class PrismExecutor:
 
         hot_gu = None
         hot_g, hot_u = _hot_band(prepared, Proj.GATE), _hot_band(prepared, Proj.UP)
-        if hot_g is not None:
+        if hot_g is not None and flow.worklist:
+            # worklist: pair (m,j)가 rejoin 좌표 — 그룹/gather/scatter 없음.
+            # 두 호출이 [:, :, :inter]/[inter:]를 완전히 덮으므로 empty로 충분.
+            dev_fn, _ = self._worklist_fns
+            hot_gu = torch.empty(m, k, 2 * inter, dtype=torch.bfloat16, device=hidden.device)
+            with _nvtx("hot.gu.worklist"):
+                cur = torch.cuda.current_stream()
+                dev_fn(hidden, topk_ids, hot_g.weights, hot_gu, hot_g.k_offset, 0, False, cur)
+                dev_fn(hidden, topk_ids, hot_u.weights, hot_gu, hot_u.k_offset, inter, False, cur)
+        elif hot_g is not None:
             hot_gu = torch.zeros(m, k, 2 * inter, dtype=torch.float32, device=hidden.device)
             for gi, group in enumerate(flow.groups):
                 with _nvtx(f"hot.gu.g{gi}x{len(group)}"):
@@ -303,7 +354,17 @@ class PrismExecutor:
 
         warm_gu = None
         gate_band, up_band = prepared.warm.band(Proj.GATE), prepared.warm.band(Proj.UP)
-        if gate_band is not None:
+        if gate_band is not None and flow.worklist:
+            # warm worklist: W가 pinned CPU라 pinned_fn(UVA 직접 읽기)을 쓴다.
+            # stager/warm_stream/이벤트 없이 current stream 직렬 (spec §3) —
+            # 배치 내 중복 expert는 PCIe 재전송이라는 설계 트레이드오프.
+            _, pin_fn = self._worklist_fns
+            warm_gu = torch.empty(m, k, 2 * inter, dtype=torch.bfloat16, device=hidden.device)
+            with _nvtx("warm.gu.worklist"):
+                cur = torch.cuda.current_stream()
+                pin_fn(hidden, topk_ids, gate_band.weights, warm_gu, gate_band.k_offset, 0, False, cur)
+                pin_fn(hidden, topk_ids, up_band.weights, warm_gu, up_band.k_offset, inter, False, cur)
+        elif gate_band is not None:
             warm_gu = torch.zeros(m, k, 2 * inter, dtype=torch.float32, device=hidden.device)
             for gi, group in enumerate(flow.groups):
                 with _nvtx(f"warm.gu.g{gi}x{len(group)}"):
@@ -370,7 +431,13 @@ class PrismExecutor:
 
         hot_down = None
         hot_d = _hot_band(prepared, Proj.DOWN)
-        if hot_d is not None:
+        if hot_d is not None and flow.worklist:
+            dev_fn, _ = self._worklist_fns
+            hot_down = torch.empty(m, k, h, dtype=torch.bfloat16, device=hidden.device)
+            with _nvtx("hot.dn.worklist"):
+                dev_fn(act.reshape(m * k, inter), topk_ids, hot_d.weights, hot_down,
+                       hot_d.k_offset, 0, True, torch.cuda.current_stream())
+        elif hot_d is not None:
             hot_down = torch.zeros(m, k, h, dtype=torch.float32, device=hidden.device)
             hot_act = _band_slice(act, hot_d).float()
             for gi, group in enumerate(flow.groups):
@@ -384,7 +451,13 @@ class PrismExecutor:
 
         warm_down = None
         down_band = prepared.warm.band(Proj.DOWN)
-        if down_band is not None:
+        if down_band is not None and flow.worklist:
+            _, pin_fn = self._worklist_fns
+            warm_down = torch.empty(m, k, h, dtype=torch.bfloat16, device=hidden.device)
+            with _nvtx("warm.dn.worklist"):
+                pin_fn(act.reshape(m * k, inter), topk_ids, down_band.weights, warm_down,
+                       down_band.k_offset, 0, True, torch.cuda.current_stream())
+        elif down_band is not None:
             warm_down = torch.zeros(m, k, h, dtype=torch.float32, device=hidden.device)
             act_band = act[:, :, down_band.k_offset : down_band.k_offset + down_band.k_rows].float()
             for gi, group in enumerate(flow.groups):
