@@ -127,9 +127,12 @@ _GPU_WORKLIST_KERNELS: dict[str, Callable[[], tuple]] = {
 
 # 불변식: 모든 worklist 키는 warm registry에도 있어야 한다 (prefill 폴백).
 # 어기면 plan 검증(known_gpu_kernels)과 resolve_worklist_kernels가 갈라진다.
-assert set(_GPU_WORKLIST_KERNELS) <= set(_GPU_WARM_KERNELS), (
-    "worklist kernel keys must also be registered in _GPU_WARM_KERNELS"
-)
+# assert가 아니라 raise: `python -O`에서 assert는 제거되지만 이 불변식은
+# 모듈 import 시 항상 검증돼야 한다.
+if not (set(_GPU_WORKLIST_KERNELS) <= set(_GPU_WARM_KERNELS)):
+    raise KernelError(
+        "worklist kernel keys must also be registered in _GPU_WARM_KERNELS"
+    )
 
 
 def resolve_worklist_kernels(name: str) -> Optional[tuple]:

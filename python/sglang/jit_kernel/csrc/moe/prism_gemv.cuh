@@ -18,6 +18,13 @@ namespace {
 //
 // grid = (ceil_div(N, 64), M×top_k), block = (64, 4).
 // thread(tx, ty): col n = bx*64+tx, r ∈ {ty, ty+4, ...} 부분합 → smem 합산.
+//
+// 스펙 편차: W 로드(`we[r * n_cols + n]`)는 스칼라 bf16(스레드당 2B)이고
+// 정렬 RuntimeCheck도 없다 — 스펙(2026-08-25-prism-gemv-worklist-design.md
+// §2)이 요구한 uint4/uint2 벡터화(및 수반 정렬 체크)를 이 1차 구현은 안 한다.
+// 디바이스 경로 실측 10.7us vs gather+bmm 17.5us로 이미 충분해 벡터화를
+// 미뤘다; warm/UVA 대역폭이 임계로 확인되면 벡터 로드 + 정렬 RuntimeCheck를
+// 후속으로 추가한다.
 template <typename IdxT>
 __global__ void prism_gemv_worklist(
     const __nv_bfloat16* __restrict__ x,

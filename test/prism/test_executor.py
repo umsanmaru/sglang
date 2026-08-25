@@ -201,7 +201,7 @@ def test_plan_invariance(qlen):
 
 
 @cuda_required
-@pytest.mark.parametrize("kind", ["mixed", "all_hot", "three_tier"])
+@pytest.mark.parametrize("kind", ["mixed", "all_warm", "all_hot", "three_tier"])
 @pytest.mark.parametrize("m", [1, 4])
 def test_worklist_matches_bmm_path(kind, m):
     """worklist 커널 plan과 torch_bmm plan이 같은 가중치·입력에서 일치.
