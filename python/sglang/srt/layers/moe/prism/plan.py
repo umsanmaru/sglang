@@ -54,11 +54,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence, Union
 
-# K-축 밴드 경계 정렬 단위 (계약 ①)
-ROW_GROUP = 64
+# K-축 경계 정렬 단위 = **페어** (계약 ① 2026-08-25).
+#
+# 초판의 `ROW_GROUP = 64`는 폐기됐다. 그것은 요구가 아니라 "AMX K_STEP(32)의
+# 배수라 안전"이라는 보수적 선택이었고, 그 K_STEP은 cold **커널의 packed 저장**
+# 성질이지 plan의 성질이 아니다 — 타일 경계까지의 올림은 로더가 하고 커널 안에서
+# 끝난다 (`kernels.cold_pack_tile_rows`). plan/자산이 지켜야 하는 것은 페어뿐이다.
+#
+# 값어치는 planner 해상도다: down은 K=512라 %32면 per-expert 크기 선택지가 16개
+# 뿐인데, 가변 per-expert 예산 배분이 이 스키마의 존재 이유다.
+ROW_GROUP = 2
 # N-축 shard 경계 정렬 단위 (AMX pack N-타일; 값은 pack 확인 후 조정 가능)
 COL_GROUP = 32
-# 인접 입력채널 페어 마스킹 단위. k2wl2 점수가 페어 단위이므로
+# 인접 입력채널 페어 마스킹 단위 (= ROW_GROUP). k2wl2 점수가 페어 단위이므로
 # (calib pairimp: sqrt(a0*x0^2 + a1*x1^2 + 2c*x0*x1)) 마스크 길이는
 # K/PAIR_GROUP이다. 밴드 경계가 페어를 쪼개면 두 티어가 같은 페어의 반쪽씩
 # 갖게 되어 어느 쪽도 점수를 재구성할 수 없다 — ROW_GROUP이 PAIR_GROUP의
@@ -158,7 +166,7 @@ class SparsitySpec:
 
 @dataclass(frozen=True)
 class BandSpec:
-    """K-축 반개구간 [start, end)와 그 티어. 경계는 ROW_GROUP 배수."""
+    """K-축 반개구간 [start, end)와 그 티어. 경계는 페어(ROW_GROUP) 배수."""
 
     start: int
     end: int

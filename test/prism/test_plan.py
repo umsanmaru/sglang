@@ -106,11 +106,20 @@ def test_incomplete_coverage_rejected():
 
 
 def test_misaligned_band_rejected():
-    assert ROW_GROUP == 64
+    """정렬 요구는 **페어**뿐이다 (2026-08-25). 커널 타일까지의 올림은 로더가
+    하고 cold 인스턴스 안에서 끝나므로 plan은 그 값을 모른다."""
+    assert ROW_GROUP == 2
     raw = make_raw_plan()
-    raw["default"]["gate"]["bands"] = [[0, 96, "warm"], [96, 256, "cold"]]
+    raw["default"]["gate"]["bands"] = [[0, 97, "warm"], [97, 256, "cold"]]
     with pytest.raises(PlanError, match="aligned"):
         check(raw)
+
+
+def test_pair_aligned_band_accepted():
+    """타일 배수가 아니어도 페어 배수면 유효하다 — planner 해상도가 목적이다."""
+    raw = make_raw_plan()
+    raw["default"]["gate"]["bands"] = [[0, 98, "warm"], [98, 256, "cold"]]
+    check(raw)
 
 
 def test_missing_cold_shards_rejected():

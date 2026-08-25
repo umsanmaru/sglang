@@ -232,6 +232,7 @@ class PrismMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer) -> None:
+        from sglang.srt.layers.moe.prism.kernels import cold_pack_tile_rows
         from sglang.srt.layers.moe.prism.numa import gpu_numa_node
         from sglang.srt.layers.moe.prism.plan import Proj, Tier
         from sglang.srt.layers.moe.prism.weights import prepare_layer_weights
@@ -258,6 +259,8 @@ class PrismMoEMethod(FusedMoEMethodBase):
             self.layer_id, w13, w2, runtime.plan,
             calib=runtime.calib, device=device,
             warm_node=gpu_numa_node(device),
+            # cold 스토어의 타일 올림 단위는 커널 키가 함의한다 (계약 ①).
+            cold_tile_rows=cold_pack_tile_rows(runtime.plan.kernels.cpu_cold),
         )
         ep = runtime.plan.expert(self.layer_id, 0)
         if any(ep.proj(p).has_tier(Tier.COLD) for p in Proj):

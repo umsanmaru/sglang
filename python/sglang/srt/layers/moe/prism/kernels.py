@@ -20,6 +20,12 @@ from typing import Tuple
 _GPU_WARM_KERNELS: Tuple[str, ...] = ("gemv_worklist", "torch_bmm")
 _CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16",)
 
+# cold packed 저장의 K축 타일 행 수 — **커널 키가 함의하는 값**이다 (계약 ①:
+# "cold의 저장 형식(pack)은 커널 키가 함의한다 — 별도 codec 필드 없음").
+# plan/자산이 지키는 정렬은 페어(%2)뿐이므로, 로더가 여기까지 올리고 0 행을
+# 채운다. 새 cold 커널은 자기 타일 크기를 여기 등록한다.
+_CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32}
+
 
 class KernelError(ValueError):
     """커널 resolve 실패 또는 커널 입력 계약 위반."""
@@ -40,6 +46,16 @@ def resolve_gpu_kernel(name: str) -> str:
             f"unknown gpu_warm kernel '{name}' (known: {sorted(_GPU_WARM_KERNELS)})"
         )
     return name
+
+
+def cold_pack_tile_rows(name: str) -> int:
+    """cold 스토어를 올림해야 하는 타일 행 수. 이름 검증도 겸한다."""
+    try:
+        return _CPU_COLD_TILE_ROWS[name]
+    except KeyError:
+        raise KernelError(
+            f"unknown cpu_cold kernel '{name}' (known: {sorted(_CPU_COLD_KERNELS)})"
+        ) from None
 
 
 def resolve_cpu_kernel(name: str) -> str:

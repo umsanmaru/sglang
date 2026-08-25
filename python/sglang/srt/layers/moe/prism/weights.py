@@ -34,13 +34,15 @@ sparsity(계약 ①, schema_version 2): `wn`/`pair_dot`은 K축이라 weight와 
 PreparedWeights.thr에 통째로 둔다. 셋 다 CPU fp32로 남긴다.
 
 전환기 상태 (2026-08-25):
-- 티어당 다중 밴드, expert 간 기하 불일치(가변 k) — **둘 다 지원된다.**
-  인덱스 표현에는 애초에 그런 제약이 없고, 밴드 시절의 NotImplementedError
-  두 개가 여기서 사라졌다.
-- 남은 제약은 **소비자 쪽**이다: cold는 kt가 밴드 기하만 받아 균일·연속을
-  요구하고(K3까지), calib gather도 그에 맞춰 밴드 절단으로 남는다. GPU 티어의
-  밴드 경로(bmm/stager)도 `weights`/`k_offset` 접근 시 균일·연속을 요구하며,
-  아니면 즉사한다 — 조용히 틀린 값을 주느니 죽는 편이 낫다.
+- 세 티어 모두 인덱스다. 티어당 다중 밴드, expert 간 기하 불일치(가변 k),
+  gate ≠ up — 전부 지원된다. 밴드 시절의 NotImplementedError 세 개가 사라졌다.
+- cold만 **타일 올림**을 받는다: plan/자산이 지키는 정렬은 페어(%2)뿐인데
+  packed 저장은 커널 타일의 배수를 요구하므로(`kernels.cold_pack_tile_rows` —
+  커널 키가 함의하는 값), 로더가 올리고 0 열을 채우며 `real_rows`가 패딩 전
+  행 수를 나른다. hot/warm은 GEMV 루프라 정렬 요구가 없다.
+- 남은 전환기 물건은 GPU 티어의 밴드 호환 속성뿐이다: `weights`/`k_offset`이
+  균일·연속을 요구하며 아니면 즉사한다 — 조용히 틀린 값을 주느니 죽는 편이
+  낫고, 그 raise가 켜지는 날이 그 속성을 지울 날이다.
 """
 
 from __future__ import annotations
@@ -50,8 +52,9 @@ from typing import Mapping, Optional
 
 import torch
 
-from sglang.srt.layers.moe.prism.calib import CalibBand, CalibTables
+from sglang.srt.layers.moe.prism.calib import CalibShard, CalibTables
 from sglang.srt.layers.moe.prism.index import (
+    IDX_DTYPE,
     LayerIndex,
     TierIndex,
     from_bands,
@@ -91,7 +94,7 @@ class TierShard:
     # 밴드 퇴화형일 때만 채워진다 (전환기 호환용, 로드 시 host에서 계산).
     uniform_k: Optional[int] = None
     band_start: Optional[int] = None
-    calib: Optional[CalibBand] = None
+    calib: Optional[CalibShard] = None
 
     @property
     def num_experts(self) -> int:
@@ -169,21 +172,32 @@ WarmBand = TierShard
 
 
 @dataclass
-class ColdBand:
-    """한 proj의 cold 밴드: CPU bf16 [E, N, k_rows] (ckpt 방향)."""
+class ColdShard:
+    """한 proj의 cold 스토어 — expert 블록 [N, k_pad(e)]를 이어 붙인 flat.
 
-    k_offset: int
-    weights: torch.Tensor
-    # sparsity 점수 재료 (이 밴드 구간만). plan.sparsity가 있으면 존재.
-    calib: Optional[CalibBand] = None
-    # 이 티어가 소유하는 K행 (계약 ③). cold **텐서 레이아웃**은 kt pack이
-    # 정하므로 K3까지 ckpt 방향 [E, N, k]로 두고, 인덱스만 먼저 동행시킨다 —
-    # kt가 KIndex를 받게 되는 시점(S7)의 입력이다.
-    index: Optional[TierIndex] = None
+    ckpt 방향(N-major)을 유지하는 이유는 소비자인 kt pack(`from_mat`)이 그 방향의
+    `[N, k]`를 읽기 때문이고, flat인 이유는 hot/warm과 같다: expert마다 k가 다르면
+    `[E, N, k]` 적층이 성립하지 않는다.
+
+    **패딩**: plan/자산이 지키는 정렬은 페어(%2)뿐인데 packed 저장은 커널 타일의
+    배수를 요구한다 (`kernels.cold_pack_tile_rows` — 커널 키가 함의하는 값).
+    로더가 `k_real`을 타일 경계까지 올리고 그만큼의 열을 0으로 채운다. 0 weight는
+    dense 경로에서 무해하고, sparse 경로의 tail 비트는 kt가 `real_rows`로 끈다.
+    """
+
+    w_flat: torch.Tensor       # bf16 [Σₑ N·k_pad(e)] (expert 블록 [N, k_pad])
+    row_off: torch.Tensor      # int32 [E+1] — **패딩된** 행 기준
+    k_index: torch.Tensor      # uint16 [Σₑ k_pad(e)] — 패딩 항목은 0을 가리킨다
+    real_rows: torch.Tensor    # int32 [E] — 패딩 전 행 수
+    calib: Optional[CalibShard] = None
 
     @property
-    def k_rows(self) -> int:
-        return self.weights.shape[2]
+    def num_experts(self) -> int:
+        return int(self.row_off.numel()) - 1
+
+    @property
+    def total_rows(self) -> int:
+        return int(self.row_off[-1])
 
 
 @dataclass
@@ -191,11 +205,11 @@ class PendingColdTensors:
     """cold backend 접속 전까지의 임시 소유자. backend가 붙으면 이 텐서들은
     C++로 pack되어 넘어가고 PreparedWeights.cold는 핸들로 대체된다."""
 
-    gate: Optional[ColdBand]
-    up: Optional[ColdBand]
-    down: Optional[ColdBand]
+    gate: Optional[ColdShard]
+    up: Optional[ColdShard]
+    down: Optional[ColdShard]
 
-    def band(self, proj: Proj) -> Optional[ColdBand]:
+    def band(self, proj: Proj) -> Optional[ColdShard]:
         return {Proj.GATE: self.gate, Proj.UP: self.up, Proj.DOWN: self.down}[proj]
 
 
@@ -251,13 +265,45 @@ def _gather_flat(src: torch.Tensor, ti: TierIndex, uniform_k, band_start):
     return out
 
 
+def _cold_flat(
+    src: torch.Tensor, ti: TierIndex, real_rows, tile: int
+) -> tuple:
+    """cold 스토어 [Σₑ N·k_pad(e)]와 패딩된 (row_off, k_index)를 만든다.
+
+    expert 블록은 ckpt 방향 `[N, k_pad(e)]`이고 패딩 열은 0이다. 패딩 인덱스는
+    아무 열이어도 되지만(weight가 0) 0을 넣는다 — kt가 축 범위를 검증한다.
+    """
+    E, N, _ = src.shape
+    pad = [((int(r) + tile - 1) // tile) * tile for r in real_rows]
+    off = torch.zeros(E + 1, dtype=torch.int32)
+    for e, kp in enumerate(pad):
+        off[e + 1] = int(off[e]) + kp
+    total = int(off[-1])
+    flat = torch.zeros(total * N, dtype=src.dtype)
+    idx = torch.zeros(total, dtype=torch.int64)
+    for e in range(E):
+        kr, kp, o0 = int(real_rows[e]), pad[e], int(off[e])
+        if kr == 0:
+            continue
+        rows = ti.for_expert(e)[:kr].to(torch.int64)
+        idx[o0 : o0 + kr] = rows
+        blk = flat[o0 * N : (o0 + kp) * N].view(N, kp)
+        blk[:, :kr] = src[e].index_select(1, rows)
+    return (
+        flat.contiguous(),
+        off,
+        idx.to(IDX_DTYPE),
+        torch.tensor([int(r) for r in real_rows], dtype=torch.int32),
+    )
+
+
 def _build_shard(
     src: torch.Tensor,
     ti: TierIndex,
     *,
     idx_device: torch.device,
     place,
-    calib: Optional[CalibBand],
+    calib: Optional[CalibShard],
 ) -> TierShard:
     """티어 스토어 하나. `place`가 flat을 최종 거처로 옮긴다 (hot=device /
     warm=pinned). row_off·k_index는 **항상 커널이 읽는 device**로 간다."""
@@ -293,6 +339,7 @@ def prepare_layer_weights(
     pin_memory: bool = True,
     device: Optional[torch.device] = None,
     warm_node: Optional[int] = None,
+    cold_tile_rows: int = 32,
 ) -> PreparedWeights:
     """한 레이어의 full weight를 Plan대로 절단·변환·배치한다.
 
@@ -336,7 +383,7 @@ def prepare_layer_weights(
 
     hot_shards: dict[Proj, Optional[TierShard]] = {}
     warm_shards: dict[Proj, Optional[TierShard]] = {}
-    cold_bands: dict[Proj, Optional[ColdBand]] = {}
+    cold_shards: dict[Proj, Optional[ColdShard]] = {}
 
     if any(layer_index.get(p, Tier.HOT) is not None for p in Proj) and device is None:
         raise PlanError(
@@ -350,24 +397,18 @@ def prepare_layer_weights(
         where = f"layer {layer_idx} {proj.value}"
         src = _proj_source(w13, w2, dims.intermediate_size, proj)  # [E, N, K]
 
-        def band_calib(ti, tier_name):
-            """전환기: calib은 아직 밴드 절단이다 (cold만 소비하고, 그 소비자인
-            kt는 K3까지 밴드 기하를 쓴다). 인덱스 gather는 S7에서 붙는다."""
+        def tier_calib(ti, tier_name, real_rows=None):
+            """점수 재료는 weight와 **같은 인덱스·같은 오프셋**으로 모인다."""
             if calib is None:
                 return None
-            k0, k1 = _uniform_band(ti)
-            if k1 is None:
-                raise NotImplementedError(
-                    f"{where} {tier_name}: sparsity + 비밴드 인덱스는 아직 "
-                    f"미지원 (calib gather는 kt가 KIndex를 받을 때 붙는다)"
-                )
-            return calib.slice_band(layer_idx, proj, k1, k1 + k0, f"{where} {tier_name}")
+            return calib.gather_index(
+                layer_idx, proj, ti, real_rows, f"{where} {tier_name}")
 
         hot_ti = layer_index.get(proj, Tier.HOT)
         hot_shards[proj] = None if hot_ti is None else _build_shard(
             src, hot_ti, idx_device=idx_device,
             place=lambda t: t.to(device, non_blocking=False),
-            calib=band_calib(hot_ti, "hot"),
+            calib=tier_calib(hot_ti, "hot"),
         )
 
         warm_ti = layer_index.get(proj, Tier.WARM)
@@ -380,25 +421,20 @@ def prepare_layer_weights(
             return store
         warm_shards[proj] = None if warm_ti is None else _build_shard(
             src, warm_ti, idx_device=idx_device, place=place_warm,
-            calib=band_calib(warm_ti, "warm"),
+            calib=tier_calib(warm_ti, "warm"),
         )
 
         cold_ti = layer_index.get(proj, Tier.COLD)
         if cold_ti is None:
-            cold_bands[proj] = None
+            cold_shards[proj] = None
         else:
-            # cold 텐서 레이아웃은 kt pack이 정한다 — K3까지 ckpt 방향
-            # [E, N, k] 유지. 인덱스는 동행만 시킨다 (S7의 입력).
-            k0, k1 = _uniform_band(cold_ti)
-            if k1 is None:
-                raise NotImplementedError(
-                    f"{where} cold: kt가 아직 밴드 기하만 받는다 (K3 이후 해제)"
-                )
-            cold_bands[proj] = ColdBand(
-                k_offset=k1,
-                weights=src[:, :, k1 : k1 + k0].contiguous(),
-                calib=band_calib(cold_ti, "cold"),
-                index=cold_ti,
+            # 타일 올림은 커널 키가 함의하는 값이고(계약 ①), 패딩 열은 0이다.
+            real = [cold_ti.k_rows(e) for e in range(dims.num_experts)]
+            flat, off, idx, real_t = _cold_flat(src, cold_ti, real, cold_tile_rows)
+            padded = TierIndex(row_off=off, idx=idx, contiguous=cold_ti.contiguous)
+            cold_shards[proj] = ColdShard(
+                w_flat=flat, row_off=off, k_index=idx, real_rows=real_t,
+                calib=tier_calib(padded, "cold", real_rows=real),
             )
 
     return PreparedWeights(
@@ -411,7 +447,8 @@ def prepare_layer_weights(
             down=warm_shards[Proj.DOWN],
         ),
         cold=PendingColdTensors(
-            gate=cold_bands[Proj.GATE], up=cold_bands[Proj.UP], down=cold_bands[Proj.DOWN]
+            gate=cold_shards[Proj.GATE], up=cold_shards[Proj.UP],
+            down=cold_shards[Proj.DOWN],
         ),
         thr=(
             None if calib is None

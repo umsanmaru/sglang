@@ -278,10 +278,12 @@ def test_cold_backend_passes_wn_squared(tmp_path):
     # thr 곡선은 밴드와 무관하므로 절단되지 않고 [E, ng]로 그대로 간다.
     assert tables["thr_gate"].shape == (E, NG)
     assert torch.equal(tables["thr_down"], blob["td2l"][0])
+    # 점수 재료는 weight와 같은 오프셋의 **flat**이다 (계약 ③) — expert 블록이
+    # 이어 붙으므로 [E, rows]를 평탄화한 것과 같아야 한다.
     wn_cold = blob["wn_g"][0][:, WARM_ROWS:H]
-    assert torch.allclose(tables["gate_wn_sq"], wn_cold * wn_cold, atol=0)
+    assert torch.allclose(tables["gate_wn_sq"], (wn_cold * wn_cold).reshape(-1), atol=0)
     assert torch.equal(tables["down_pair_dot"],
-                       blob["cd"][0][:, WARM_ROWS // 2 :])
+                       blob["cd"][0][:, WARM_ROWS // 2 :].reshape(-1))
 
 
 @kt_required

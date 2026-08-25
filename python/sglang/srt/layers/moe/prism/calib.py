@@ -26,10 +26,11 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional, Sequence
 
 import torch
 
+from sglang.srt.layers.moe.prism.index import TierIndex
 from sglang.srt.layers.moe.prism.plan import (
     PAIR_GROUP,
     CalibRef,
@@ -79,6 +80,25 @@ class CalibBand:
         GPU(sparsity.py)와 CPU(kt) 두 소비자가 같은 정의를 쓰도록 여기 둔다.
         한쪽이 wn을, 다른 쪽이 wn²을 받으면 마스크가 조용히 갈린다.
         """
+        return (self.wn * self.wn).contiguous()
+
+
+@dataclass(frozen=True)
+class CalibShard:
+    """한 (proj, tier)의 점수 재료 — weight 스토어와 **같은 오프셋**의 flat.
+
+    `wn`: fp32 [Σₑ k(e)] / `pair_dot`: fp32 [Σₑ k(e) / PAIR_GROUP].
+    소비자(kt)가 `a + row_base(e)`, `c + row_base(e)/2`로 읽으므로 오프셋
+    테이블 하나가 weight·인덱스·점수 셋을 서비스한다 (계약 ③).
+    """
+
+    wn: torch.Tensor
+    pair_dot: torch.Tensor
+
+    @property
+    def wn_sq(self) -> torch.Tensor:
+        """a = wn² — 점수 식이 실제로 쓰는 형태. 정의점을 하나로 두는 이유는
+        한쪽이 wn을, 다른 쪽이 wn²을 받으면 마스크가 조용히 갈리기 때문이다."""
         return (self.wn * self.wn).contiguous()
 
 
@@ -172,6 +192,46 @@ class CalibTables:
             :, start // PAIR_GROUP : end // PAIR_GROUP
         ]
         return CalibBand(wn=wn.contiguous(), pair_dot=pair_dot.contiguous())
+
+    def gather_index(
+        self,
+        layer_idx: int,
+        proj: Proj,
+        ti: TierIndex,
+        real_rows: Optional[Sequence[int]],
+        where: str,
+    ) -> CalibShard:
+        """티어 인덱스로 점수 재료를 모은다 — weight와 **같은 순서, 같은 오프셋**.
+
+        같은 인덱스를 쓰는 것이 전부다: 마스크 비트 ↔ packed 타일 대응이
+        유지되려면 점수의 행 순서가 gather된 activation·weight의 순서와 같아야
+        한다.
+
+        `real_rows`가 주어지면 그 뒤는 타일 경계까지의 **패딩**이라 0으로 남긴다
+        (weight도 0이므로 수치 기여가 없고, kt가 마스크 tail 비트를 끈다).
+        """
+        wn_all = self._t[f"wn_{proj.value}"][layer_idx]        # [E, K]
+        pd_all = self._t[f"pair_dot_{proj.value}"][layer_idx]  # [E, K // PAIR_GROUP]
+        total = ti.total_rows
+        wn = torch.zeros(total, dtype=torch.float32)
+        pair_dot = torch.zeros(total // PAIR_GROUP, dtype=torch.float32)
+        for e in range(ti.num_experts):
+            o0 = int(ti.row_off[e])
+            kr = ti.k_rows(e) if real_rows is None else int(real_rows[e])
+            if kr == 0:
+                continue
+            if o0 % PAIR_GROUP:
+                raise AssertionError(
+                    f"{where}: expert {e} offset {o0} is not pair-aligned"
+                )
+            rows = ti.for_expert(e)[:kr].to(torch.int64)
+            wn[o0 : o0 + kr] = wn_all[e][rows]
+            # 페어 id는 gather된 순서의 짝수 위치가 가리키는 원본 페어다
+            # (페어 무결성이 보장되므로 홀수 위치는 같은 페어의 반대쪽).
+            pairs = rows[::PAIR_GROUP] // PAIR_GROUP
+            half = o0 // PAIR_GROUP
+            pair_dot[half : half + kr // PAIR_GROUP] = pd_all[e][pairs]
+        return CalibShard(wn=wn.contiguous(), pair_dot=pair_dot.contiguous())
 
     def check_dims(self, dims: ModelDims, spec: SparsitySpec) -> None:
         """expected_calib_shapes와의 대조를 이 객체만으로 수행 (편의)."""

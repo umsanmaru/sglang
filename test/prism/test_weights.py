@@ -75,22 +75,43 @@ def sources(w13, w2):
 
 
 def reassemble(prepared, proj, K):
-    """hot·warm(방향 복원) + cold를 K축 순서대로 이어 붙인 [E, N, K]."""
-    pieces = []
-    hot = None if prepared.hot is None else prepared.hot.band(proj)
-    if hot is not None:
-        pieces.append((hot.k_offset, hot.weights.cpu().transpose(1, 2)))
-    warm = prepared.warm.band(proj)
-    if warm is not None:
-        pieces.append((warm.k_offset, warm.weights.transpose(1, 2)))
+    """세 티어의 행을 **인덱스대로 원위치에 되돌린** [E, N, K].
+
+    밴드 시절엔 k_offset 순서로 이어 붙이면 됐지만, 인덱스에서는 각 행이 자기
+    자리로 흩어져야 한다 — 그래서 이 헬퍼가 인덱스 매핑 자체의 검증을 겸한다.
+    티어가 [0, K)를 정확히 한 번씩 덮으므로 전 위치가 정확히 한 번 채워진다.
+    """
+    E, N = DIMS["num_experts"], (DIMS["hidden_size"] if proj is Proj.DOWN
+                                 else DIMS["intermediate_size"])
+    out = torch.full((E, N, K), float("nan"), dtype=torch.float32)
+
+    def scatter(row_off, k_index, rows_of_expert, real=None):
+        for e in range(E):
+            o0, o1 = int(row_off[e]), int(row_off[e + 1])
+            n = o1 - o0 if real is None else int(real[e])
+            if n == 0:
+                continue
+            cols = k_index[o0 : o0 + n].to(torch.int64)
+            out[e].index_copy_(1, cols, rows_of_expert(e, o0, n))
+
+    for store in (prepared.hot, prepared.warm):
+        sh = None if store is None else store.band(proj)
+        if sh is None:
+            continue
+        w = sh.w_flat.cpu().float()          # [Σ k, N] (K-major)
+        scatter(sh.row_off.cpu(), sh.k_index.cpu(),
+                lambda e, o0, n, w=w: w[o0 : o0 + n].t())
     cold = prepared.cold.band(proj)
     if cold is not None:
-        pieces.append((cold.k_offset, cold.weights))
-    pieces.sort(key=lambda p: p[0])
-    assert pieces and pieces[0][0] == 0
-    out = torch.cat([t for _, t in pieces], dim=2)
-    assert out.shape[2] == K
-    return out
+        row_off, real = cold.row_off.cpu(), cold.real_rows.cpu()
+        flat = cold.w_flat.float()           # expert 블록 [N, k_pad]
+        def cold_rows(e, o0, n, flat=flat, row_off=row_off):
+            kp = int(row_off[e + 1]) - int(row_off[e])
+            blk = flat[int(row_off[e]) * N : int(row_off[e + 1]) * N].view(N, kp)
+            return blk[:, :n]
+        scatter(row_off, cold.k_index.cpu(), cold_rows, real=real)
+    assert not torch.isnan(out).any(), "티어들이 K를 완전히 덮지 못했다"
+    return out.to(torch.bfloat16)
 
 
 def test_roundtrip_reassembly_bitexact():
@@ -116,9 +137,12 @@ def test_warm_store_layout_and_offsets():
         if PIN:
             assert band.weights.is_pinned()
         cold = prepared.cold.band(proj)
-        assert cold.k_offset == 64
-        assert cold.weights.shape[2] == plan.dims.k_of(proj) - 64  # [E, N, k_cold]
-        assert not cold.weights.is_cuda
+        E, N = plan.dims.num_experts, plan.dims.n_of(proj)
+        k_cold = plan.dims.k_of(proj) - 64
+        assert cold.total_rows == E * k_cold          # 밴드라 패딩이 없다
+        assert cold.w_flat.numel() == N * cold.total_rows
+        assert cold.real_rows.tolist() == [k_cold] * E
+        assert not cold.w_flat.is_cuda
 
 
 def test_gate_up_bands_may_differ():
@@ -184,10 +208,12 @@ def test_hot_store_layout_matches_warm_direction():
         assert hot.weights.shape == (4, 64, N)
         assert hot.weights.dtype == torch.bfloat16
         assert hot.weights.is_contiguous()
-    # 다음 티어가 구멍 없이 이어받는다
+    # 다음 티어가 구멍 없이 이어받는다 (reassemble이 이미 전 위치 커버를
+    # 단언하지만, 여기서는 티어 경계 자체를 본다)
     assert prepared.warm.band(Proj.GATE).k_offset == 64
     assert prepared.warm.band(Proj.UP).k_offset == 64
-    assert prepared.cold.band(Proj.DOWN).k_offset == 64
+    down_cold = prepared.cold.band(Proj.DOWN)
+    assert int(down_cold.k_index[0]) == 64
 
 
 def test_all_hot():
@@ -302,8 +328,10 @@ def test_per_expert_variable_geometry_supported():
         assert torch.equal(warm.w_flat[o0:o1], src[e].t().index_select(0, rows))
 
 
-def test_variable_cold_geometry_rejected():
-    """cold는 아직 밴드 기하만 — kt가 KIndex를 받는 K3까지의 한계."""
+def test_variable_cold_geometry_supported():
+    """cold도 expert마다 행 수가 달라도 된다 — kt가 KIndex를 받으면서 풀린
+    제약이다 (밴드 시절의 `NotImplementedError("밴드 기하만")`이 사라진 자리).
+    """
     def entry(bands, N):
         return {"bands": bands,
                 "cold_shards": [[0, 0, N // 2], [1, N // 2, N]]}
@@ -327,10 +355,11 @@ def test_variable_cold_geometry_rejected():
     plan = parse_plan(raw)
     validate_static(plan)
     w13, w2 = make_weights()
-    with pytest.raises(NotImplementedError, match="밴드 기하만"):
-        prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN)
-
-
+    prepared = prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN)
+    cold = prepared.cold.band(Proj.GATE)
+    assert cold.real_rows.tolist()[:3] == [192, 128, 192]   # expert 1만 얇다
+    assert torch.equal(reassemble(prepared, Proj.GATE, DIMS["hidden_size"]),
+                       sources(w13, w2)[Proj.GATE])
 def test_shape_mismatch_rejected():
     plan = make_plan()
     w13, w2 = make_weights()
@@ -450,14 +479,17 @@ def test_calib_bands_reassemble_to_original(tmp_path, layer_idx):
     )
     wn_key = {Proj.GATE: "wn_g", Proj.UP: "wn_u", Proj.DOWN: "wn_d"}
     dot_key = {Proj.GATE: "cg", Proj.UP: "cu", Proj.DOWN: "cd"}
+    E = DIMS["num_experts"]
     for proj in Proj:
         warm = prepared.warm.band(proj).calib
         cold = prepared.cold.band(proj).calib
+        # flat이므로 expert별로 다시 나눠 warm|cold를 이어 붙인다 (밴드 plan
+        # 이라 각 expert의 두 조각이 원본 한 행을 정확히 덮는다).
+        wn = torch.cat([warm.wn.view(E, -1), cold.wn.view(E, -1)], dim=1)
+        pd = torch.cat([warm.pair_dot.view(E, -1), cold.pair_dot.view(E, -1)], dim=1)
+        assert torch.equal(wn, blob[wn_key[proj]][layer_idx])
         assert torch.equal(
-            torch.cat([warm.wn, cold.wn], dim=1), blob[wn_key[proj]][layer_idx]
-        )
-        assert torch.equal(
-            torch.cat([warm.pair_dot, cold.pair_dot], dim=1),
+            pd,
             blob[dot_key[proj]][layer_idx],
         )
 
@@ -474,8 +506,10 @@ def test_calib_band_rows_track_weight_rows(tmp_path):
     prepared = prepare_layer_weights(0, w13, w2, plan, calib=calib, pin_memory=PIN)
     for proj in Proj:
         for band in (prepared.warm.band(proj), prepared.cold.band(proj)):
-            assert band.calib.k_rows == band.k_rows
-            assert band.calib.pair_dot.shape[1] == band.k_rows // PAIR_GROUP
+            # 점수 재료는 weight 스토어와 **같은 오프셋의 flat**이다 — 행 수가
+            # 스토어 총량과 맞는지가 그 성질의 검사다.
+            assert band.calib.wn.numel() == band.total_rows
+            assert band.calib.pair_dot.numel() == band.total_rows // PAIR_GROUP
 
 
 def test_all_warm_plan_has_no_cold_calib(tmp_path):
@@ -491,6 +525,44 @@ def test_all_warm_plan_has_no_cold_calib(tmp_path):
     for proj in Proj:
         assert prepared.cold.band(proj) is None
         assert torch.equal(
-            prepared.warm.band(proj).calib.wn,
+            prepared.warm.band(proj).calib.wn.view(DIMS["num_experts"], -1),
             blob[{Proj.GATE: "wn_g", Proj.UP: "wn_u", Proj.DOWN: "wn_d"}[proj]][0],
         )
+
+
+def test_cold_tile_padding_is_transparent():
+    """cold 행 수가 커널 타일(32)의 배수가 아니면 로더가 올리고 0으로 채운다.
+
+    plan이 지키는 정렬은 페어뿐이고 타일 올림은 **커널 키가 함의하는 값**이라
+    (계약 ①) 여기가 그 경계의 검증이다: 스토어는 패딩된 크기이고, `real_rows`는
+    패딩 전 값이며, 재조립은 실제 행만 보므로 원본과 비트일치다.
+    """
+    plan = make_plan(gate_bands=[[0, 66, "warm"], [66, 256, "cold"]])
+    w13, w2 = make_weights()
+    prepared = prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN,
+                                     cold_tile_rows=32)
+    cold = prepared.cold.band(Proj.GATE)
+    E, N = DIMS["num_experts"], DIMS["intermediate_size"]
+    assert cold.real_rows.tolist() == [190] * E          # 256 - 66
+    assert cold.total_rows == 192 * E                    # 32 경계까지 올림
+    assert cold.w_flat.numel() == N * cold.total_rows
+
+    # 패딩 열은 0이어야 한다 — dense 경로가 그 값을 실제로 곱하기 때문이다.
+    for e in range(E):
+        o0, o1 = int(cold.row_off[e]), int(cold.row_off[e + 1])
+        blk = cold.w_flat[o0 * N : o1 * N].view(N, o1 - o0)
+        assert torch.equal(blk[:, 190:], torch.zeros(N, 2, dtype=blk.dtype))
+
+    assert torch.equal(reassemble(prepared, Proj.GATE, DIMS["hidden_size"]),
+                       sources(w13, w2)[Proj.GATE])
+
+
+def test_cold_padding_absent_when_already_aligned():
+    """이미 타일 배수면 패딩이 없다 — real_rows가 스토어 행 수와 같다."""
+    plan = make_plan()  # cold = 192 rows (32의 배수)
+    w13, w2 = make_weights()
+    prepared = prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN)
+    cold = prepared.cold.band(Proj.GATE)
+    rows = [int(cold.row_off[e + 1]) - int(cold.row_off[e])
+            for e in range(DIMS["num_experts"])]
+    assert cold.real_rows.tolist() == rows

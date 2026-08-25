@@ -25,7 +25,7 @@ from typing import Optional, Protocol
 
 import torch
 
-from sglang.srt.layers.moe.prism.plan import Plan, PlanError, Proj, Tier
+from sglang.srt.layers.moe.prism.plan import Plan, PlanError, Proj
 from sglang.srt.layers.moe.prism.weights import PendingColdTensors
 
 
@@ -43,13 +43,6 @@ class ColdBackend(Protocol):
                     cuda_stream: Optional[int] = None,
                     weights_ptr: int = 0) -> None: ...
     def sync(self, cuda_stream: Optional[int] = None) -> None: ...
-
-
-def _single_cold_band(pp, where: str):
-    bands = [b for b in pp.bands if b.tier is Tier.COLD]
-    if len(bands) != 1:
-        raise NotImplementedError(f"{where}: P0 cold backend supports exactly one COLD band")
-    return bands[0]
 
 
 def _shard_tables(shards, num_nodes: int, where: str):
@@ -83,7 +76,22 @@ class KtColdBackend:
         self._wrappers: dict[int, object] = {}
 
     # ── Plan → kt config 번역 (유일한 번역 지점) ─────────────────────────
-    def _build_config(self, layer_idx: int):
+    @staticmethod
+    def _set_kindex(dst, shard) -> None:
+        """ColdShard의 기하를 kt `KIndex`로 옮긴다 — 이 클래스의 본래 책임인
+        "Plan 어휘 ↔ kt 원시 어휘의 번역"이 인덱스 시대에 갖는 형태다.
+
+        `real_rows`는 타일 올림 **전**의 행 수다. kt는 이것으로 sparse 마스크의
+        tail 비트를 끈다 (패딩 행은 weight가 0이라 dense에는 무해하다).
+        """
+        dst.row_off = shard.row_off.tolist()
+        dst.idx = shard.k_index.to(torch.int32).tolist()
+        real = shard.real_rows.tolist()
+        # 패딩이 없으면 real_rows를 비워 둔다 — kt가 k(e)와 같다고 읽는다.
+        if any(r != shard.row_off[e + 1] - shard.row_off[e] for e, r in enumerate(real)):
+            dst.real_rows = real
+
+    def _build_config(self, layer_idx: int, cold: PendingColdTensors):
         plan, dims = self._plan, self._plan.dims
         # P0: expert 간 균일 기하 (weights.py 로더와 같은 요구)
         ep = plan.expert(layer_idx, 0)
@@ -94,12 +102,10 @@ class KtColdBackend:
                     f"layer {layer_idx}: P0 cold backend requires uniform expert geometry"
                 )
         where = f"layer {layer_idx}"
-        # P0 영구 제약 (계약 ①): gate == up — 위반은 조용한 오답이 되므로 즉사
-        if ep.gate.bands != ep.up.bands or ep.gate.cold_shards != ep.up.cold_shards:
-            raise PlanError(f"{where}: gate and up must share K bands and N shards")
+        # N shard는 여전히 gate/up 공유다 (출력 축 — K 인덱스와 무관하다).
+        if ep.gate.cold_shards != ep.up.cold_shards:
+            raise PlanError(f"{where}: gate and up must share cold N shards")
 
-        gu_band = _single_cold_band(ep.gate, f"{where}.gateup")
-        dn_band = _single_cold_band(ep.down, f"{where}.down")
         gu_off, gu_rows = _shard_tables(ep.gate.cold_shards, self._num_nodes, f"{where}.gateup")
         dn_off, dn_rows = _shard_tables(ep.down.cold_shards, self._num_nodes, f"{where}.down")
 
@@ -109,15 +115,11 @@ class KtColdBackend:
         cfg.max_len = self._max_tokens
         cfg.layer_idx = layer_idx
         cfg.partial.enabled = True
-        # gate와 up은 kt에서 독립 필드다 (2026-08-25). 지금 Plan은 둘의 밴드가
-        # 같음을 위에서 강제하므로 같은 값을 넣는다 — kt는 기하가 같으면 pack을
+        # K 기하는 인덱스로 간다. gate와 up이 같은 인덱스면 kt가 pack을
         # 공유하고(dual_pack() == false) 이전과 같은 경로를 탄다.
-        cfg.partial.gate.offset = gu_band.start
-        cfg.partial.gate.rows = gu_band.end - gu_band.start
-        cfg.partial.up.offset = gu_band.start
-        cfg.partial.up.rows = gu_band.end - gu_band.start
-        cfg.partial.down.offset = dn_band.start
-        cfg.partial.down.rows = dn_band.end - dn_band.start
+        self._set_kindex(cfg.partial.gate, cold.gate)
+        self._set_kindex(cfg.partial.up, cold.up)
+        self._set_kindex(cfg.partial.down, cold.down)
         cfg.partial.n_total = dims.intermediate_size
         cfg.partial.node_gateup_n_offset = gu_off
         cfg.partial.node_gateup_n_rows = gu_rows
@@ -142,12 +144,10 @@ class KtColdBackend:
 
         if layer_idx in self._wrappers:
             raise RuntimeError(f"layer {layer_idx} already loaded")
-        cfg = self._build_config(layer_idx)
+        cfg = self._build_config(layer_idx, cold)
         # 텐서 ↔ 기하 정합 (계약 ②의 shape 검증은 wrapper가 다시 한 번)
         if cold.gate is None or cold.up is None or cold.down is None:
-            raise NotImplementedError("P0 cold backend requires cold bands on all projections")
-        if cold.gate.k_offset != cfg.partial.gate.offset or cold.down.k_offset != cfg.partial.down.offset:
-            raise PlanError(f"layer {layer_idx}: PendingColdTensors offsets disagree with plan")
+            raise NotImplementedError("P0 cold backend requires cold rows on all projections")
 
         tables = None
         if self._plan.sparsity is not None:
@@ -180,7 +180,7 @@ class KtColdBackend:
         kernel_key = self._plan.kernels.cpu_cold
         wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=kernel_key)
         wrapper.load_weights_from_tensors(
-            cold.gate.weights, cold.up.weights, cold.down.weights,
+            cold.gate.w_flat, cold.up.w_flat, cold.down.w_flat,
             sparsity_tables=tables,
         )
         self._wrappers[layer_idx] = wrapper
