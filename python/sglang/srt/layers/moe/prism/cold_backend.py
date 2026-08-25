@@ -109,8 +109,13 @@ class KtColdBackend:
         cfg.max_len = self._max_tokens
         cfg.layer_idx = layer_idx
         cfg.partial.enabled = True
-        cfg.partial.gateup.offset = gu_band.start
-        cfg.partial.gateup.rows = gu_band.end - gu_band.start
+        # gate와 up은 kt에서 독립 필드다 (2026-08-25). 지금 Plan은 둘의 밴드가
+        # 같음을 위에서 강제하므로 같은 값을 넣는다 — kt는 기하가 같으면 pack을
+        # 공유하고(dual_pack() == false) 이전과 같은 경로를 탄다.
+        cfg.partial.gate.offset = gu_band.start
+        cfg.partial.gate.rows = gu_band.end - gu_band.start
+        cfg.partial.up.offset = gu_band.start
+        cfg.partial.up.rows = gu_band.end - gu_band.start
         cfg.partial.down.offset = dn_band.start
         cfg.partial.down.rows = dn_band.end - dn_band.start
         cfg.partial.n_total = dims.intermediate_size
@@ -141,7 +146,7 @@ class KtColdBackend:
         # 텐서 ↔ 기하 정합 (계약 ②의 shape 검증은 wrapper가 다시 한 번)
         if cold.gate is None or cold.up is None or cold.down is None:
             raise NotImplementedError("P0 cold backend requires cold bands on all projections")
-        if cold.gate.k_offset != cfg.partial.gateup.offset or cold.down.k_offset != cfg.partial.down.offset:
+        if cold.gate.k_offset != cfg.partial.gate.offset or cold.down.k_offset != cfg.partial.down.offset:
             raise PlanError(f"layer {layer_idx}: PendingColdTensors offsets disagree with plan")
 
         tables = None
