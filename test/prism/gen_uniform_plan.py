@@ -92,6 +92,9 @@ def main():
     ap.add_argument("--target-p", type=float, default=0.5, help="목표 sparsity")
     ap.add_argument("--lam", type=float, default=None,
                     help="gate-dynamic λ (기본: 자산의 lam0)")
+    ap.add_argument("--gpu-kernel", default="torch_bmm",
+                    choices=["torch_bmm", "gemv_worklist"],
+                    help="plan kernels.gpu_warm (worklist는 bs>1 graph decode용)")
     args = ap.parse_args()
 
     raw = json.loads((Path(args.model_dir) / "config.json").read_text())
@@ -127,7 +130,7 @@ def main():
             "top_k": top_k,
             "dtype": "bfloat16",
         },
-        "kernels": {"gpu_warm": "torch_bmm", "cpu_cold": "kt_amx_bf16"},
+        "kernels": {"gpu_warm": args.gpu_kernel, "cpu_cold": "kt_amx_bf16"},
         "default": {"gate": gate_up, "up": dict(gate_up), "down": down},
     }
     if sparsity:

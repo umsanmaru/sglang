@@ -49,6 +49,10 @@ _ENV_NUMA_MAP = "SGLANG_PRISM_NUMA_MAP"
 # eager에서도 cold submit/sync를 stream host node로 보내는 opt-in.
 # (graph 경로는 env와 무관하게 항상 stream 통합 — executor 참조.)
 _ENV_COLD_STREAM = "SGLANG_PRISM_COLD_STREAM"
+# worklist 경로(gemv_worklist)를 태우는 M 상한 (decode 전용, eager) —
+# executor의 worklist_max_m 기본값과 동일한 32. plan이 worklist 키가
+# 아니면(resolve_worklist_kernels가 None) 이 값은 읽히지 않는다.
+_ENV_WORKLIST_MAX_M = "SGLANG_PRISM_WORKLIST_MAX_M"
 
 
 def _sglang_capture_mode() -> bool:
@@ -86,7 +90,10 @@ class _PrismRuntime:
     def executor(self, device: torch.device):
         if self._executor is None:
             from sglang.srt.layers.moe.prism.executor import PrismExecutor
-            from sglang.srt.layers.moe.prism.kernels import resolve_gpu_kernel
+            from sglang.srt.layers.moe.prism.kernels import (
+                resolve_gpu_kernel,
+                resolve_worklist_kernels,
+            )
             from sglang.srt.layers.moe.prism.resources import (
                 ExecutionResources,
                 ResourceSpec,
@@ -99,11 +106,20 @@ class _PrismRuntime:
             # 인자로 주입한다 (executor/stagers는 hidden input 없음).
             stager = select_stager(self._resources, graph_mode=False,
                                    override=os.environ.get(ENV_STAGER))
+            worklist_fns = resolve_worklist_kernels(self.plan.kernels.gpu_warm)
+            if worklist_fns is not None:
+                # worklist 커널의 lazy JIT이 첫 호출(=캡처 워밍업) 시점에
+                # 컴파일되는 것을 startup으로 앞당긴다 — 캡처 순서 의존 제거.
+                from sglang.jit_kernel.prism_gemv import warmup_jit
+
+                warmup_jit()
             self._executor = PrismExecutor(
                 self.plan, self._resources, self.cold(), resolve_gpu_kernel(self.plan.kernels.gpu_warm),
                 stager=stager,
                 cold_stream=os.environ.get(_ENV_COLD_STREAM) == "1",
                 capture_mode_fn=_sglang_capture_mode,
+                worklist_kernels=worklist_fns,
+                worklist_max_m=int(os.environ.get(_ENV_WORKLIST_MAX_M, "32")),
             )
         return self._executor
 

@@ -22,6 +22,14 @@ def _jit_prism_gemv_module() -> Module:
     )
 
 
+def warmup_jit() -> None:
+    """모듈을 강제 컴파일한다 (public 래퍼 — `_jit_prism_gemv_module`은 private).
+
+    호출자(method.py)가 startup 경로에서 이걸 불러 lazy JIT을 캡처 워밍업
+    이전으로 앞당긴다 — 캡처 순서 의존 제거."""
+    _jit_prism_gemv_module()
+
+
 def gemv_worklist(x2d, topk_ids, weights, out3d, k_offset, out_col_offset,
                   x_row_is_pair, stream) -> None:
     """out3d[m, j, off:off+N] = x_row · W[topk_ids[m,j]] — device-resident W (HOT).
