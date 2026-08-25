@@ -243,8 +243,9 @@ PCIe 대역폭 그대로 임계경로에 앉는다 — warm 0.125 → 0.25에서
 제외). h375=warm-frac 0(cold-only sparse), h125=warm-frac 0.125. `_wl` = worklist
 GEMV 커널, 접미사 없음(torch_bmm) = 현행 placeholder. graph일 때 `--cuda-graph-bs
 1 2 4 8`. 측정 중 GPU0에 타 사용자 프로세스(`sglang::scheduler`, 12~29GiB
-변동)가 run01~04 구간에 걸쳐 있었다 — bs=1/2/4/8 graph 4건은 공유 상태,
-eager 6건과 h125 교차검증 1건은 GPU0 단독 점유(quiet) 상태에서 측정.
+변동)가 run01~05 구간에 걸쳐 있었다 — bs=1/2/4/8 graph 4건과 wl-eager
+bs=2 1건(→ 2.14× 배율의 분자 측정)은 GPU0 공유 상태, 나머지 eager 5건과
+h125 교차검증 1건은 GPU0 단독 점유(quiet) 상태에서 측정.
 
 | plan | bs | graph | ms/step | tok/s aggregate |
 |---|---|---|---|---|
@@ -264,10 +265,10 @@ eager 6건과 h125 교차검증 1건은 GPU0 단독 점유(quiet) 상태에서 �
 안에 있다 — 단, 이 값 자체는 GPU0 공유 상태에서 잰 것이라 대역 상단 쪽으로
 치우쳤을 수 있다.
 
-**worklist graph vs 같은 plan eager**: bs=2에서 2.14배, bs=4에서 1.63배,
-bs=8에서 1.67배 — graph가 여전히 크게 이긴다(GatherKernelStager가 bs>1도
-캡처 가능해졌으므로 당연하지만, S1 host 블록 소멸의 효과가 bs가 커져도
-유지됨을 확인).
+**worklist graph vs 같은 plan eager**: bs=2에서 2.14배(GPU0 공유 상태에서
+측정, 분자=31.47ms 그래프 측정값), bs=4에서 1.63배, bs=8에서 1.67배 —
+graph가 여전히 크게 이긴다(GatherKernelStager가 bs>1도 캡처 가능해졌으므로
+당연하지만, S1 host 블록 소멸의 효과가 bs가 커져도 유지됨을 확인).
 
 **worklist graph vs torch_bmm eager(현행 기준선) 배율**: bs=2 3.80배, bs=4
 3.62배, bs=8 2.55배. bs=8에서 배율이 줄어드는 것은 분자(graph)가 커져서가
