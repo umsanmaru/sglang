@@ -125,6 +125,12 @@ _GPU_WORKLIST_KERNELS: dict[str, Callable[[], tuple]] = {
     "gemv_worklist": _worklist_fns,
 }
 
+# 불변식: 모든 worklist 키는 warm registry에도 있어야 한다 (prefill 폴백).
+# 어기면 plan 검증(known_gpu_kernels)과 resolve_worklist_kernels가 갈라진다.
+assert set(_GPU_WORKLIST_KERNELS) <= set(_GPU_WARM_KERNELS), (
+    "worklist kernel keys must also be registered in _GPU_WARM_KERNELS"
+)
+
 
 def resolve_worklist_kernels(name: str) -> Optional[tuple]:
     """worklist 커널 쌍 (device_fn, pinned_fn) 또는 None (bmm 전용 키).
