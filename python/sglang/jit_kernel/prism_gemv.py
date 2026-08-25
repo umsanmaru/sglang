@@ -18,6 +18,8 @@ def _jit_prism_gemv_module() -> Module:
         cuda_wrappers=[
             ("gemv_worklist", "gemv_worklist"),
             ("gemv_worklist_pinned", "gemv_worklist_pinned"),
+            ("gemv_worklist_indexed", "gemv_worklist_indexed"),
+            ("gemv_worklist_indexed_pinned", "gemv_worklist_indexed_pinned"),
         ],
     )
 
@@ -53,3 +55,35 @@ def gemv_worklist_pinned(x2d, topk_ids, weights, out3d, k_offset, out_col_offset
     with torch.cuda.stream(stream):
         module.gemv_worklist_pinned(x2d, topk_ids, weights, out3d,
                                     int(k_offset), int(out_col_offset), int(bool(x_row_is_pair)))
+
+
+def gemv_worklist_indexed(x2d, topk_ids, w_flat, row_off, kidx, out3d,
+                          out_col_offset, x_row_is_pair, stream) -> None:
+    """인덱스 변형 — 티어 멤버십이 밴드가 아니라 **가변 per-expert 인덱스**인 경우.
+
+    `gemv_worklist`와 다른 것은 두 가지뿐이다:
+      - W가 flat `[Σₑ k[e], N]`이고 expert 구간을 `row_off[e] ..= row_off[e+1]`이 준다
+      - activation 열을 `kidx`가 준다 (`x[row, kidx[o0 + r]]`)
+    `k_offset`/`k_rows` 인자가 사라진 자리가 그 둘이다. grid는 같다 — k는 루프라
+    expert마다 길이가 달라도 launch 모양이 안 변한다.
+
+    row_off(int32 [E+1])와 kidx(uint16 [Σₑ k[e]])는 **항상 device 상주**여야
+    한다. W만 pinned일 수 있다 (아래 쌍둥이).
+
+    연속 인덱스(밴드 퇴화형)에서는 읽는 원소도 누산 순서도 `gemv_worklist`와
+    같으므로 **비트일치**한다 — 그것이 전환기의 합격 기준이다.
+    """
+    module = _jit_prism_gemv_module()
+    with torch.cuda.stream(stream):
+        module.gemv_worklist_indexed(x2d, topk_ids, w_flat, row_off, kidx, out3d,
+                                     int(out_col_offset), int(bool(x_row_is_pair)))
+
+
+def gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx, out3d,
+                                 out_col_offset, x_row_is_pair, stream) -> None:
+    """gemv_worklist_indexed의 쌍둥이 — W가 pinned CPU(UVA 직접 읽기, WARM)."""
+    module = _jit_prism_gemv_module()
+    with torch.cuda.stream(stream):
+        module.gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx,
+                                            out3d, int(out_col_offset),
+                                            int(bool(x_row_is_pair)))
