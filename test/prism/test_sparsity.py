@@ -39,7 +39,6 @@ from sglang.srt.layers.moe.prism.resources import (  # noqa: E402
     ExecutionResources,
     ResourceSpec,
 )
-from sglang.srt.layers.moe.prism.stagers import PerSlotCopyStager  # noqa: E402
 from sglang.srt.layers.moe.prism.weights import prepare_layer_weights  # noqa: E402
 
 try:
@@ -129,7 +128,8 @@ def make_exec_weights(seed=0):
 
 
 def build_exec(plan, w13, w2, calib=None):
-    prepared = prepare_layer_weights(0, w13, w2, plan, calib=calib)
+    prepared = prepare_layer_weights(0, w13, w2, plan, calib=calib,
+                                     device=torch.device("cuda"))
     ep = plan.expert(0, 0)
     has_cold = any(ep.proj(p).has_tier(Tier.COLD) for p in Proj)
     cold = None
@@ -142,11 +142,7 @@ def build_exec(plan, w13, w2, calib=None):
         cold.load_layer(0, prepared.cold, prepared.thr)
     spec = ResourceSpec.from_plan(plan, max_tokens=MAX_TOKENS,
                                   device=torch.device("cuda"))
-    ex = PrismExecutor(
-        plan, ExecutionResources(spec), cold,
-        resolve_gpu_kernel(plan.kernels.gpu_warm),
-        stager=PerSlotCopyStager(),
-    )
+    ex = PrismExecutor(plan, ExecutionResources(spec), cold)
     ex.register_layer(0, prepared)
     return ex
 
@@ -268,7 +264,8 @@ def test_cold_backend_passes_wn_squared(tmp_path):
     w13, w2 = make_exec_weights()
     calib, blob = make_exec_calib(tmp_path, 0.0)
     plan = make_exec_plan("mixed")
-    prepared = prepare_layer_weights(0, w13, w2, plan, calib=calib)
+    prepared = prepare_layer_weights(0, w13, w2, plan, calib=calib,
+                                     device=torch.device("cuda"))
     cold = KtColdBackend(plan, max_tokens=MAX_TOKENS,
                          num_numa_nodes=numa_node_count())
     cold.load_layer(0, prepared.cold, prepared.thr)

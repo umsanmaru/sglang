@@ -16,14 +16,10 @@ Prism의 "full 텐서 로드 → K-슬라이스 → 주입" 흐름과 겹치는 
     (full 텐서 소멸 — 계약 ③)
   apply: executor.run_layer 위임 한 줄
 
-P0 제약: TP=1. eager는 모든 batch size에서 동작하는 경로이고, Task 8부터
-CUDA graph bs=1 decode도 지원한다 — 단 그래프 launch는 **반드시**
-`--cuda-graph-bs 1 --cuda-graph-max-bs 1`로 해야 한다. 이 두 플래그를 같이
-주지 않으면 sglang이 기본 bs 목록(1보다 큰 값 포함)으로 캡처를 시도하고,
-executor의 M==1 guard가 그 첫 bs>1 캡처 시도에서 즉시 `RuntimeError`를
-던져 launch 자체가 실패한다 (설계상 fail-fast — bs>1 캡처를 조용히 잘못
-실행하는 경우는 없다). 두 플래그가 맞으면 executor가 캡처 구간을 자동
-감지해 graph-safe 경로(device-sel gather + stream 통합 cold)를 탄다.
+P0 제약: TP=1. batch size 제약은 없다 — GPU 티어가 pair-native가 되면서
+그룹 조성의 host 결정이 사라졌고, eager·캡처·prefill이 모두 같은 경로다
+(2026-08-25). executor가 캡처 구간을 자동 감지해 cold를 stream 통합
+(kt host node)으로 돌린다.
 """
 
 from __future__ import annotations
@@ -49,10 +45,6 @@ _ENV_NUMA_MAP = "SGLANG_PRISM_NUMA_MAP"
 # eager에서도 cold submit/sync를 stream host node로 보내는 opt-in.
 # (graph 경로는 env와 무관하게 항상 stream 통합 — executor 참조.)
 _ENV_COLD_STREAM = "SGLANG_PRISM_COLD_STREAM"
-# worklist 경로(gemv_worklist)를 태우는 M 상한 (decode 전용, eager) —
-# executor의 worklist_max_m 기본값과 동일한 32. plan이 worklist 키가
-# 아니면(resolve_worklist_kernels가 None) 이 값은 읽히지 않는다.
-_ENV_WORKLIST_MAX_M = "SGLANG_PRISM_WORKLIST_MAX_M"
 
 
 def _sglang_capture_mode() -> bool:
@@ -89,37 +81,27 @@ class _PrismRuntime:
 
     def executor(self, device: torch.device):
         if self._executor is None:
+            from sglang.jit_kernel.prism_gemv import warmup_jit
             from sglang.srt.layers.moe.prism.executor import PrismExecutor
-            from sglang.srt.layers.moe.prism.kernels import (
-                resolve_gpu_kernel,
-                resolve_worklist_kernels,
-            )
+            from sglang.srt.layers.moe.prism.kernels import resolve_gpu_kernel
             from sglang.srt.layers.moe.prism.resources import (
                 ExecutionResources,
                 ResourceSpec,
             )
-            from sglang.srt.layers.moe.prism.stagers import ENV_STAGER, select_stager
 
-            spec = ResourceSpec.from_plan(self.plan, max_tokens=self.max_tokens, device=device)
+            resolve_gpu_kernel(self.plan.kernels.gpu_warm)  # 이름 검증
+            # GEMV 커널의 lazy JIT을 startup으로 앞당긴다 — 첫 호출이 캡처
+            # 워밍업이면 컴파일이 캡처 순서에 얽힌다.
+            warmup_jit()
+            spec = ResourceSpec.from_plan(
+                self.plan, max_tokens=self.max_tokens, device=device)
             self._resources = ExecutionResources(spec)
             # 조립 지점: env·runner 같은 외부 입력은 전부 여기서 읽어 명시
-            # 인자로 주입한다 (executor/stagers는 hidden input 없음).
-            stager = select_stager(self._resources, graph_mode=False,
-                                   override=os.environ.get(ENV_STAGER))
-            worklist_fns = resolve_worklist_kernels(self.plan.kernels.gpu_warm)
-            if worklist_fns is not None:
-                # worklist 커널의 lazy JIT이 첫 호출(=캡처 워밍업) 시점에
-                # 컴파일되는 것을 startup으로 앞당긴다 — 캡처 순서 의존 제거.
-                from sglang.jit_kernel.prism_gemv import warmup_jit
-
-                warmup_jit()
+            # 인자로 주입한다 (executor는 hidden input 없음).
             self._executor = PrismExecutor(
-                self.plan, self._resources, self.cold(), resolve_gpu_kernel(self.plan.kernels.gpu_warm),
-                stager=stager,
+                self.plan, self._resources, self.cold(),
                 cold_stream=os.environ.get(_ENV_COLD_STREAM) == "1",
                 capture_mode_fn=_sglang_capture_mode,
-                worklist_kernels=worklist_fns,
-                worklist_max_m=int(os.environ.get(_ENV_WORKLIST_MAX_M, "32")),
             )
         return self._executor
 

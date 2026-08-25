@@ -6,7 +6,6 @@ import torch
 from sglang.srt.layers.moe.prism.plan import Proj, parse_plan, validate_static
 from sglang.srt.layers.moe.prism.resources import (
     ColdStaging,
-    DeviceArena,
     ExecutionResources,
     ResourceSpec,
 )
@@ -51,103 +50,20 @@ def make_spec(device="cuda"):
     )
 
 
-def test_spec_from_plan_takes_max_warm_rows():
-    spec = make_spec("cpu")  # spec 산정 자체는 device 무관
-    assert spec.k_warm_gate == 64
-    assert spec.k_warm_up == 128
-    assert spec.k_warm_down == 64
-    assert spec.n_slots == DIMS["top_k"]
-    assert spec.n_of(Proj.GATE) == 128 and spec.n_of(Proj.DOWN) == 256
-    # hot 밴드가 없는 plan은 k_hot 전부 0
-    assert (spec.k_hot_gate, spec.k_hot_up, spec.k_hot_down) == (0, 0, 0)
-
-
-def make_hot_plan():
-    raw = {
-        "schema_version": 1,
-        "model_id": "test/tiny-hot",
-        "dims": dict(DIMS),
-        "kernels": {"gpu_warm": "torch_bmm", "cpu_cold": "kt_amx_bf16"},
-        "default": {
-            "gate": {"bands": [[0, 64, "hot"], [64, 128, "warm"], [128, 256, "cold"]],
-                      "cold_shards": [[0, 0, 128]]},
-            "up": {"bands": [[0, 64, "hot"], [64, 128, "warm"], [128, 256, "cold"]],
-                    "cold_shards": [[0, 0, 128]]},
-            "down": {"bands": [[0, 64, "hot"], [64, 128, "cold"]],
-                      "cold_shards": [[0, 0, 256]]},
-        },
-    }
-    plan = parse_plan(raw)
-    validate_static(plan)
-    return plan
-
-
-def test_spec_from_plan_takes_max_hot_rows():
+def test_spec_from_plan_carries_dims():
+    """티어별 K 치수와 n_slots가 사라졌다 — 스토어가 flat + offset이 되면서
+    크기를 로더가 알고, arena가 없어지면서 slot 개념 자체가 없다."""
     spec = ResourceSpec.from_plan(
-        make_hot_plan(), max_tokens=8, device=torch.device("cpu")
-    )
-    assert (spec.k_hot_gate, spec.k_hot_up, spec.k_hot_down) == (64, 64, 64)
-    assert spec.k_hot_of(Proj.GATE) == 64
+        make_plan(), max_tokens=32, device=torch.device("cpu"))
+    assert spec.max_tokens == 32
+    assert spec.top_k == DIMS["top_k"]
+    assert spec.hidden_size == DIMS["hidden_size"]
+    assert spec.intermediate_size == DIMS["intermediate_size"]
+    assert spec.n_of(Proj.DOWN) == DIMS["hidden_size"]
+    assert spec.n_of(Proj.GATE) == DIMS["intermediate_size"]
+    assert not hasattr(spec, "n_slots")
 
 
-@cuda_required
-def test_hot_arena_views_and_sel():
-    spec = ResourceSpec.from_plan(
-        make_hot_plan(), max_tokens=8, device=torch.device("cuda")
-    )
-    res = ExecutionResources(spec)
-    gate = res.hot_view(Proj.GATE)
-    assert gate.shape == (spec.n_slots, 64, 128)
-    assert gate.dtype == torch.bfloat16 and gate.is_cuda
-    assert res.hot_view(Proj.DOWN).shape == (spec.n_slots, 64, 256)
-    # storage identity 불변 (계약 ④)
-    assert res.hot_view(Proj.GATE).data_ptr() == gate.data_ptr()
-    sel = res.hot_sel_device()
-    assert sel.dtype == torch.int32 and sel.is_cuda and sel.shape == (spec.n_slots,)
-    # warm sel과 물리적으로 분리 (스트림 간 공유 금지)
-    assert sel.data_ptr() != res.sel_device().data_ptr()
-
-
-@cuda_required
-def test_hot_arena_absent_without_hot_bands():
-    res = ExecutionResources(make_spec())
-    with pytest.raises(KeyError):
-        res.hot_view(Proj.GATE)
-
-
-@cuda_required
-def test_arena_views_shapes_and_aliasing():
-    spec = make_spec()
-    arena = DeviceArena(spec)
-    gate = arena.view(Proj.GATE)
-    up = arena.view(Proj.UP)
-    down = arena.view(Proj.DOWN)
-    assert gate.shape == (2, 64, 128)
-    assert up.shape == (2, 128, 128)
-    assert down.shape == (2, 64, 256)
-    # gate/up은 서로소 구간
-    assert gate.data_ptr() + gate.numel() * 2 <= up.data_ptr()
-    # down은 flat 선두 재사용 (gate와 같은 주소에서 시작)
-    assert down.data_ptr() == gate.data_ptr()
-    # storage identity 불변: view는 항상 같은 객체 주소를 돌려준다
-    assert arena.view(Proj.GATE).data_ptr() == gate.data_ptr()
-
-
-@cuda_required
-def test_arena_down_reuse_sizing():
-    # down이 gate+up 합보다 큰 경우 flat이 down 기준으로 잡히는지
-    spec = ResourceSpec(
-        max_tokens=4, top_k=2, hidden_size=1024, intermediate_size=64,
-        k_warm_gate=32, k_warm_up=32, k_warm_down=64, n_slots=2,
-        device=torch.device("cuda"),
-    )
-    arena = DeviceArena(spec)
-    down_bytes = 2 * 64 * 1024 * 2
-    gateup_bytes = 2 * 32 * 64 * 2 * 2
-    assert arena.nbytes == max(down_bytes, gateup_bytes) == down_bytes
-
-
-@cuda_required
 def test_staging_inplace_identity_and_capacity():
     spec = make_spec()
     staging = ColdStaging(spec, pin_memory=True)
@@ -179,8 +95,9 @@ def test_staging_shapes():
 
 @cuda_required
 def test_execution_resources_bundle():
+    """남은 영구 자원은 staging 하나다 — arena·stager 스크래치·sel 버퍼는
+    소비자(bmm의 연속 배치 축)와 함께 사라졌다."""
     res = ExecutionResources(make_spec(), pin_memory=True)
-    assert isinstance(res.warm_stream, torch.cuda.Stream)
-    assert res.arena.view(Proj.GATE).is_cuda
-    res.evt_staged.record(res.warm_stream)
-    res.evt_staged.synchronize()
+    assert isinstance(res.staging, ColdStaging)
+    assert not hasattr(res, "arena")
+    assert not hasattr(res, "warm_stream")

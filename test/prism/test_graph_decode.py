@@ -34,11 +34,6 @@ from sglang.srt.layers.moe.prism.resources import (  # noqa: E402
     ExecutionResources,
     ResourceSpec,
 )
-from sglang.srt.layers.moe.prism.stagers import (  # noqa: E402
-    GatherKernelStager,
-    PerSlotCopyStager,
-)
-from sglang.srt.layers.moe.prism.weights import WarmBand  # noqa: E402
 
 
 def run1(ex, x, ids, w):
@@ -57,40 +52,6 @@ class _Toggle:
 
 
 # ── 1. stager 단위 ────────────────────────────────────────────────────────
-
-@cuda_required
-def test_stage_from_device_bitwise():
-    """stage_from_device(device sel)가 PerSlot 준거와 bitwise 일치 —
-    sel이 int64 cuda(topk_ids 슬라이스 그대로)여도 device cast로 처리."""
-    spec = ResourceSpec(
-        max_tokens=8, top_k=3, hidden_size=64, intermediate_size=8,
-        k_warm_gate=8, k_warm_up=8, k_warm_down=8, n_slots=8,
-        device=torch.device("cuda"),
-    )
-    res = ExecutionResources(spec)
-    band = WarmBand.from_band(
-        torch.arange(32 * 8 * 8, dtype=torch.bfloat16).reshape(32, 8, 8).pin_memory()
-    )
-    s = torch.cuda.Stream()
-    ref = torch.zeros(spec.n_slots, 8, 8, dtype=torch.bfloat16, device="cuda")
-    # zeros init(current stream)과 타 stream의 무대기 stage 사이 레이스 방지
-    # (test_stagers.py의 동기화 주석 참조).
-    torch.cuda.synchronize()
-    e_ref = PerSlotCopyStager().stage(band, [5, 17, 2], ref, s, None, Proj.GATE)
-
-    sel = torch.tensor([5, 17, 2], dtype=torch.int64, device="cuda")
-    out = res.arena.view(Proj.GATE)
-    e_out = GatherKernelStager(res).stage_from_device(
-        band, sel, out, res.warm_stream, None, Proj.GATE
-    )
-    cur = torch.cuda.current_stream()
-    cur.wait_event(e_ref)
-    cur.wait_event(e_out)
-    torch.cuda.synchronize()
-    assert torch.equal(out[:3].cpu(), ref[:3].cpu())
-
-
-# ── 2. 경로 등가 (캡처 없이 강제) ─────────────────────────────────────────
 
 @cuda_required
 @pytest.mark.parametrize("kind", ["mixed", "all_cold", "all_warm", "all_hot", "three_tier"])
@@ -113,15 +74,22 @@ def test_graph_path_matches_eager(kind):
 
 
 @cuda_required
-def test_graph_path_rejects_prefill():
-    """graph 경로는 M==1 전용 — m>1이면 조용한 오답 대신 즉사해야 한다."""
-    plan = make_plan("all_warm")
-    w13, w2 = make_weights()
-    ex = build_executor(plan, w13, w2, force_graph_path=True)
-    x, ids, w = make_inputs(4, seed=1)
-    with pytest.raises(RuntimeError, match="M==1"):
-        run1(ex, x, ids, w)
+def test_graph_path_accepts_prefill():
+    """graph 경로의 M==1 제약이 사라졌다.
 
+    그 제약은 그룹 조성이 host 결정이던 시절의 것이다 — pair-native GEMV에서는
+    블록이 topk[pair]에서 expert를 스스로 읽으므로 M이 얼마든 host 분기가 없고,
+    eager와 캡처가 같은 호출이 된다 (계약 ④ 2026-08-25).
+
+    (cold 조합의 M>1 캡처는 test_capture_replay_worklist_bs[4]가 덮는다.
+    여기서 all_hot을 쓰는 이유는 guard가 GPU 경로의 것이기도 하고, 테스트마다
+    CPUInfer 스레드풀이 새로 뜨는 비용을 아끼기 위해서다.)
+    """
+    w13, w2 = make_weights()
+    ex = build_executor(make_plan("all_hot"), w13, w2, force_graph_path=True)
+    x, ids, tw = make_inputs(m=4)
+    out = ex.run_layer(0, x.cuda(), ids.cuda(), tw.cuda())
+    assert out.shape == x.shape
 
 @cuda_required
 @pytest.mark.parametrize("qlen", [1, 16])
@@ -199,7 +167,7 @@ def test_capture_replay_matches_eager(kind):
 @cuda_required
 def test_qlen_pin_graph_isolated_from_eager_write():
     """Review Finding A 회귀: 캡처가 baking하는 qlen 포인터는 eager의
-    `self._qlen_pin`과 격리된 `self._qlen_pin_graph`(상수 1)여야 한다.
+    `self._qlen_pin`과 격리된 `self._qlen_pins_graph[1]`(상수 1)여야 한다.
 
     수정 전에는 두 경로가 같은 `self._qlen_pin`을 공유했다 — 캡처 후 eager
     prefill(m=16)이 `self._qlen_pin[0] = 16`을 쓰면, 그 이후 모든 graph
@@ -228,7 +196,7 @@ def test_qlen_pin_graph_isolated_from_eager_write():
     toggle.on = True
 
     assert int(ex._qlen_pin[0]) == 16, "eager 호출이 qlen_pin을 16으로 세팅했어야 함"
-    assert int(ex._qlen_pin_graph[0]) == 1, (
+    assert int(ex._qlen_pins_graph[1][0]) == 1, (
         "graph 전용 버퍼가 eager 쓰기에 오염됐다 — Finding A 회귀"
     )
 
@@ -252,7 +220,7 @@ def test_qlen_pin_graph_isolated_from_eager_write():
     # 참고: `ref`도 eager(m=1) 호출이라 self._qlen_pin은 여기서 다시 1로
     # 덮인다 — eager는 매 호출마다 자기 m을 쓰는 게 정상 동작이다. 이 테스트
     # 가 실제로 지키는 불변식은 graph 전용 버퍼가 절대 안 바뀐다는 것.
-    assert int(ex._qlen_pin_graph[0]) == 1
+    assert int(ex._qlen_pins_graph[1][0]) == 1
 
 
 # ── 4. 리뷰 finding D: 테스트 갭 보강 ─────────────────────────────────────
