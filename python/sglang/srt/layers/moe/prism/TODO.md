@@ -154,6 +154,88 @@ graph bs=1로 "산란 dispatch"와 "S1 host 블록"이라는 두 개의 오버�
   추가 HBM 트래픽) 측정 후 필요시 gather-free 커널.
 - **N-shard rank 분산 (TP>1)**: rank별 자기 inter 샤드만 store/DMA.
 
+## 실측표 (Qwen3.6-35B-A3B, RTX PRO 6000 Blackwell 96GB, 2 NUMA, bs=1 greedy, 256tok×5 median, 2026-08-24/25)
+
+치수 NL=40 NE=256 I=512 H=2048 → expert weight 총량 60 GiB. warm-frac 0.125 고정,
+`--attention-backend triton --cuda-graph-bs 1 --max-running-requests 1 --context-length 4096`.
+
+**(a) hot 스윕 @ mem-fraction 0.85** — ms/tok
+
+| f_hot | hot VRAM | cold 행(gate/up) | sparse | dense | sparsity 효과 |
+|---|---|---|---|---|---|
+| 0 | — | 1792 (87.5%) | 24.51 | 27.75 | **−11.7%** |
+| 0.0625 | 2.5 GiB | 1664 | 24.63 | — | — |
+| 0.125 | 7.5 GiB | 1536 (75%) | 24.08 | 27.65 | **−12.9%** |
+| 0.25 | 15 GiB | 1280 (62.5%) | 23.52 | 28.16* | — |
+| 0.5 | 30 GiB | 768 (37.5%) | 23.61 | 23.14 | **≈0** |
+| 0.75 | 45 GiB | 256 (12.5%) | 24.18 | 23.90 | ≈0 |
+| 0.875 | 52.5 GiB | **0** | — | **18.26** | (cold 없음) |
+| prism 미사용 (순수 GPU) | — | — | — | **6.58** | — |
+
+<sub>*3회 측정(나머지는 5회)</sub>
+
+VRAM은 `--hot-frac` 예산 예측과 정확히 일치 (h250: `mem usage=20.51 GB` = 5.51 + 15.00).
+
+**(b) 32 GiB 상한 @ mem-fraction 0.335** — 두 구성 모두 실측 33.0 GiB 사용
+
+| f_hot | f_warm | KV 토큰 | sparse | dense |
+|---|---|---|---|---|
+| 0 | 0.125 | 719k | 24.40 | — |
+| 0.375 | 0.125 | 99k | 22.68 | 23.71 |
+| 0.375 | **0.25** | 99k | **28.57** | — |
+| **0.375** | **0** | 99k | **18.84** | — |
+| 0.0625 | 0 | — | 22.86 | — |
+
+토큰당 VRAM 38.1 KiB (KV 자체 20.0 + hybrid GDN state/index pool 18.1) — 2점 fit.
+
+### 여기서 확정된 것
+
+**1. cold sparsity의 실제 효과는 −11.7%다.** 그동안 −42%는 cold 레이어만 떼어낸
+합성 벤치였다. 실제 keep ratio도 처음 측정됐다: gate/up 0.4697, down 0.4680
+(accuracy-eval `result.md` 8.9절, `calib/qwen36/neuron_freq.py`). 판정식은 kt
+런타임과 비트 단위로 맞춰 잰 값이다.
+
+**2. cold 비용은 행 수가 아니라 층당 고정비(~140 µs)에 지배된다.** cold 행을
+768 → 256으로 67% 줄여도 이득이 0인데(23.14 → 23.90) 마지막 256행을 없애면
+5.6 ms/tok이 빠진다. 소재는 executor의 cold 경로가 current stream에 직렬로
+올리는 `fill_x`(D2H) → `submit`(host node) → `sync`(host node) → `h2d_out`(H2D)
+로 보이며, phase 2회 × 4개 = 층당 8회 stream 왕복이 cold 행 수와 무관하게 붙는다.
+**아직 NVTX로 분해되지 않았다 — 차분에서 얻은 추정이다.**
+
+**3. hot이 커질수록 sparsity 이득이 사라진다.** f_hot 0 → 0.125 → 0.375 → 0.5에서
+sparsity 효과가 −11.7% → −12.9% → −4.3% → ≈0. 둘 다 cold 가변 성분만 건드리므로
+경쟁 관계다. 같은 이유로 **frequency 기반 행 배치의 기대 이득도 f=0.375에서
+0.05 ms/tok(0.2%)** 로 노이즈(산포 1.6 ms) 아래다 — 게다가 gate/up은 K축이 expert
+간 공유되는 hidden 채널이라 per-expert permutation이 원리적으로 불가능해 down만
+회수 가능하다.
+
+**4. warm 티어는 이 하드웨어에서 순손실이다.** warm H2D는 cold 뒤에 숨지 않고
+PCIe 대역폭 그대로 임계경로에 앉는다 — warm 0.125 → 0.25에서 실측 증분 147 µs/층,
+이론 PCIe(44.8 GiB/s) 증분 131 µs/층으로 거의 일치. warm 12.5%를 cold로 넘기면
+22.68 → 18.84 (**−17%**). warm의 PCIe 총량 5.24 ms vs cold가 같은 행을 처리하는
+비용 1.40 ms.
+- **arena 캐시("직전에 올렸으면 재전송 생략")로도 못 살린다.** decode step 간
+  expert 재사용률 실측 35.2%(W=1, 160 MiB) ~ 66.4%(W=8, 1.28 GiB)인데 — 우연
+  수준(3.1%)의 11배로 상관은 확실히 있다 — warm이 cold를 이기려면 적중률
+  **73.3%** 가 필요하다. W=8도 부족하고 그 1.28 GiB는 hot에 주는 편이 낫다.
+- 단, **cold가 매우 클 때(f_hot=0)는 미검증**이다. cold 창이 크면 warm 전송이
+  그 뒤에 숨을 여지가 있고, h375에서 노출된 것은 hot이 cold 창을 줄였기 때문이다.
+- 이 결론은 **PCIe 44.8 GiB/s : 이 CPU의 AMX** 라는 비율에서 나온 것이다. 비율이
+  다른 조합에서는 뒤집힐 수 있다.
+
+**5. 32 GiB 최선 = hot 37.5% + warm 0 + cold 62.5% sparse → 18.84 ms/tok (53.1 tok/s).**
+코드 변경 없이 plan만으로 도달한다.
+
+### 이 측정에서 틀렸던 가설 (반복 방지)
+
+둘 다 "차분으로 얻은 수치를 다른 동작점에 그대로 옮긴" 오류였다:
+- "cold는 이미 GPU 뒤에 숨었다" → h875(cold 완전 제거)가 h500보다 21% 빨라 기각.
+- "GPU 경로가 병목" → 292 µs/층은 **행 100%가 GPU를 지나는 h875**에서 잰 값이라
+  cold 지배 구성에 옮길 수 없었다. cold 지배 영역의 병목은 cold다 (sparsity가
+  −11.7%를 내는 것이 그 증거 — GPU 병목이면 cold를 깎아도 벽시계가 안 변한다).
+- "warm 전송은 cold 뒤에 숨어 있다" → warm 0.125↔0.25 대조로 기각(위 4항).
+
+
 ## 실측표 (Qwen3-30B-A3B, H100, node1 8스레드 단일소켓, batch1 greedy, uniform10-1node plan, 2026-08-20/21)
 
 | 구성 | decode ms/tok | tok/s |

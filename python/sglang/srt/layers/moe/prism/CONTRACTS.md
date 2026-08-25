@@ -17,6 +17,12 @@ Prism = K-split hot/warm/cold 티어링 MoE 오프로드. 패키지명이자 프
 - `HOT` — 해당 row들이 VRAM에 상주하고 GPU가 계산한다.
 - `WARM` — pinned host에 상주하고, step마다 선택된 expert의 밴드만 GPU로
   전송되어 GPU가 계산한다.
+  - **2026-08-25 실측 주의:** 이 전송은 cold 뒤에 숨지 않고 PCIe 대역폭 그대로
+    임계경로에 앉는다(실측 147 µs/층 vs 이론 131 µs/층). 현 하드웨어(PCIe
+    44.8 GiB/s + 2 NUMA AMX)에서는 같은 행을 cold에 두는 편이 빨라 `warm-frac 0`
+    이 최선이었다(22.68 → 18.84 ms/tok). WARM은 **계약상 유효한 티어로 유지**하되
+    (하드웨어 비율이 다르면 뒤집힌다) 이 조합에서 기본값으로 쓰지 말 것.
+    근거와 반증 실험은 TODO.md 실측표 4항.
 - `COLD` — pageable host(NUMA-local)에 상주하고 CPU가 계산한다.
 
 **좌표계:**
