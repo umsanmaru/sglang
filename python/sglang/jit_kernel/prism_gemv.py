@@ -58,7 +58,7 @@ def gemv_worklist_pinned(x2d, topk_ids, weights, out3d, k_offset, out_col_offset
 
 
 def gemv_worklist_indexed(x2d, topk_ids, w_flat, row_off, kidx, out3d,
-                          out_col_offset, x_row_is_pair, stream) -> None:
+                          out_col_offset, x_row_is_pair, stream, vec=0) -> None:
     """인덱스 변형 — 티어 멤버십이 밴드가 아니라 **가변 per-expert 인덱스**인 경우.
 
     `gemv_worklist`와 다른 것은 두 가지뿐이다:
@@ -70,20 +70,24 @@ def gemv_worklist_indexed(x2d, topk_ids, w_flat, row_off, kidx, out3d,
     row_off(int32 [E+1])와 kidx(uint16 [Σₑ k[e]])는 **항상 device 상주**여야
     한다. W만 pinned일 수 있다 (아래 쌍둥이).
 
+    vec: W 로드 폭 (열/스레드). 0 = 자동(정렬이 허용하는 최대), 1/4/8 강제.
+    강제는 벤치·디버그용이다.
+
     연속 인덱스(밴드 퇴화형)에서는 읽는 원소도 누산 순서도 `gemv_worklist`와
     같으므로 **비트일치**한다 — 그것이 전환기의 합격 기준이다.
     """
     module = _jit_prism_gemv_module()
     with torch.cuda.stream(stream):
         module.gemv_worklist_indexed(x2d, topk_ids, w_flat, row_off, kidx, out3d,
-                                     int(out_col_offset), int(bool(x_row_is_pair)))
+                                     int(out_col_offset), int(bool(x_row_is_pair)),
+                                     int(vec))
 
 
 def gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx, out3d,
-                                 out_col_offset, x_row_is_pair, stream) -> None:
+                                 out_col_offset, x_row_is_pair, stream, vec=0) -> None:
     """gemv_worklist_indexed의 쌍둥이 — W가 pinned CPU(UVA 직접 읽기, WARM)."""
     module = _jit_prism_gemv_module()
     with torch.cuda.stream(stream):
         module.gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx,
                                             out3d, int(out_col_offset),
-                                            int(bool(x_row_is_pair)))
+                                            int(bool(x_row_is_pair)), int(vec))

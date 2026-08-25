@@ -39,7 +39,7 @@ namespace {
 // 디바이스 경로 실측 10.7us vs gather+bmm 17.5us로 이미 충분해 벡터화를
 // 미뤘다; warm/UVA 대역폭이 임계로 확인되면 벡터 로드 + 정렬 RuntimeCheck를
 // 후속으로 추가한다.
-template <typename IdxT, bool INDEXED>
+template <typename IdxT, bool INDEXED, int V>
 __global__ void prism_gemv_worklist(
     const __nv_bfloat16* __restrict__ x,
     const IdxT* __restrict__ topk,
@@ -59,7 +59,14 @@ __global__ void prism_gemv_worklist(
   const long long m = pair / top_k;
   const long long e = static_cast<long long>(topk[pair]);
   const long long row = x_row_is_pair ? pair : m;
-  const long long n = static_cast<long long>(blockIdx.x) * 64 + threadIdx.x;
+  // 블록의 열 타일은 V와 무관하게 64로 고정한다. V를 키우면 blockDim이
+  // (64/V, 4V)로 재배치되므로 **블록 수와 타일 기하가 불변**이다 — 단순히
+  // 열을 V배 맡게 하면 grid.x가 1/V로 붕괴한다 (gate는 N=512, V=8에서 8블록).
+  constexpr int NCOL = 64;
+  constexpr int NY = 4 * V;  // = blockDim.y
+  const long long n0 = static_cast<long long>(blockIdx.x) * NCOL +
+                       static_cast<long long>(threadIdx.x) * V;
+  const bool active = n0 < n_cols;
 
   long long o0, kr;
   if constexpr (INDEXED) {
@@ -90,7 +97,30 @@ __global__ void prism_gemv_worklist(
   // 없고, syncthreads만 늘어 순손실이었다 (실측 bs=1 10.5 → 12.0 µs).
   constexpr int KTILE = 2048;
 
-  float acc = 0.f;
+  float acc[V];
+#pragma unroll
+  for (int j = 0; j < V; ++j) acc[j] = 0.f;
+
+  // W 로드 폭. bf16 스칼라(2 B/스레드)로는 피크 대역폭을 채울 만큼 요청을
+  // 띄우지 못한다 (실측 실효 524 GB/s). V개 열이 W에서 연속이므로 uint2(8 B)/
+  // uint4(16 B) 한 번으로 가져와 스레드당 in-flight 바이트를 늘린다.
+  // 정렬은 계약 ①의 COL_GROUP=32가 보증한다 (n_cols % 8 == 0).
+  auto fma_row = [&](const __nv_bfloat16* wp, float xv) {
+    if constexpr (V == 1) {
+      acc[0] += xv * __bfloat162float(wp[0]);
+    } else if constexpr (V == 4) {
+      const uint2 v = *reinterpret_cast<const uint2*>(wp);
+      const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&v);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) acc[j] += xv * __bfloat162float(wb[j]);
+    } else {
+      const uint4 v = *reinterpret_cast<const uint4*>(wp);
+      const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&v);
+#pragma unroll
+      for (int j = 0; j < 8; ++j) acc[j] += xv * __bfloat162float(wb[j]);
+    }
+  };
+
   if constexpr (INDEXED) {
     __shared__ __nv_bfloat16 xs[KTILE];
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
@@ -102,55 +132,102 @@ __global__ void prism_gemv_worklist(
         xs[t] = xr[static_cast<long long>(ie[base + t])];
       }
       __syncthreads();
-      if (n < n_cols) {
-        for (int r = threadIdx.y; r < cnt; r += 4) {
-          acc += __bfloat162float(xs[r]) *
-                 __bfloat162float(we[(base + r) * n_cols + n]);
+      if (active) {
+        for (int r = threadIdx.y; r < cnt; r += NY) {
+          fma_row(we + (base + r) * n_cols + n0, __bfloat162float(xs[r]));
         }
       }
     }
   } else {
     // 밴드 경로는 x를 순차로 읽어 의존 사슬이 없다 — 스테이징이 순손실이라
     // (실측 bs=1 10.5 → 12.0 µs) 원래 루프를 그대로 둔다.
-    if (n < n_cols) {
-      for (long long r = threadIdx.y; r < kr; r += 4) {
-        acc += __bfloat162float(xr[k_offset + r]) *
-               __bfloat162float(we[r * n_cols + n]);
+    if (active) {
+      for (long long r = threadIdx.y; r < kr; r += NY) {
+        fma_row(we + r * n_cols + n0, __bfloat162float(xr[k_offset + r]));
       }
     }
   }
-  __shared__ float red[4][64];
-  red[threadIdx.y][threadIdx.x] = acc;
+  __shared__ float red[NY][NCOL];
+#pragma unroll
+  for (int j = 0; j < V; ++j) {
+    red[threadIdx.y][threadIdx.x * V + j] = active ? acc[j] : 0.f;
+  }
   __syncthreads();
-  if (threadIdx.y == 0 && n < n_cols) {
-    const float s = red[0][threadIdx.x] + red[1][threadIdx.x] +
-                    red[2][threadIdx.x] + red[3][threadIdx.x];
-    out[pair * out_row + out_off + n] = __float2bfloat16(s);
+  if constexpr (V == 1) {
+    // 기존 순서 그대로 — 밴드 경로의 비트 재현을 건드리지 않는다.
+    if (threadIdx.y == 0 && active) {
+      const float t = red[0][threadIdx.x] + red[1][threadIdx.x] +
+                      red[2][threadIdx.x] + red[3][threadIdx.x];
+      out[pair * out_row + out_off + n0] = __float2bfloat16(t);
+    }
+  } else {
+    for (int stride = NY / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.y < stride) {
+#pragma unroll
+        for (int j = 0; j < V; ++j) {
+          red[threadIdx.y][threadIdx.x * V + j] +=
+              red[threadIdx.y + stride][threadIdx.x * V + j];
+        }
+      }
+      __syncthreads();
+    }
+    if (threadIdx.y == 0 && active) {
+#pragma unroll
+      for (int j = 0; j < V; ++j) {
+        out[pair * out_row + out_off + n0 + j] =
+            __float2bfloat16(red[0][threadIdx.x * V + j]);
+      }
+    }
   }
 }
 
 // topk dtype 디스패치. 나머지 인자는 두 경로가 공유한다 (비인덱스는
 // row_off/kidx가 nullptr, 인덱스는 k_offset/k_rows가 무시된다).
-template <bool INDEXED>
+template <bool INDEXED, int V>
 inline void launch_gemv_worklist(
-    const dim3& grid, const dim3& block, const DLDevice& device,
+    const dim3& grid, const DLDevice& device,
     tvm::ffi::TensorView topk,
     const __nv_bfloat16* x, const __nv_bfloat16* w, __nv_bfloat16* out,
     const int32_t* row_off, const uint16_t* kidx,
     int64_t x_kx, int64_t k_offset, int64_t k_rows, int64_t n_cols,
     int64_t out_row, int64_t out_col_offset, int64_t top_k, int x_row_is_pair) {
   using namespace host;
+  const dim3 block(64 / V, 4 * V);  // 블록당 열 타일 64 고정 (커널 주석 참조)
   if (is_type<int32_t>(topk.dtype())) {
     LaunchKernel(grid, block, device)(
-        prism_gemv_worklist<int32_t, INDEXED>, x,
+        prism_gemv_worklist<int32_t, INDEXED, V>, x,
         static_cast<const int32_t*>(topk.data_ptr()), w, out, row_off, kidx,
         x_kx, k_offset, k_rows, n_cols, out_row, out_col_offset, top_k, x_row_is_pair);
   } else {
     LaunchKernel(grid, block, device)(
-        prism_gemv_worklist<int64_t, INDEXED>, x,
+        prism_gemv_worklist<int64_t, INDEXED, V>, x,
         static_cast<const int64_t*>(topk.data_ptr()), w, out, row_off, kidx,
         x_kx, k_offset, k_rows, n_cols, out_row, out_col_offset, top_k, x_row_is_pair);
   }
+}
+
+// W 로드 폭 선택. uint2/uint4 정렬 조건은 (a) n_cols가 V의 배수, (b) 스토어
+// 시작 주소가 V*2 바이트 정렬. (a)는 계약 ①의 COL_GROUP=32가 보증하고,
+// row_off[e]는 임의여도 된다 — 행 시작이 n_cols 원소의 배수이므로 (a)가
+// 곧 행 정렬이다. hint > 0이면 강제(벤치/디버그용), 0이면 자동.
+inline int choose_vec(int64_t hint, int64_t n_cols, const void* w) {
+  using namespace host;
+  auto ok = [&](int v) {
+    return n_cols % v == 0 &&
+           reinterpret_cast<std::uintptr_t>(w) % (static_cast<std::size_t>(v) * 2) == 0;
+  };
+  if (hint > 0) {
+    RuntimeCheck(hint == 1 || hint == 4 || hint == 8,
+                 "gemv_worklist_indexed: vec must be 0(auto), 1, 4 or 8, got ", hint);
+    RuntimeCheck(ok(static_cast<int>(hint)),
+                 "gemv_worklist_indexed: vec=", hint,
+                 " needs n_cols (", n_cols, ") divisible by it and a ",
+                 hint * 2, "-byte aligned store");
+    return static_cast<int>(hint);
+  }
+  if (ok(8)) return 8;
+  if (ok(4)) return 4;
+  return 1;
 }
 
 // 공통 검증+launch. src_on_device로 W의 device 제약만 갈라진다
@@ -202,8 +279,9 @@ inline void gemv_worklist_impl(
   const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(64))),
                   static_cast<unsigned int>(m * top_k));
 
-  launch_gemv_worklist<false>(
-      grid, block, device, topk,
+  // 밴드 경로는 V=1 고정 — 인덱스 전환과 함께 폐기될 경로라 건드리지 않는다.
+  launch_gemv_worklist<false, 1>(
+      grid, device, topk,
       static_cast<const __nv_bfloat16*>(x.data_ptr()),
       static_cast<const __nv_bfloat16*>(w.data_ptr()),
       static_cast<__nv_bfloat16*>(out.data_ptr()),
@@ -220,7 +298,7 @@ inline void gemv_worklist_indexed_impl(
     tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
     tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
     tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
-    bool w_on_device) {
+    int64_t vec, bool w_on_device) {
   using namespace host;
 
   auto Rx = SymbolicSize{"x_rows"};
@@ -272,15 +350,23 @@ inline void gemv_worklist_indexed_impl(
   const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(64))),
                   static_cast<unsigned int>(m * top_k));
 
-  launch_gemv_worklist<true>(
-      grid, block, device, topk,
-      static_cast<const __nv_bfloat16*>(x.data_ptr()),
-      static_cast<const __nv_bfloat16*>(w.data_ptr()),
-      static_cast<__nv_bfloat16*>(out.data_ptr()),
-      static_cast<const int32_t*>(row_off.data_ptr()),
-      static_cast<const uint16_t*>(kidx.data_ptr()),
-      x_kx, 0, 0, n_cols, out_row, out_col_offset, top_k,
-      static_cast<int>(x_row_is_pair));
+#define PRISM_LAUNCH_INDEXED(V)                                              \
+  launch_gemv_worklist<true, V>(                                             \
+      grid, device, topk,                                                    \
+      static_cast<const __nv_bfloat16*>(x.data_ptr()),                       \
+      static_cast<const __nv_bfloat16*>(w.data_ptr()),                       \
+      static_cast<__nv_bfloat16*>(out.data_ptr()),                           \
+      static_cast<const int32_t*>(row_off.data_ptr()),                       \
+      static_cast<const uint16_t*>(kidx.data_ptr()),                         \
+      x_kx, 0, 0, n_cols, out_row, out_col_offset, top_k,                    \
+      static_cast<int>(x_row_is_pair))
+
+  switch (choose_vec(vec, n_cols, w.data_ptr())) {
+    case 8: PRISM_LAUNCH_INDEXED(8); break;
+    case 4: PRISM_LAUNCH_INDEXED(4); break;
+    default: PRISM_LAUNCH_INDEXED(1); break;
+  }
+#undef PRISM_LAUNCH_INDEXED
 }
 
 void gemv_worklist(
@@ -300,17 +386,19 @@ void gemv_worklist_pinned(
 void gemv_worklist_indexed(
     tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
     tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair) {
+    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
+    int64_t vec) {
   gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                             x_row_is_pair, true);
+                             x_row_is_pair, vec, true);
 }
 
 void gemv_worklist_indexed_pinned(
     tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
     tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair) {
+    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
+    int64_t vec) {
   gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                             x_row_is_pair, false);
+                             x_row_is_pair, vec, false);
 }
 
 }  // namespace
