@@ -82,3 +82,22 @@ def test_registry_and_resolution():
         resolve_gpu_kernel("nope")
     with pytest.raises(KernelError, match="unknown cpu_cold"):
         resolve_cpu_kernel("nope")
+
+
+def test_worklist_kernel_key_registered():
+    from sglang.srt.layers.moe.prism.kernels import (
+        known_gpu_kernels, resolve_gpu_kernel, resolve_worklist_kernels,
+    )
+    assert "gemv_worklist" in known_gpu_kernels()
+    assert resolve_worklist_kernels("torch_bmm") is None
+    fns = resolve_worklist_kernels("gemv_worklist")
+    assert fns is not None and len(fns) == 2
+    # prefill 폴백: worklist plan도 bmm형 커널을 반환해야 한다 (Dedup 경로용)
+    assert resolve_gpu_kernel("gemv_worklist") is resolve_gpu_kernel("torch_bmm")
+
+
+def test_worklist_kernel_unknown_key_raises():
+    import pytest as _pytest
+    from sglang.srt.layers.moe.prism.kernels import KernelError, resolve_worklist_kernels
+    with _pytest.raises(KernelError):
+        resolve_worklist_kernels("nope")

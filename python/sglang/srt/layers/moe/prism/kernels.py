@@ -21,7 +21,7 @@ warm GEMM 커널 계약 (계약 ④ run_warm의 계산 코어):
 
 from __future__ import annotations
 
-from typing import Callable, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 
@@ -106,3 +106,35 @@ def resolve_cpu_kernel(name: str) -> str:
             f"unknown cpu_cold kernel '{name}' (known: {sorted(_CPU_COLD_KERNELS)})"
         )
     return name
+
+
+# ── worklist GEMV (decode 전용, spec 2026-08-25) ─────────────────────────
+# plan `kernels.gpu_warm: "gemv_worklist"` 선택 시 decode(M ≤ 임계치)는
+# worklist 경로(gather/bmm/scatter 우회), prefill은 아래 폴백 bmm을 그대로
+# 탄다. 래퍼 시그니처는 jit_kernel/prism_gemv.py docstring이 정본.
+def _worklist_fns():
+    from sglang.jit_kernel.prism_gemv import (  # 지연 import — CPU-only 환경 보호
+        gemv_worklist, gemv_worklist_pinned,
+    )
+    return (gemv_worklist, gemv_worklist_pinned)
+
+
+_GPU_WARM_KERNELS["gemv_worklist"] = _warm_gemm_torch_bmm  # prefill/Dedup 폴백
+
+_GPU_WORKLIST_KERNELS: dict[str, Callable[[], tuple]] = {
+    "gemv_worklist": _worklist_fns,
+}
+
+
+def resolve_worklist_kernels(name: str) -> Optional[tuple]:
+    """worklist 커널 쌍 (device_fn, pinned_fn) 또는 None (bmm 전용 키).
+
+    KernelError는 아예 모르는 키일 때만 — 유효하지만 worklist가 아닌 키
+    ("torch_bmm")는 None이다 (호출자가 경로를 가른다)."""
+    if name in _GPU_WORKLIST_KERNELS:
+        return _GPU_WORKLIST_KERNELS[name]()
+    if name in _GPU_WARM_KERNELS:
+        return None
+    raise KernelError(
+        f"unknown gpu_warm kernel '{name}' (known: {sorted(_GPU_WARM_KERNELS)})"
+    )
