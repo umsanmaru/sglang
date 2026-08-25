@@ -265,8 +265,8 @@ h125 교차검증 1건은 GPU0 단독 점유(quiet) 상태에서 측정.
 안에 있다 — 단, 이 값 자체는 GPU0 공유 상태에서 잰 것이라 대역 상단 쪽으로
 치우쳤을 수 있다.
 
-**worklist graph vs 같은 plan eager**: bs=2에서 2.14배(GPU0 공유 상태에서
-측정, 분자=31.47ms 그래프 측정값), bs=4에서 1.63배, bs=8에서 1.67배 —
+**worklist graph vs 같은 plan eager**: bs=2에서 2.14배(분자 eager
+67.26ms·분모 graph 31.47ms 모두 GPU0 공유 상태 측정), bs=4에서 1.63배, bs=8에서 1.67배 —
 graph가 여전히 크게 이긴다(GatherKernelStager가 bs>1도 캡처 가능해졌으므로
 당연하지만, S1 host 블록 소멸의 효과가 bs가 커져도 유지됨을 확인).
 
