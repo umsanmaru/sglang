@@ -210,7 +210,7 @@ def test_hot_without_device_rejected():
     """hot 밴드가 있는데 device가 없으면 즉사 — 조용히 CPU에 두면 티어 의미가 사라진다."""
     plan = make_plan(**HOT3)
     w13, w2 = make_weights()
-    with pytest.raises(PlanError, match="HOT bands but no device"):
+    with pytest.raises(PlanError, match="HOT rows but no device"):
         prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN)
 
 
@@ -222,55 +222,113 @@ def test_no_hot_band_needs_no_device():
     assert all(prepared.hot.band(p) is None for p in Proj)
 
 
-def test_hot_multi_band_not_implemented():
+def test_hot_multi_band_now_supported():
+    """티어당 다중 밴드는 인덱스 표현에 제약이 아니다 — 이어 붙으면 그만이다.
+
+    (밴드 시절의 `NotImplementedError("one hot band")`가 사라진 자리.)
+    """
     plan = make_plan(
-        gate_bands=[[0, 64, "hot"], [64, 128, "cold"], [128, 192, "hot"], [192, 256, "cold"]]
+        gate_bands=[[0, 64, "hot"], [64, 128, "warm"], [128, 192, "hot"],
+                    [192, 256, "cold"]]
     )
     w13, w2 = make_weights()
-    with pytest.raises(NotImplementedError, match="one hot band"):
-        prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN, device=CPU)
+    prepared = prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN, device=CPU)
+    hot = prepared.hot.band(Proj.GATE)
+    assert hot.total_rows == 128 * DIMS["num_experts"]
+    assert not hot.contiguous          # 두 구간이라 단위 stride가 아니다
+    assert hot.uniform_k == 128        # 개수는 균일
+    with pytest.raises(NotImplementedError, match="연속 밴드가 아니다"):
+        hot.k_offset                   # 밴드 경로는 이 plan을 실행할 수 없다
 
 
-def test_multi_band_not_implemented():
+def test_warm_multi_band_now_supported():
     plan = make_plan(
-        gate_bands=[[0, 64, "warm"], [64, 128, "cold"], [128, 192, "warm"], [192, 256, "cold"]]
+        gate_bands=[[0, 64, "warm"], [64, 128, "hot"], [128, 192, "warm"],
+                    [192, 256, "cold"]]
     )
     w13, w2 = make_weights()
-    with pytest.raises(NotImplementedError, match="one warm band"):
-        prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN)
+    prepared = prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN, device=CPU)
+    warm = prepared.warm.band(Proj.GATE)
+    assert not warm.contiguous and warm.uniform_k == 128
+    rows = warm.k_index[: warm.uniform_k].to(torch.int64).tolist()
+    assert rows == list(range(0, 64)) + list(range(128, 192))
 
 
-def test_nonuniform_experts_not_implemented():
-    raw_plan = make_plan()
+def test_per_expert_variable_geometry_supported():
+    """expert마다 행 수가 달라도 로드된다 — flat + offset이 존재하는 이유다.
+
+    cold는 전 expert 동일하게 두었다: kt가 아직 밴드 기하만 받으므로(K3까지)
+    가변 cold는 별도 테스트가 거부를 확인한다.
+    """
+    def entry(bands, N):
+        return {"bands": bands,
+                "cold_shards": [[0, 0, N // 2], [1, N // 2, N]]}
     raw = {
         "schema_version": 1,
         "model_id": "test/tiny",
         "dims": dict(DIMS),
         "kernels": {"gpu_warm": "torch_bmm", "cpu_cold": "kt_amx_bf16"},
         "default": {
-            "gate": {"bands": [[0, 64, "warm"], [64, 256, "cold"]],
-                      "cold_shards": [[0, 0, 128]]},
-            "up": {"bands": [[0, 64, "warm"], [64, 256, "cold"]],
-                    "cold_shards": [[0, 0, 128]]},
-            "down": {"bands": [[0, 64, "warm"], [64, 128, "cold"]],
-                      "cold_shards": [[0, 0, 256]]},
+            "gate": entry([[0, 64, "warm"], [64, 192, "hot"], [192, 256, "cold"]], 128),
+            "up": entry([[0, 64, "warm"], [64, 256, "cold"]], 128),
+            "down": entry([[0, 64, "warm"], [64, 128, "cold"]], 256),
         },
         "overrides": [{
             "layer": 0, "expert": 1,
-            "gate": {"bands": [[0, 128, "warm"], [128, 256, "cold"]],
-                      "cold_shards": [[0, 0, 128]]},
-            "up": {"bands": [[0, 64, "warm"], [64, 256, "cold"]],
-                    "cold_shards": [[0, 0, 128]]},
-            "down": {"bands": [[0, 64, "warm"], [64, 128, "cold"]],
-                      "cold_shards": [[0, 0, 256]]},
+            # warm이 두 배, hot이 그만큼 얇다 — cold는 그대로.
+            "gate": entry([[0, 128, "warm"], [128, 192, "hot"], [192, 256, "cold"]], 128),
+            "up": entry([[0, 64, "warm"], [64, 256, "cold"]], 128),
+            "down": entry([[0, 64, "warm"], [64, 128, "cold"]], 256),
         }],
     }
     plan = parse_plan(raw)
     validate_static(plan)
     w13, w2 = make_weights()
-    with pytest.raises(NotImplementedError, match="uniform geometry"):
+    prepared = prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN, device=CPU)
+
+    warm = prepared.warm.band(Proj.GATE)
+    assert warm.uniform_k is None                       # expert마다 다르다
+    assert int(warm.row_off[1]) - int(warm.row_off[0]) == 64
+    assert int(warm.row_off[2]) - int(warm.row_off[1]) == 128
+    assert warm.total_rows == 64 * (DIMS["num_experts"] - 1) + 128
+    with pytest.raises(NotImplementedError, match="행 수가 다르다"):
+        warm.k_rows
+
+    # 스토어 내용이 expert별 인덱스와 맞는지 (좌표 뒤섞임 검출)
+    src = w13[:, : DIMS["intermediate_size"], :]        # gate [E, N, K]
+    for e in (0, 1, 2):
+        o0, o1 = int(warm.row_off[e]), int(warm.row_off[e + 1])
+        rows = warm.k_index[o0:o1].to(torch.int64)
+        assert torch.equal(warm.w_flat[o0:o1], src[e].t().index_select(0, rows))
+
+
+def test_variable_cold_geometry_rejected():
+    """cold는 아직 밴드 기하만 — kt가 KIndex를 받는 K3까지의 한계."""
+    def entry(bands, N):
+        return {"bands": bands,
+                "cold_shards": [[0, 0, N // 2], [1, N // 2, N]]}
+    raw = {
+        "schema_version": 1,
+        "model_id": "test/tiny",
+        "dims": dict(DIMS),
+        "kernels": {"gpu_warm": "torch_bmm", "cpu_cold": "kt_amx_bf16"},
+        "default": {
+            "gate": entry([[0, 64, "warm"], [64, 256, "cold"]], 128),
+            "up": entry([[0, 64, "warm"], [64, 256, "cold"]], 128),
+            "down": entry([[0, 64, "warm"], [64, 128, "cold"]], 256),
+        },
+        "overrides": [{
+            "layer": 0, "expert": 1,
+            "gate": entry([[0, 128, "warm"], [128, 256, "cold"]], 128),
+            "up": entry([[0, 64, "warm"], [64, 256, "cold"]], 128),
+            "down": entry([[0, 64, "warm"], [64, 128, "cold"]], 256),
+        }],
+    }
+    plan = parse_plan(raw)
+    validate_static(plan)
+    w13, w2 = make_weights()
+    with pytest.raises(NotImplementedError, match="밴드 기하만"):
         prepare_layer_weights(0, w13, w2, plan, pin_memory=PIN)
-    del raw_plan
 
 
 def test_shape_mismatch_rejected():

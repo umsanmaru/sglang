@@ -2,7 +2,7 @@
 
 소유권 (계약 ③):
 - hot  → Python 소유 device 텐서 (VRAM 상주, 전송 없음)
-- warm → Python 소유 pinned 텐서 + (proj) → k_offset
+- warm → Python 소유 pinned 텐서 (GPU가 UVA로 제자리 읽는다)
 - cold → C++ MOE 객체 핸들. 단, cold backend(K3/S5)가 붙기 전까지는
   PendingColdTensors가 슬라이스본을 임시 소유한다 — backend 접속 시
   텐서를 넘기고 핸들로 대체되는 것이 P0의 로딩 흐름이다.
@@ -18,25 +18,29 @@ w13/w2에 대한 참조를 보관하지 않으며, 호출자는 반환 즉시 �
   trtllm cutlass 계열)를 세팅하면 w13 내부 순서가 뒤집힌다. 이 로더는
   기본 순서를 가정하므로, method 통합(S7)에서 해당 플래그가 False임을
   assert해야 한다 — 위반 시 gate/up이 조용히 뒤바뀐다.
-- hot store는 warm과 **같은 방향** [E, k_rows, N] (K-major, device). 같은
-  warm GEMM 커널(kernels.py 계약)에 그대로 들어간다 — hot이 warm과 다른 것은
-  '어디 상주하고 step마다 옮기는가' 하나뿐이고 계산 계약은 동일하다.
-- warm store는 [E, k_rows, N] (K-major) — transpose 표기 없이 GEMM에
-  들어가는 no-transpose 정준 방향을 로드 시점에 한 번 고정한 것
-  (kernels.py의 warm GEMM 계약이 이 방향 하나만 가정; N-major도 GEMM
-  자체는 가능하지만 커널 계약 단일화 + P1 persistent GEMV의 스트리밍
-  패턴 + cuBLAS T-경로 회피를 위해 통일). cold 슬라이스는 ckpt 방향
-  [E, N, k_cold] 유지 — 소비자인 kt-kernel pack이 기대하는 방향이다.
+- hot/warm store는 **flat + offset** [Σₑ k[e], N] (K-major) — `[E, k, N]`
+  균일 적층이 expert마다 다른 k를 표현할 수 없어서다 (계약 ① 2026-08-25).
+  두 티어가 같은 타입인 이유는 계산 계약이 같기 때문이고, 다른 것은 거처
+  (device / pinned) 하나뿐이다. K-major는 no-transpose 정준 방향으로 로드
+  시점에 고정한 것이다.
+- 인덱스(`k_index`)와 스토어는 **같은 오프셋 테이블을 공유한다** — 둘 다
+  expert당 k[e]개이므로 `row_off` 하나가 셋(weight·인덱스·점수 테이블)을
+  서비스한다.
+- cold 슬라이스는 ckpt 방향 [E, N, k_cold] 유지 — 소비자인 kt-kernel pack이
+  기대하는 방향이고, 그쪽이 KIndex를 받는 K3까지 밴드 기하로 남는다.
 
 sparsity(계약 ①, schema_version 2): `wn`/`pair_dot`은 K축이라 weight와 **같은
-밴드 절단**을 받아 각 밴드에 동행한다 (WarmBand/ColdBand.calib). `thr` 곡선은
-밴드와 무관한 per-(layer, expert)라 PreparedWeights.thr에 통째로 둔다. 셋 다
-CPU fp32로 남긴다 — warm 쪽 device 배치는 device 메모리 소유자(resources/
-executor)의 결정이라 여기서 앞질러 정하지 않는다.
+절단**을 받아 동행한다. `thr` 곡선은 절단과 무관한 per-(layer, expert)라
+PreparedWeights.thr에 통째로 둔다. 셋 다 CPU fp32로 남긴다.
 
-P0 loader capability gap (스키마 제약이 아님, NotImplementedError로 명시):
-- 티어당 다중 밴드 미지원
-- 레이어 내 expert 간 기하 불일치 미지원 (store가 [E, ...] 균일 적층이므로)
+전환기 상태 (2026-08-25):
+- 티어당 다중 밴드, expert 간 기하 불일치(가변 k) — **둘 다 지원된다.**
+  인덱스 표현에는 애초에 그런 제약이 없고, 밴드 시절의 NotImplementedError
+  두 개가 여기서 사라졌다.
+- 남은 제약은 **소비자 쪽**이다: cold는 kt가 밴드 기하만 받아 균일·연속을
+  요구하고(K3까지), calib gather도 그에 맞춰 밴드 절단으로 남는다. GPU 티어의
+  밴드 경로(bmm/stager)도 `weights`/`k_offset` 접근 시 균일·연속을 요구하며,
+  아니면 즉사한다 — 조용히 틀린 값을 주느니 죽는 편이 낫다.
 """
 
 from __future__ import annotations
@@ -47,6 +51,12 @@ from typing import Mapping, Optional
 import torch
 
 from sglang.srt.layers.moe.prism.calib import CalibBand, CalibTables
+from sglang.srt.layers.moe.prism.index import (
+    LayerIndex,
+    TierIndex,
+    from_bands,
+    validate_layer,
+)
 from sglang.srt.layers.moe.prism.numa import alloc_pinned_on_node
 from sglang.srt.layers.moe.prism.plan import (
     ExpertProjPlan,
@@ -58,58 +68,104 @@ from sglang.srt.layers.moe.prism.plan import (
 
 
 @dataclass
-class HotBand:
-    """한 proj의 hot 밴드: device bf16 [E, k_rows, N] (warm과 동일 K-major).
+class TierShard:
+    """GPU 티어(hot/warm) 하나의 스토어 — **flat + offset** (계약 ③ 2026-08-25).
 
-    warm과 방향이 같은 이유는 같은 GEMM 커널을 타기 때문이다. 차이는 상주
-    위치뿐이라 executor에서 PCIe stager가 빠지고, warm과 같은 uint4 gather
-    커널(device-src 변형)이 hot arena로 [g, k_rows, N]를 모은다.
+    `[E, k, N]` 균일 적층은 expert마다 k가 다른 것을 표현할 수 없다. flat이
+    소유자이고, 인덱스는 스토어와 **같은 오프셋 테이블을 공유한다** (둘 다
+    expert당 k[e]개).
+
+    hot과 warm이 같은 타입인 이유는 계약 ①이 둘의 계산 계약을 같다고 못박기
+    때문이다 — 다른 것은 `w_flat`이 device냐 pinned냐 하나뿐이다.
+
+    전환기 호환(`weights`/`k_offset`/`k_rows`): 기존 밴드 경로(bmm/stager)가
+    아직 살아 있어 `[E, k, N]` 뷰와 밴드 스칼라를 노출한다. 균일·연속이 아닌
+    plan에서는 **즉사한다** — 조용히 틀린 값을 주느니 죽는 편이 낫고, 그 시점이
+    곧 밴드 경로를 지울 때다.
     """
 
-    k_offset: int
-    weights: torch.Tensor
-    # sparsity 점수 재료 (이 밴드 구간만). plan.sparsity가 있으면 존재.
-    # hot은 dense로 계산하므로(계약 ①) 현재 소비자가 없다 — warm과 대칭을
-    # 유지해 밴드 재배치 시 특례가 생기지 않게 두는 것.
+    w_flat: torch.Tensor       # bf16 [Σₑ k[e], N] — hot=device / warm=pinned
+    row_off: torch.Tensor      # int32 [E+1] (device — 커널이 읽는다)
+    k_index: torch.Tensor      # uint16 [Σₑ k[e]] (device)
+    contiguous: bool
+    # 밴드 퇴화형일 때만 채워진다 (전환기 호환용, 로드 시 host에서 계산).
+    uniform_k: Optional[int] = None
+    band_start: Optional[int] = None
     calib: Optional[CalibBand] = None
 
     @property
+    def num_experts(self) -> int:
+        return int(self.row_off.numel()) - 1
+
+    @property
+    def total_rows(self) -> int:
+        return int(self.w_flat.shape[0])
+
+    # ── 전환기 호환 ──────────────────────────────────────────────────────
+    @property
     def k_rows(self) -> int:
-        return self.weights.shape[1]
+        if self.uniform_k is None:
+            raise NotImplementedError(
+                "k_rows: expert마다 행 수가 다르다 — 밴드 경로는 이 plan을 "
+                "실행할 수 없다 (인덱스 경로를 쓸 것)"
+            )
+        return self.uniform_k
+
+    @property
+    def k_offset(self) -> int:
+        if self.band_start is None:
+            raise NotImplementedError(
+                "k_offset: 연속 밴드가 아니다 — 밴드 경로는 이 plan을 실행할 "
+                "수 없다 (인덱스 경로를 쓸 것)"
+            )
+        return self.band_start
+
+    @property
+    def weights(self) -> torch.Tensor:
+        """[E, k, N] 뷰 — flat의 재해석이므로 복사가 없다."""
+        return self.w_flat.view(self.num_experts, self.k_rows, self.w_flat.shape[1])
+
+    @classmethod
+    def from_band(cls, weights: torch.Tensor, k_offset: int = 0) -> "TierShard":
+        """[E, k, N] 밴드 텐서에서 shard를 만든다 (전환기 픽스처용).
+
+        flat은 뷰라 복사가 없다 — 밴드가 인덱스의 퇴화형이라는 사실의 가장
+        짧은 표현이다."""
+        E, k, N = weights.shape
+        return cls(
+            w_flat=weights.reshape(E * k, N),
+            row_off=torch.arange(E + 1, dtype=torch.int32) * k,
+            k_index=torch.arange(k_offset, k_offset + k).repeat(E).to(torch.uint16),
+            contiguous=True,
+            uniform_k=k,
+            band_start=k_offset,
+        )
 
 
 @dataclass
 class HotStore:
-    gate: Optional[HotBand]
-    up: Optional[HotBand]
-    down: Optional[HotBand]
+    gate: Optional[TierShard]
+    up: Optional[TierShard]
+    down: Optional[TierShard]
 
-    def band(self, proj: Proj) -> Optional[HotBand]:
+    def band(self, proj: Proj) -> Optional[TierShard]:
         return {Proj.GATE: self.gate, Proj.UP: self.up, Proj.DOWN: self.down}[proj]
-
-
-@dataclass
-class WarmBand:
-    """한 proj의 warm 밴드: pinned bf16 [E, k_rows, N] (K-major, no-transpose 정준 방향)."""
-
-    k_offset: int
-    weights: torch.Tensor
-    # sparsity 점수 재료 (이 밴드 구간만). plan.sparsity가 있으면 존재.
-    calib: Optional[CalibBand] = None
-
-    @property
-    def k_rows(self) -> int:
-        return self.weights.shape[1]
 
 
 @dataclass
 class WarmStore:
-    gate: Optional[WarmBand]
-    up: Optional[WarmBand]
-    down: Optional[WarmBand]
+    gate: Optional[TierShard]
+    up: Optional[TierShard]
+    down: Optional[TierShard]
 
-    def band(self, proj: Proj) -> Optional[WarmBand]:
+    def band(self, proj: Proj) -> Optional[TierShard]:
         return {Proj.GATE: self.gate, Proj.UP: self.up, Proj.DOWN: self.down}[proj]
+
+
+# 전환기 별칭 — 타입은 이미 하나로 합쳐졌고(계약 ①: hot/warm 계산 계약 동일),
+# 이름만 밴드 경로가 지워질 때까지 남는다.
+HotBand = TierShard
+WarmBand = TierShard
 
 
 @dataclass
@@ -120,6 +176,10 @@ class ColdBand:
     weights: torch.Tensor
     # sparsity 점수 재료 (이 밴드 구간만). plan.sparsity가 있으면 존재.
     calib: Optional[CalibBand] = None
+    # 이 티어가 소유하는 K행 (계약 ③). cold **텐서 레이아웃**은 kt pack이
+    # 정하므로 K3까지 ckpt 방향 [E, N, k]로 두고, 인덱스만 먼저 동행시킨다 —
+    # kt가 KIndex를 받게 되는 시점(S7)의 입력이다.
+    index: Optional[TierIndex] = None
 
     @property
     def k_rows(self) -> int:
@@ -150,30 +210,68 @@ class PreparedWeights:
     thr: Optional[Mapping[Proj, torch.Tensor]] = None
 
 
-def _uniform_proj_plan(plan: Plan, layer_idx: int, proj: Proj) -> ExpertProjPlan:
-    """레이어 내 모든 expert의 proj 기하가 동일함을 요구하고 그것을 반환.
+def _uniform_band(ti: TierIndex) -> tuple[Optional[int], Optional[int]]:
+    """(uniform_k, band_start) — 밴드 퇴화형이면 채워지고 아니면 (None, None).
 
-    P0 store가 [E, ...] 균일 적층이라서다. 가변 k_warm[e]가 오면 store가
-    offset 테이블 기반으로 바뀌면서 이 요구가 사라진다.
+    전환기 호환 속성(`weights`/`k_offset`/`k_rows`)이 유효한지의 판정이다.
+    host에서 한 번 계산해 두는 이유: 판정에 인덱스 값이 필요한데, 스토어가
+    device로 간 뒤에는 그걸 읽는 것이 곧 동기화이기 때문이다.
     """
-    first = plan.expert(layer_idx, 0).proj(proj)
-    for expert in range(1, plan.dims.num_experts):
-        other = plan.expert(layer_idx, expert).proj(proj)
-        if other is not first and other != first:
-            raise NotImplementedError(
-                f"P0 loader requires uniform geometry across experts; "
-                f"layer {layer_idx} {proj.value} differs at expert {expert}"
-            )
-    return first
+    E = ti.num_experts
+    ks = {ti.k_rows(e) for e in range(E)}
+    uniform = ks.pop() if len(ks) == 1 else None
+    if uniform is None or not ti.contiguous or uniform == 0:
+        return uniform, None
+    starts = {int(ti.idx[int(ti.row_off[e])]) for e in range(E)}
+    return uniform, (starts.pop() if len(starts) == 1 else None)
 
 
-def _single_band(pp: ExpertProjPlan, tier: Tier, where: str):
-    bands = [b for b in pp.bands if b.tier is tier]
-    if not bands:
-        return None
-    if len(bands) > 1:
-        raise NotImplementedError(f"{where}: P0 loader supports one {tier.value} band")
-    return bands[0]
+def _gather_flat(src: torch.Tensor, ti: TierIndex, uniform_k, band_start):
+    """[E, N, K] 소스에서 이 티어의 flat 스토어 [Σₑ k[e], N]를 만든다 (CPU).
+
+    밴드 퇴화형이면 한 번의 transpose+contiguous로 끝난다 — 기존 로더와 같은
+    비용이라 현행 plan 40개의 로딩이 느려지지 않는다. 일반 경로는 expert 루프인데,
+    배치 gather로 하려면 [E, N, k] 크기의 int64 인덱스를 물질화해야 해서(gate 기준
+    6 GB) 루프가 오히려 싸다.
+    """
+    E, N, _ = src.shape
+    if band_start is not None:
+        return (
+            src[:, :, band_start : band_start + uniform_k]
+            .transpose(1, 2)
+            .contiguous()
+            .reshape(-1, N)
+        )
+    out = torch.empty(ti.total_rows, N, dtype=src.dtype)
+    for e in range(E):
+        o0, o1 = int(ti.row_off[e]), int(ti.row_off[e + 1])
+        if o1 > o0:
+            rows = ti.for_expert(e).to(torch.int64)
+            out[o0:o1] = src[e].t().index_select(0, rows)
+    return out
+
+
+def _build_shard(
+    src: torch.Tensor,
+    ti: TierIndex,
+    *,
+    idx_device: torch.device,
+    place,
+    calib: Optional[CalibBand],
+) -> TierShard:
+    """티어 스토어 하나. `place`가 flat을 최종 거처로 옮긴다 (hot=device /
+    warm=pinned). row_off·k_index는 **항상 커널이 읽는 device**로 간다."""
+    uniform_k, band_start = _uniform_band(ti)
+    flat = _gather_flat(src, ti, uniform_k, band_start)
+    return TierShard(
+        w_flat=place(flat),
+        row_off=ti.row_off.to(idx_device),
+        k_index=ti.idx.to(idx_device),
+        contiguous=ti.contiguous,
+        uniform_k=uniform_k,
+        band_start=band_start,
+        calib=calib,
+    )
 
 
 def _proj_source(w13: torch.Tensor, w2: torch.Tensor, inter: int, proj: Proj):
@@ -231,105 +329,86 @@ def prepare_layer_weights(
             f"plan이 다른 모델에 적용되고 있을 가능성"
         )
 
-    hot_bands: dict[Proj, Optional[HotBand]] = {}
-    warm_bands: dict[Proj, Optional[WarmBand]] = {}
+    # 티어 멤버십을 인덱스로 확정하고 **순열·페어를 검증한다** (계약 ①).
+    # 밴드 검증이 plan.py에서 사라진 자리를 여기가 메운다 — 로드마다 돈다.
+    layer_index = from_bands(plan, layer_idx)
+    validate_layer(layer_index, dims, layer_idx)
+
+    hot_shards: dict[Proj, Optional[TierShard]] = {}
+    warm_shards: dict[Proj, Optional[TierShard]] = {}
     cold_bands: dict[Proj, Optional[ColdBand]] = {}
 
-    any_hot = any(
-        _uniform_proj_plan(plan, layer_idx, p).has_tier(Tier.HOT) for p in Proj
-    )
-    if any_hot and device is None:
+    if any(layer_index.get(p, Tier.HOT) is not None for p in Proj) and device is None:
         raise PlanError(
-            f"layer {layer_idx}: plan has HOT bands but no device was given — "
+            f"layer {layer_idx}: plan has HOT rows but no device was given — "
             f"hot store는 VRAM 상주라 배치 device가 로더의 입력이어야 한다"
         )
+    idx_device = device if device is not None else torch.device("cpu")
 
     for proj in Proj:
-        pp = _uniform_proj_plan(plan, layer_idx, proj)
+        pp = plan.expert(layer_idx, 0).proj(proj)
         where = f"layer {layer_idx} {proj.value}"
-
         src = _proj_source(w13, w2, dims.intermediate_size, proj)  # [E, N, K]
 
-        hot = _single_band(pp, Tier.HOT, where)
-        if hot is None:
-            hot_bands[proj] = None
-        else:
-            # warm과 같은 [E, N, k] → [E, k, N] 변환. 차이는 목적지가 device라는
-            # 것뿐 — .to()가 H2D까지 한 번에 한다 (transpose가 non-contiguous라
-            # copy는 어차피 발생하므로 중간 CPU contiguous 사본을 만들지 않는다).
-            hot_bands[proj] = HotBand(
-                k_offset=hot.start,
-                weights=src[:, :, hot.start : hot.end]
-                .transpose(1, 2)
-                .contiguous()
-                .to(device, non_blocking=False),
-                calib=(
-                    None if calib is None
-                    else calib.slice_band(
-                        layer_idx, proj, hot.start, hot.end, f"{where} hot"
-                    )
-                ),
-            )
-
-        warm = _single_band(pp, Tier.WARM, where)
-        if warm is None:
-            warm_bands[proj] = None
-        else:
-            # [E, N, k] → GEMM-ready [E, k, N], pinned
-            sliced = src[:, :, warm.start : warm.end].transpose(1, 2)
-            store = (
-                alloc_pinned_on_node(
-                    sliced.shape, w13.dtype, warm_node, f"{where} warm store"
+        def band_calib(ti, tier_name):
+            """전환기: calib은 아직 밴드 절단이다 (cold만 소비하고, 그 소비자인
+            kt는 K3까지 밴드 기하를 쓴다). 인덱스 gather는 S7에서 붙는다."""
+            if calib is None:
+                return None
+            k0, k1 = _uniform_band(ti)
+            if k1 is None:
+                raise NotImplementedError(
+                    f"{where} {tier_name}: sparsity + 비밴드 인덱스는 아직 "
+                    f"미지원 (calib gather는 kt가 KIndex를 받을 때 붙는다)"
                 )
-                if pin_memory
-                else torch.empty(sliced.shape, dtype=w13.dtype)
-            )
-            store.copy_(sliced)
-            warm_bands[proj] = WarmBand(
-                k_offset=warm.start,
-                weights=store,
-                calib=(
-                    None if calib is None
-                    else calib.slice_band(
-                        layer_idx, proj, warm.start, warm.end, f"{where} warm"
-                    )
-                ),
-            )
+            return calib.slice_band(layer_idx, proj, k1, k1 + k0, f"{where} {tier_name}")
 
-        cold = _single_band(pp, Tier.COLD, where)
-        if cold is None:
+        hot_ti = layer_index.get(proj, Tier.HOT)
+        hot_shards[proj] = None if hot_ti is None else _build_shard(
+            src, hot_ti, idx_device=idx_device,
+            place=lambda t: t.to(device, non_blocking=False),
+            calib=band_calib(hot_ti, "hot"),
+        )
+
+        warm_ti = layer_index.get(proj, Tier.WARM)
+        def place_warm(t, where=where):
+            if not pin_memory:
+                return t.contiguous()
+            store = alloc_pinned_on_node(
+                tuple(t.shape), t.dtype, warm_node, f"{where} warm store")
+            store.copy_(t)
+            return store
+        warm_shards[proj] = None if warm_ti is None else _build_shard(
+            src, warm_ti, idx_device=idx_device, place=place_warm,
+            calib=band_calib(warm_ti, "warm"),
+        )
+
+        cold_ti = layer_index.get(proj, Tier.COLD)
+        if cold_ti is None:
             cold_bands[proj] = None
         else:
-            # ckpt 방향 유지 (kt pack 입력)
+            # cold 텐서 레이아웃은 kt pack이 정한다 — K3까지 ckpt 방향
+            # [E, N, k] 유지. 인덱스는 동행만 시킨다 (S7의 입력).
+            k0, k1 = _uniform_band(cold_ti)
+            if k1 is None:
+                raise NotImplementedError(
+                    f"{where} cold: kt가 아직 밴드 기하만 받는다 (K3 이후 해제)"
+                )
             cold_bands[proj] = ColdBand(
-                k_offset=cold.start,
-                weights=src[:, :, cold.start : cold.end].contiguous(),
-                calib=(
-                    None if calib is None
-                    else calib.slice_band(
-                        layer_idx, proj, cold.start, cold.end, f"{where} cold"
-                    )
-                ),
-            )
-
-        got = (
-            (hot.end - hot.start if hot else 0)
-            + (warm.end - warm.start if warm else 0)
-            + (cold.end - cold.start if cold else 0)
-        )
-        if got != dims.k_of(proj):
-            # validate_static이 커버리지를 이미 보증하므로, 여기 도달은
-            # loader 자체의 결함이다 — 조용히 지나가면 이중계산/누락.
-            raise AssertionError(
-                f"{where}: loader dropped rows ({got} != K={dims.k_of(proj)})"
+                k_offset=k1,
+                weights=src[:, :, k1 : k1 + k0].contiguous(),
+                calib=band_calib(cold_ti, "cold"),
+                index=cold_ti,
             )
 
     return PreparedWeights(
         hot=HotStore(
-            gate=hot_bands[Proj.GATE], up=hot_bands[Proj.UP], down=hot_bands[Proj.DOWN]
+            gate=hot_shards[Proj.GATE], up=hot_shards[Proj.UP],
+            down=hot_shards[Proj.DOWN],
         ),
         warm=WarmStore(
-            gate=warm_bands[Proj.GATE], up=warm_bands[Proj.UP], down=warm_bands[Proj.DOWN]
+            gate=warm_shards[Proj.GATE], up=warm_shards[Proj.UP],
+            down=warm_shards[Proj.DOWN],
         ),
         cold=PendingColdTensors(
             gate=cold_bands[Proj.GATE], up=cold_bands[Proj.UP], down=cold_bands[Proj.DOWN]

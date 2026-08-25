@@ -12,8 +12,8 @@ from sglang.srt.layers.moe.prism.weights import WarmBand
 
 
 def _band(e=16, rows=5, n=7):
-    return WarmBand(k_offset=0, weights=torch.arange(e * rows * n, dtype=torch.bfloat16)
-                    .reshape(e, rows, n).pin_memory())
+    return WarmBand.from_band(
+        torch.arange(e * rows * n, dtype=torch.bfloat16).reshape(e, rows, n).pin_memory())
 
 
 @pytest.fixture

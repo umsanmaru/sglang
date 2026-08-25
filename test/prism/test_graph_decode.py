@@ -68,10 +68,8 @@ def test_stage_from_device_bitwise():
         device=torch.device("cuda"),
     )
     res = ExecutionResources(spec)
-    band = WarmBand(
-        k_offset=0,
-        weights=torch.arange(32 * 8 * 8, dtype=torch.bfloat16)
-        .reshape(32, 8, 8).pin_memory(),
+    band = WarmBand.from_band(
+        torch.arange(32 * 8 * 8, dtype=torch.bfloat16).reshape(32, 8, 8).pin_memory()
     )
     s = torch.cuda.Stream()
     ref = torch.zeros(spec.n_slots, 8, 8, dtype=torch.bfloat16, device="cuda")
