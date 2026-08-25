@@ -286,6 +286,85 @@ def test_graph_path_distinguishes_position_from_id(monkeypatch):
     )
 
 
+# ── 5. Task 5: worklist bs>1 캡처/재생 ───────────────────────────────────
+
+@cuda_required
+@pytest.mark.parametrize("m", [1, 4])
+def test_capture_replay_worklist_bs(m):
+    """worklist plan은 bs>1도 캡처·재생 가능 — replay가 그 시점 topk를 반영.
+
+    test_capture_replay_matches_eager와 동형(같은 워밍업·캡처·버퍼-교체
+    절차)이되 plan을 worklist(gemv_worklist)로, 입력 m을 파라미터화한다.
+    비교 기준은 (기존 bs=1 테스트와 동일하게) **같은 executor·같은
+    worklist plan**의 eager 출력이다 — graph replay와 eager가 같은 커널·
+    같은 라운딩 경로를 타므로(worklist-vs-worklist) tolerance가 아니라
+    bitwise(torch.equal)가 성립해야 한다. exact=True 입력은 브리프 지정
+    그대로 유지(gu/cold 경로를 결정적으로 만들어 신호 대 잡음비를 높임)."""
+    plan = make_plan("three_tier", gpu_warm="gemv_worklist")
+    w13, w2 = make_weights(exact=True)
+    toggle = _Toggle()
+    ex = build_executor(plan, w13, w2, capture_mode_fn=toggle)
+
+    x0, ids0, w0 = make_inputs(m=m, exact=True)
+    x_buf, ids_buf, w_buf = x0.cuda(), ids0.cuda(), w0.cuda()
+
+    toggle.on = True
+    g, out_buf = _warmup_and_capture(ex, x_buf, ids_buf, w_buf)
+
+    for seed in (1, 2):
+        x, ids, w = make_inputs(m=m, exact=True, seed=seed)
+        x_buf.copy_(x.cuda())
+        ids_buf.copy_(ids.cuda())
+        w_buf.copy_(w.cuda())
+        g.replay()
+        torch.cuda.synchronize()
+        got = out_buf.cpu().clone()
+
+        toggle.on = False
+        ref = ex.run_layer(0, x_buf, ids_buf, w_buf).cpu()
+        toggle.on = True
+        assert torch.equal(got, ref), (
+            f"m={m} seed {seed}: max abs diff "
+            f"{(got.float() - ref.float()).abs().max().item()}"
+        )
+
+
+@cuda_required
+def test_qlen_pins_graph_isolated_per_bs():
+    """bs별 qlen pin이 서로/eager와 격리 — Finding A(328ms/tok stale pin)의
+    worklist(M>1) 일반화. force_graph_path=True로 m=1, m=4를 같은
+    executor에서 연달아 실행해 두 bs의 pin이 각자 자기 값을 유지하고
+    서로 다른 주소를 가리키는지 직접 확인한다.
+
+    plan은 브리프 원안의 "three_tier"(cold 포함) 대신 cold가 없는
+    "all_hot"을 쓴다 — `_qlen_pins_graph` 격리는 `_plan_flow`의 순수
+    host-side 북키핑이라 cold 유무와 무관하게 성립하는 불변식이고
+    (`_plan_flow`의 pin 할당/조회는 `has_cold` 분기보다 앞서 무조건
+    실행된다), 실측으로 cold(KtColdBackend/CPUInfer WorkerPool)를 이 위치
+    (force_graph_path로 **실캡처 없이** cold submit을 태우는 경로, m>1)에서
+    이 프로세스 안의 비-첫 backend로 생성하면 이 스위트 안에서 100%
+    재현되는 kt_kernel 네이티브 크래시/행(`tpp.c:83
+    __pthread_tpp_change_priority` glibc assert 또는 WorkerPool 생성 중
+    행)를 만난다 — RLIMIT_RTPRIO=0인 이 컨테이너에서 실캡처 없이(=
+    프로덕션 CudaGraphRunner는 절대 밟지 않는, force_graph_path 전용
+    테스트/디버그 경로) cold host-callback을 처음 태우는 backend가
+    프로세스 내 두 번째 이상일 때만 터진다(실측: 동일 시나리오를 순수
+    파이썬 스크립트로 실행하면 재현되지 않음 — pytest 세션 특유의
+    스레드/시그널 상태 차이로 보인다). all_hot도 여전히 gemv_worklist
+    hot 커널을 실경로로 태우므로 M<=32 worklist force_graph_path 자체의
+    검증력은 그대로 유지된다."""
+    plan = make_plan("all_hot", gpu_warm="gemv_worklist")
+    w13, w2 = make_weights(exact=True)
+    ex = build_executor(plan, w13, w2, force_graph_path=True)
+    for m in (1, 4):
+        x, ids, tw = make_inputs(m=m, exact=True)
+        ex.run_layer(0, x.cuda(), ids.cuda(), tw.cuda())
+    assert set(ex._qlen_pins_graph) >= {1, 4}
+    assert int(ex._qlen_pins_graph[1][0]) == 1
+    assert int(ex._qlen_pins_graph[4][0]) == 4
+    assert ex._qlen_pins_graph[1].data_ptr() != ex._qlen_pins_graph[4].data_ptr()
+
+
 @cuda_required
 def test_capture_mode_fn_routes_graph_path():
     """주입된 capture_mode_fn이 True를 돌리면 강제(force_graph_path)나 실제
