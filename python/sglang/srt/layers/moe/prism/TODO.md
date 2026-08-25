@@ -4,7 +4,59 @@ P0에서 결정만 해두고 구현을 미룬 항목들. 각 항목은 "왜 미�
 "구현 시 건드릴 곳"을 함께 기록한다. (P0 범위 자체는 CONTRACTS.md와
 커밋 계획 참조)
 
-## warm 전송 ping-pong (그룹 루프 전송 노출 해소)
+## grouped GEMM prefill (worklist 대비 1.7배 회수)
+
+- **현상**: prefill이 decode와 같은 pair-native worklist GEMV를 탄다 (2026-08-25,
+  S6). 실측으로 bmm 경로 대비 **1.6~1.9배**다 (35B gate 치수, M=1024~4096:
+  worklist 0.98/3.87 ms vs bmm 0.52/2.28 ms). worklist는 라우팅된 pair만
+  계산하는데(bmm은 그룹의 전 (토큰, expert) 쌍) 처리량이 1/4이라 나온 값이고,
+  원인은 GEMV라 tensor core를 못 타는 것이다.
+- **왜 감수했나**: bmm은 **가변 per-expert K를 원리적으로 표현할 수 없다**
+  (연속 배치 축 = 배치당 K 하나). 폴백으로 남겨도 이 스키마의 plan을 실행하지
+  못하는 경로일 뿐이라, 경로를 하나로 합치고 prefill이 인덱스를 지원하게 하는
+  쪽을 택했다.
+- **구현**: 토큰을 expert로 묶어(topk argsort) `x[tokens_e][:, idx_e]`를 gather한
+  뒤 expert별 GEMM. kt의 prefill 구조(`m_local_pos_` 장부)와 같은 모양이고, GPU
+  쪽에서는 grouped/segmented GEMM 커널이 제 형태다. expert별 `torch.mm` 루프는
+  정확하지만 launch가 E×proj×layer로 늘어 별도 실측이 필요하다.
+- **선행 판단**: prefill의 GPU 티어 시간이 prefill 전체(cold 지배)에서 차지하는
+  비율을 먼저 재야 한다. 1.7배가 전체의 몇 %인지 모르는 채로 커널을 쓰는 것은
+  이르다.
+- **건드릴 곳**: `tiers.py`(세 번째 구현 — Protocol은 그대로), `executor.py`의
+  `_run_gateup`/`_run_down` 디스패치. 커널 신규.
+
+## 인덱스 전환 — 남은 작업 (2026-08-25)
+
+sglang 쪽은 S6까지 끝났다 (인덱스 표현 → 커널 → 로더 → executor). 남은 것:
+
+1. **kt 쪽 K3~K5** — `KIndex` + per-expert 접근자, gather-to-dense, dual-pack.
+   목록과 line ref는 kt `doc/prism-partial-entrypoints.md` §10.
+2. **S7 결합** — `cold_backend`가 인덱스를 kt에 주입. 현재 cold는 밴드 기하로
+   남아 있고(`ColdBand.index`가 동행만 한다), `weights.py`가 비밴드 cold plan을
+   `NotImplementedError`로 거부한다. K3~K5가 끝나야 풀린다.
+3. **calib gather** — `wn`/`pair_dot`을 인덱스로 gather (지금은 밴드 절단).
+   소비자가 cold뿐이라 2번과 같이 간다.
+4. **S9 셔플 자산** — 자산 생성기 + 로더(`index.py`의 `from_rows`가 입구) +
+   **셔플 인덱스에서의 정수 비트일치**. 인덱스 시대의 exact 검출기이고, 지금까지의
+   모든 검증은 "연속 인덱스 = 밴드"라는 퇴화형 위에서만 돌았다.
+5. **타일 클러스터링** — cold 인덱스를 "같이 죽는 행끼리" 정렬해
+   `avx_kernel_4_sparse`의 타일 통째 skip(`mask == 0`)을 발화시키는 순열 최적화.
+   keep 0.47에서 랜덤 배치의 발화 확률은 4×10⁻⁵라 지금은 죽은 코드다. 정확성에
+   영향이 없고(순열일 뿐) GPU 쪽 대가도 없다 (셔플이 공짜임은 실측).
+
+## 테스트 위생 — CPUInfer 스레드 누적
+
+`test_executor.build_executor`가 호출마다 `KtColdBackend`를 새로 만들고, 기본
+`cpuinfer_threads=60`이다. 테스트가 늘수록 스레드풀이 쌓여 스위트가 느려진다
+(2026-08-25에 신규 테스트 하나가 스위트를 타임아웃 근처로 밀었다). 픽스처
+스코프를 올려 CPUInfer를 공유하면 된다.
+
+## ~~warm 전송 ping-pong~~ — **폐기** (2026-08-25)
+
+warm은 전송되지 않는다 (제자리 UVA 읽기). arena도 그룹 루프도 없어졌으므로
+ping/pong 할 대상이 존재하지 않는다. 아래는 폐기 시점의 기록.
+
+### (기록) 그룹 루프 전송 노출 해소
 
 - **현상**: distinct expert > n_slots이면 executor가 n_slots 단위 그룹
   직렬 루프를 돈다. 직렬이라 그룹 g+1의 stage 전송이 그룹 g의 GEMM 뒤에
@@ -57,7 +109,7 @@ eager decode도 함께 해제 (qlen ≤ max_len 범위 guard로 대체). 테스�
 decode/prefill 파라미터화 (중복 expert 필연 구성 + 정수 비트일치가 좌표
 뒤섞임 검출) + 불균등 shard × prefill 조합.
 
-## ~~stage 일괄화 (H2D 26→3/층)~~ — ✅ 완료 (2026-08-21)
+## ~~stage 일괄화 (H2D 26→3/층)~~ — 완료 후 **폐기** (2026-08-25: stage 자체가 사라짐)
 
 NVTX 실측(2026-08-20)에서 slot당 `copy_` 산란이 층당 H2D 26조각 + dispatch를
 만들어 ~1.4ms/층의 오버헤드였다. `BatchedCopyStager`(host `index_select`로
@@ -65,7 +117,7 @@ NVTX 실측(2026-08-20)에서 slot당 `copy_` 산란이 층당 H2D 26조각 + di
 `select_stager`의 eager 기본값이 됐다. 등가성은 `PerSlotCopyStager` 대비
 bitwise(`torch.equal`)로 검증 (test/prism/test_stagers.py).
 
-## ~~graph bs=1 (GatherKernelStager)~~ — ✅ 완료 (2026-08-21)
+## ~~graph bs=1 (GatherKernelStager)~~ — 완료 후 **폐기** (2026-08-25: bs 제약도 stager도 사라짐)
 
 `GatherKernelStager.stage_from_device`(sel을 device 상주 topk_ids 슬라이스에서
 직접 취함 — host copy/H2D/guard 전부 없음)와 cold submit/sync의 stream 통합
@@ -115,9 +167,8 @@ graph bs=1로 "산란 dispatch"와 "S1 host 블록"이라는 두 개의 오버�
   방식 (위 "다음 후보 순위" 3번).
 - **cold-down deferral**: down partial의 1-layer 지연 합류 (kt deferral
   기계 재사용). Phase 2 노출 해소책.
-- ~~C++ dual-pack (gate ≠ up K-밴드)~~ — **폐기** (2026-08-20 사용자 결정:
-  gate/up은 K·N 모두 공유, 풀 계획 없음). gate==up 검증은 영구 제약으로
-  cold 로드에 유지. 스키마의 독립 표현력과 로더의 처리 능력은 공짜
+- **C++ dual-pack (gate ≠ up)** — 2026-08-20에 폐기했다가 **2026-08-25에 부활**
+  (gate/up 인덱스 독립 결정). kt A 풀이 2배가 된다 — kt doc §10.3. 스키마의 독립 표현력과 로더의 처리 능력은 공짜
   일반성이라 남겨둠 (계약 아님).
 - **티어당 다중 밴드 / hot-warm-cold interleave**: 스키마·검증은 이미 허용
   (validate_static은 disjoint+커버만 요구, 티어 순서·횟수 무제한).
@@ -132,7 +183,8 @@ graph bs=1로 "산란 dispatch"와 "S1 host 블록"이라는 두 개의 오버�
   skip, warm_tier.cc:264 warm gather). 비용 = activation gather O(m×k_tier)
   뿐(weight는 로드 타임 pre-slice), decode m≤8에선 무시 가능. 우리 slice는
   연속-인덱스 퇴화형이므로 "연속이면 slice, 아니면 gather" 디스패치로 확장.
-- **warm GEMM 커널 교체: torch_bmm → persistent GEMV**: torch_bmm은
+- ~~**warm GEMM 커널 교체: torch_bmm → persistent GEMV**~~ — ✅ 완료
+  (worklist GEMV + 인덱스 변형; bmm은 2026-08-25에 삭제): torch_bmm은
   정확성 기준선용 placeholder다. 알려진 placeholder 한계 — ① x를 전
   expert에 broadcast하므로 라우팅 안 된 (토큰, expert) 쌍까지 계산
   (prefill에서 낭비 큼), ② 전역 matmul 플래그 저장/복원이 커널 안에
@@ -141,10 +193,9 @@ graph bs=1로 "산란 dispatch"와 "S1 host 블록"이라는 두 개의 오버�
   kernels.cu 연장)는 device worklist를 네이티브로 소화해 ①③을 없애고
   가변 k_warm도 공짜 — 교체는 registry 한 줄 (`WarmGemmFn` 계약 유지,
   단 다중 밴드 시 k_offset 인자 진화는 위 interleave 항목 참조).
-- **가변 k_warm[e]**: calibration 산출 밴드. loader의 균일성 요구 제거
+- ~~**가변 k_warm[e]**~~ — ✅ 완료 (2026-08-25, flat + offset). 원문: loader의 균일성 요구 제거
   (offset 테이블 store) + warm GEMM을 persistent GEMV로 교체 (위 항목).
-- **pinned store NUMA 바인딩**: kt-kernel에 set_memory_to_numa 노출 추가
-  후 numa.py에 연결 (현재는 first-touch 방임).
+- ~~**pinned store NUMA 바인딩**~~ — ✅ 완료 (2026-08-25, libnuma 직접 + 배치 검증).
 - ~~**hot tier**~~ — **완료** (2026-08-24). HotBand/HotStore + loader VRAM
   배치(`prepare_layer_weights(device=)`) + executor hot 경로(stager·arena
   없이 `index_select` → 같은 warm GEMM). 검증: 3-tier 재조립 bitexact,
