@@ -234,6 +234,7 @@ class PrismMoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2, extra_weight_attrs)
 
     def process_weights_after_loading(self, layer) -> None:
+        from sglang.srt.layers.moe.prism.numa import gpu_numa_node
         from sglang.srt.layers.moe.prism.plan import Proj, Tier
         from sglang.srt.layers.moe.prism.weights import prepare_layer_weights
 
@@ -249,11 +250,16 @@ class PrismMoEMethod(FusedMoEMethodBase):
             w13 = w13.cpu()
         if w2.is_cuda:
             w2 = w2.cpu()
-        # hot 밴드는 이 device에 상주한다 — 로더가 배치까지 끝낸다 (계약 ③).
+        # hot 밴드는 이 device에, warm pinned store는 그 GPU의 PCIe root와 같은
+        # NUMA 노드에 상주한다 — 둘 다 로더의 입력이고 여기가 결정 지점이다
+        # (계약 ③). 원격 소켓 warm은 UVA 읽기에 소켓 간 홉을 추가해 warm의
+        # 존립 근거를 무너뜨리는데, 결과는 정확하고 느리기만 해서 어떤 테스트도
+        # 잡지 못한다 — 그래서 로더가 배치 후 실제 노드를 검증하고 즉사한다.
         device = torch.device(torch.cuda.current_device())
         prepared = prepare_layer_weights(
             self.layer_id, w13, w2, runtime.plan,
             calib=runtime.calib, device=device,
+            warm_node=gpu_numa_node(device),
         )
         ep = runtime.plan.expert(self.layer_id, 0)
         if any(ep.proj(p).has_tier(Tier.COLD) for p in Proj):

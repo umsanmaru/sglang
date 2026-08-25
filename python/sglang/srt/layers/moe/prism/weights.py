@@ -47,6 +47,7 @@ from typing import Mapping, Optional
 import torch
 
 from sglang.srt.layers.moe.prism.calib import CalibBand, CalibTables
+from sglang.srt.layers.moe.prism.numa import alloc_pinned_on_node
 from sglang.srt.layers.moe.prism.plan import (
     ExpertProjPlan,
     Plan,
@@ -193,6 +194,7 @@ def prepare_layer_weights(
     calib: Optional[CalibTables] = None,
     pin_memory: bool = True,
     device: Optional[torch.device] = None,
+    warm_node: Optional[int] = None,
 ) -> PreparedWeights:
     """한 레이어의 full weight를 Plan대로 절단·변환·배치한다.
 
@@ -203,6 +205,10 @@ def prepare_layer_weights(
     있으면 마스킹이 조용히 사라지거나 테이블이 버려지므로 즉사한다.
 
     pin_memory=False는 CUDA 없는 테스트용 탈출구다.
+    warm_node는 warm pinned store가 상주해야 하는 NUMA 노드다 — hot의 device와
+    같은 급의 **로더 입력**이고(계약 ③), 값을 정하는 것은 조립 지점의 몫이다
+    (method.py가 gpu_numa_node로 GPU의 PCIe root 소켓을 읽어 넘긴다). None이면
+    바인딩 없음 = 할당 스레드가 어디 떠 있었느냐에 달린 운.
     device는 HOT 밴드가 있을 때만 필요하다 (없으면 요구하지 않는다 — CPU
     전용 테스트가 hot 없는 plan으로 계속 돌 수 있어야 하므로).
     """
@@ -271,8 +277,12 @@ def prepare_layer_weights(
         else:
             # [E, N, k] → GEMM-ready [E, k, N], pinned
             sliced = src[:, :, warm.start : warm.end].transpose(1, 2)
-            store = torch.empty(
-                sliced.shape, dtype=w13.dtype, pin_memory=pin_memory
+            store = (
+                alloc_pinned_on_node(
+                    sliced.shape, w13.dtype, warm_node, f"{where} warm store"
+                )
+                if pin_memory
+                else torch.empty(sliced.shape, dtype=w13.dtype)
             )
             store.copy_(sliced)
             warm_bands[proj] = WarmBand(
