@@ -65,6 +65,23 @@ struct SparseArgs {
   int ng, renorm_it;
 };
 
+// 블록 하나가 맡는 출력 열 수. 커널의 `NCOL`, blockDim.x(= kNCol/V),
+// grid.x(= ceil(n_cols/kNCol)) 셋이 **같은 값**이어야 하므로 정의점을 하나로 둔다
+// (어긋나면 블록이 남의 열을 계산하는 조용한 오답이다).
+//
+// 64는 임의값이 아니다: **캐시라인을 꽉 채우는 가장 작은 값**이다.
+// `kNCol × 2 B = 128 B`. 스레드/블록이 `kNCol/V × 4V = 4·kNCol`이라 블록 수와
+// 정확히 상쇄되어 **warp 총량은 kNCol과 무관**하고, 남는 변수는 둘뿐이다:
+//   1. warp의 연속 run이 128 B 라인을 꽉 채우는가 — 32면 run이 64 B라 라인을
+//      절반만 쓰고 버려 같은 바이트에 라인 요청이 2배가 된다 (실측 hot 레이어
+//      47.0 → 50.4, warm gateup 30.4 → 33.8).
+//   2. 그 warp들이 몇 SM에 퍼지는가 — outstanding 요청 한계가 SM당이므로 블록이
+//      적으면 손해다. 128/256으로 키우면 블록이 48/24로 줄어 warm이 30.4 →
+//      32.9 → 39.1로 단조 악화한다 (2026-08-26 실측).
+// 그래서 bf16에서는 64가 두 힘의 최적점이다. dtype이 바뀌면(fp8 등) 이 값도
+// 라인 크기에 맞춰 다시 정해야 한다.
+constexpr int kNCol = 64;
+
 template <typename IdxT, bool INDEXED, int V, bool SPARSE>
 __global__ void prism_gemv_worklist(
     const __nv_bfloat16* __restrict__ x,
@@ -92,7 +109,7 @@ __global__ void prism_gemv_worklist(
   // 블록의 열 타일은 V와 무관하게 64로 고정한다. V를 키우면 blockDim이
   // (64/V, 4V)로 재배치되므로 **블록 수와 타일 기하가 불변**이다 — 단순히
   // 열을 V배 맡게 하면 grid.x가 1/V로 붕괴한다 (gate는 N=512, V=8에서 8블록).
-  constexpr int NCOL = 64;
+  constexpr int NCOL = kNCol;
   constexpr int NY = 4 * V;  // = blockDim.y
   const long long n0 = static_cast<long long>(blockIdx.x) * NCOL +
                        static_cast<long long>(threadIdx.x) * V;
@@ -285,7 +302,7 @@ inline void launch_gemv_worklist(
     int64_t out_row, int64_t out_col_offset, int64_t top_k, int x_row_is_pair,
     const SparseArgs& sp) {
   using namespace host;
-  const dim3 block(64 / V, 4 * V);  // 블록당 열 타일 64 고정 (커널 주석 참조)
+  const dim3 block(kNCol / V, 4 * V);  // 열 타일은 kNCol (커널 주석 참조)
   if (is_type<int32_t>(topk.dtype())) {
     LaunchKernel(grid, block, device)(
         prism_gemv_worklist<int32_t, INDEXED, V, SPARSE>, x,
@@ -371,7 +388,7 @@ inline void gemv_worklist_impl(
 
   const DLDevice device = cuda_device.unwrap();
   const dim3 block(64, 4);
-  const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(64))),
+  const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(kNCol))),
                   static_cast<unsigned int>(m * top_k));
 
   // 밴드 경로는 V=1 고정 — 인덱스 전환과 함께 폐기될 경로라 건드리지 않는다.
@@ -492,7 +509,7 @@ inline void gemv_worklist_indexed_impl(
 
   const DLDevice device = cuda_device.unwrap();
   const dim3 block(64, 4);
-  const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(64))),
+  const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(kNCol))),
                   static_cast<unsigned int>(m * top_k));
 
 #define PRISM_LAUNCH_INDEXED(V, SP)                                          \
