@@ -90,6 +90,9 @@ def main() -> None:
                    help="마스킹 없이 (sparse 커널 대신 dense 커널) — 절감 기준선")
     p.add_argument("--with-staging", action="store_true",
                    help="combined에 x/가중 D2H + partial H2D 포함 변형 추가")
+    p.add_argument("--no-fused", action="store_true",
+                   help="gateup을 융합하지 않고 2회 launch로 측정 (비교용). 기본은 "
+                        "executor와 같은 융합 경로다")
     p.add_argument("--check", action="store_true",
                    help="합성 마스크 레퍼런스와 두 커널 출력을 대조")
     p.add_argument("--shuffle-index", action="store_true")
@@ -127,7 +130,7 @@ def main() -> None:
                 [g.strip() for g in a.groups.split(",") if g.strip()],
                 reps=a.reps, replays=a.replays, with_staging=a.with_staging,
                 only=([s.strip() for s in a.only.split(",")] if a.only else None),
-                do_check=a.check)
+                do_check=a.check, fused=not a.no_fused)
     except ValueError as e:
         raise SystemExit(str(e))
     emit(payload, a.out)

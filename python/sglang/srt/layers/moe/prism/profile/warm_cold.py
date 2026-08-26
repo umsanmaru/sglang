@@ -414,7 +414,8 @@ class WarmColdProfiler:
 
     def measure(self, group: str = "gateup", *, reps: int = 100,
                 replays: int = 20, with_staging: bool = False,
-                only: Optional[Sequence[str]] = None) -> GroupReport:
+                only: Optional[Sequence[str]] = None,
+                fused: bool = True) -> GroupReport:
         """group의 변형들을 잰다. `only`를 주면 그 변형만 돈다 — nsys 트레이스를
         한 변형으로 좁히려면 나머지가 타임라인에 없어야 한다 (전부 돌리면 커널이
         이름 없이 섞인다)."""
@@ -459,7 +460,28 @@ class WarmColdProfiler:
         st.fill_topk_w(topk_w_dev)
         w_ptr = st.topk_w_ptr() if masking else 0
 
+        # gateup을 **시스템과 같은 형태로** 발행한다: executor는 gate와 up을 한
+        # 커널로 보낸다 (`tiers.SparsePinnedGateUp`). 두 번 launch해서 재면
+        # 시스템보다 비싼 값이 나온다 — 실측 31.7 vs 22.8 µs. `fused=False`로
+        # 옛 경로를 재서 그 차이를 볼 수 있다. 융합 진입점이 (pinned, sparse)
+        # 조합에만 있으므로 dense(prefill) 경로는 자동으로 2 launch다.
+        fuse_now = fused and group == "gateup" and masking
+        fused_fn = None
+        if fuse_now:
+            from sglang.jit_kernel.prism_gemv import (
+                gemv_worklist_indexed_pinned_sparse_gateup,
+            )
+            fused_fn = gemv_worklist_indexed_pinned_sparse_gateup
+
         def warm_launch(i: int) -> None:
+            if fused_fn is not None:
+                wg, wu = warm["gate"], warm["up"]
+                fused_fn(x, ids_dev[i], topk_w_dev,
+                         wg.w_flat, wg.row_off, wg.k_index,
+                         wu.w_flat, wu.row_off, wu.k_index,
+                         out, wg.spec, wu.spec, 0, shape.inter, False,
+                         torch.cuda.current_stream())
+                return
             for proj in projs:
                 warm[proj].launch(x, ids_dev[i], topk_w_dev, out, cols[proj],
                                   masking=masking)
@@ -564,7 +586,7 @@ class WarmColdProfiler:
                 topk * cold.rows_of(p) * shape.n_cols(p) * 2 for p in projs),
             "warm_keep_frac": round(warm[projs[0]].keep_frac, 4),
             "cold_keep_frac": round(cold.keep_frac[projs[0]], 4),
-            "reps": reps, "replays": replays,
+            "reps": reps, "replays": replays, "warm_fused": fuse_now,
         }
         return GroupReport(group=group, timings=timings, info=info)
 
@@ -652,11 +674,11 @@ class WarmColdProfiler:
     def report(self, groups: Sequence[str] = ("gateup", "down"), *,
                reps: int = 100, replays: int = 20, with_staging: bool = False,
                only: Optional[Sequence[str]] = None,
-               do_check: bool = False) -> dict:
+               do_check: bool = False, fused: bool = True) -> dict:
         results = {}
         for group in groups:
             rep = self.measure(group, reps=reps, replays=replays,
-                               with_staging=with_staging, only=only)
+                               with_staging=with_staging, only=only, fused=fused)
             d = rep.as_dict()
             if do_check:
                 d["check"] = self.check(group)
@@ -679,7 +701,8 @@ class WarmColdProfiler:
 def warm_cold_sparse(shape: Shape, *, groups: Sequence[str] = ("gateup", "down"),
                      reps: int = 100, replays: int = 20,
                      with_staging: bool = False, do_check: bool = False,
-                     only: Optional[Sequence[str]] = None, **kw) -> dict:
+                     only: Optional[Sequence[str]] = None, fused: bool = True,
+                     **kw) -> dict:
     """한 번 쓰고 버리는 편의 함수 — 스토어를 만들고 재고 해제한다.
 
     같은 스토어로 여러 번 질의하려면 `WarmColdProfiler`를 직접 쓴다 (cold 패킹이
@@ -687,7 +710,7 @@ def warm_cold_sparse(shape: Shape, *, groups: Sequence[str] = ("gateup", "down")
     with WarmColdProfiler(shape, **kw) as prof:
         return prof.report(groups, reps=reps, replays=replays,
                            with_staging=with_staging, only=only,
-                           do_check=do_check)
+                           do_check=do_check, fused=fused)
 
 
 def single_expert_warm_cold(hidden: int, inter: int, *, warm_frac: float = 0.125,

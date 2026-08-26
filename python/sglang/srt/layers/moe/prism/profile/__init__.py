@@ -94,6 +94,7 @@ from sglang.srt.layers.moe.prism.profile.hot import (
     ProjGemv,
     dense_gemv,
     hot_dense_gemv,
+    measure_gateup,
     measure_proj,
 )
 from sglang.srt.layers.moe.prism.profile.warm_cold import (
@@ -117,7 +118,7 @@ __all__ = [
     "Shape", "Timing", "ProjGemv", "HotGemvReport", "GroupReport", "Split",
     "ColdCpuReport",
     # 측정 진입점
-    "hot_dense_gemv", "measure_proj", "dense_gemv",
+    "hot_dense_gemv", "measure_proj", "measure_gateup", "dense_gemv",
     "WarmColdProfiler", "warm_cold_sparse", "single_expert_warm_cold",
     "ColdCpuProfiler", "cold_cpu", "cold_cpu_sweep",
     # 구성 요소 (직접 조립할 때)

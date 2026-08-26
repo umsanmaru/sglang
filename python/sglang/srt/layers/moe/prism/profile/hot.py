@@ -73,8 +73,17 @@ class HotGemvReport:
 
     @property
     def layer_gemv_us(self) -> Optional[float]:
-        """한 레이어의 GPU dense GEMV 총합 (gate + up + down, up == gate 치수).
-        gate와 down을 다 재지 않았으면 None."""
+        """한 레이어의 GPU dense GEMV 총합.
+
+        `gateup`을 쟀으면 그 값 + down이다 — executor가 gate와 up을 한 커널로
+        발행하므로 그것이 시스템 비용이다. proj별로만 쟀으면 2×gate + down으로
+        떨어지는데, 그 값은 **시스템보다 비싸다** (실측 35.5 vs 17.7 µs).
+        """
+        for label in ("gateup", "gateup_2launch"):
+            try:
+                return round(self.us(label) + self.us("down"), 3)
+            except KeyError:
+                continue
         try:
             return round(2 * self.us("gate") + self.us("down"), 3)
         except KeyError:
@@ -159,8 +168,69 @@ def measure_proj(shape: Shape, proj: str, k_rows: int, *, m: int = 1,
     )
 
 
+def measure_gateup(shape: Shape, k_rows: int, *, m: int = 1, vec: int = 0,
+                   reps: int = 100, replays: int = 20, device=0,
+                   shuffle_index: bool = False, seed: int = 0,
+                   fused: bool = True) -> ProjGemv:
+    """gateup phase를 **시스템과 같은 형태로** 잰다.
+
+    executor는 gate와 up을 한 커널로 발행한다 (`tiers.ResidentGateUp`). 그래서
+    `2 × measure_proj("gate")`는 시스템 비용이 아니다 — 실측 35.5 vs 17.7 µs.
+    `fused=False`로 두면 옛 경로(2 launch)를 재서 그 차이를 볼 수 있다.
+    """
+    from sglang.jit_kernel.prism_gemv import (
+        gemv_worklist_indexed,
+        gemv_worklist_indexed_gateup,
+    )
+
+    dev = select_device(device) if not isinstance(device, torch.device) else device
+    E, topk = shape.experts, shape.topk
+    n = shape.inter
+    axis = shape.hidden
+    if k_rows <= 0 or k_rows > axis:
+        raise ValueError(f"k_rows {k_rows} out of range for axis {axis}")
+
+    def store(tag: int):
+        w = torch.empty(E * k_rows, n, dtype=torch.bfloat16, device=dev)
+        w.normal_(0, 0.02)
+        ro = (torch.arange(E + 1, dtype=torch.int32) * k_rows).to(dev)
+        ki = (tier_index(axis, k_rows, shuffle=shuffle_index, seed=seed + tag)
+              .to(torch.uint16).repeat(E).contiguous().to(dev))
+        return w, ro, ki
+
+    wg, rog, kig = store(0)
+    wu, rou, kiu = store(100)
+    x = torch.empty(m, axis, dtype=torch.bfloat16, device=dev)
+    x.normal_(0, 1.0)
+    out = torch.zeros(m, topk, 2 * n, dtype=torch.bfloat16, device=dev)
+    ids = _ids(shape, m, reps, dev, seed + 1)
+
+    def launch(i: int) -> None:
+        stream = torch.cuda.current_stream()
+        if fused:
+            gemv_worklist_indexed_gateup(x, ids[i], wg, rog, kig, wu, rou, kiu,
+                                         out, 0, n, False, stream, vec)
+        else:
+            gemv_worklist_indexed(x, ids[i], wg, rog, kig, out, 0, False, stream, vec)
+            gemv_worklist_indexed(x, ids[i], wu, rou, kiu, out, n, False, stream, vec)
+
+    try:
+        with nvtx("hot/gateup" + ("" if fused else "/2launch")):
+            timing = graph_timing(launch, reps, replays=replays)
+    finally:
+        del wg, wu, x, out, ids
+        torch.cuda.empty_cache()
+
+    return ProjGemv(
+        proj="gateup" if fused else "gateup_2launch", k_rows=k_rows, n_cols=n,
+        k_axis=axis, m=m, timing=timing,
+        w_bytes_per_launch=2 * m * topk * k_rows * n * 2,
+        w_store_mb=round(2 * E * k_rows * n * 2 / 1e6, 1),
+    )
+
+
 def hot_dense_gemv(shape: Shape, *, hot_frac: float = 1.0,
-                   projs: Sequence[str] = ("gate", "down"),
+                   projs: Sequence[str] = ("gateup", "down"),
                    k_rows: Optional[int] = None, n_cols: Optional[int] = None,
                    m: int = 1, vec: int = 0, reps: int = 100, replays: int = 20,
                    device=0, shuffle_index: bool = False,
@@ -191,12 +261,20 @@ def hot_dense_gemv(shape: Shape, *, hot_frac: float = 1.0,
             device=dev, shuffle_index=shuffle_index, seed=seed, label="raw"))
     else:
         for proj in projs:
-            rows = split_rows(shape.k_axis(proj), hot_frac)
+            axis = (shape.hidden if proj.startswith("gateup")
+                    else shape.k_axis(proj))
+            rows = split_rows(axis, hot_frac)
             if rows == 0:
                 raise ValueError("hot_frac 0은 잴 것이 없다")
-            results.append(measure_proj(
-                shape, proj, rows, m=m, vec=vec, reps=reps, replays=replays,
-                device=dev, shuffle_index=shuffle_index, seed=seed))
+            if proj in ("gateup", "gateup_2launch"):
+                results.append(measure_gateup(
+                    shape, rows, m=m, vec=vec, reps=reps, replays=replays,
+                    device=dev, shuffle_index=shuffle_index, seed=seed,
+                    fused=(proj == "gateup")))
+            else:
+                results.append(measure_proj(
+                    shape, proj, rows, m=m, vec=vec, reps=reps, replays=replays,
+                    device=dev, shuffle_index=shuffle_index, seed=seed))
 
     return HotGemvReport(shape=shape, params=params, results=tuple(results),
                          env=env_stamp(dev))

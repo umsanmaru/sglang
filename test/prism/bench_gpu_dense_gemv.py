@@ -35,8 +35,9 @@ def main() -> None:
     p.add_argument("--inter", type=int, default=768)
     p.add_argument("--hot-frac", type=float, default=1.0,
                    help="K축에서 hot이 소유하는 비율 (기본 1.0 = 전체)")
-    p.add_argument("--projs", default="gate,down",
-                   help="측정할 proj (기본 gate,down — up은 gate와 같은 치수)")
+    p.add_argument("--projs", default="gateup,down",
+                   help="측정할 단위 (기본 gateup,down = executor가 실제로 발행하는 "
+                        "형태). 비교용으로 gateup_2launch, 또는 proj별 gate/up/down")
     p.add_argument("--k", type=int, help="raw 모드: weight 행 수 (proj 치수 대신)")
     p.add_argument("--n", type=int, help="raw 모드: weight 열 수")
     p.add_argument("--m", type=int, default=1, help="토큰 수 (decode=1)")
