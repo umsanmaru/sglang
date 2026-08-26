@@ -63,6 +63,7 @@ from bench_common import (
     add_shape_args,
     emit,
     env_stamp,
+    nvtx,
     graph_stats,
     host_stats,
     select_device,
@@ -295,7 +296,8 @@ def _ids(shape: Shape, reps: int, device, seed: int) -> tuple:
 
 def bench_group(group: str, shape: Shape, warm: dict, cold: ColdTier, res,
                 *, reps: int, replays: int, device, with_staging: bool,
-                masking: bool, qlen_ptr: int) -> dict:
+                masking: bool, qlen_ptr: int,
+                only: Optional[frozenset] = None) -> dict:
     """gateup(gate+up 두 launch, cold 한 번) 또는 down(각각 한 번)의 네 숫자."""
     projs = GROUPS[group]
     topk = shape.topk
@@ -337,13 +339,22 @@ def bench_group(group: str, shape: Shape, warm: dict, cold: ColdTier, res,
         cold.wrapper.sync(stream)
 
     out_stats = {}
-    out_stats["warm_only"] = graph_stats(warm_launch, reps, replays=replays)
+    # `only`가 주어지면 그 변형만 돈다 — nsys 트레이스를 한 변형으로 좁히려면
+    # 나머지가 타임라인에 없어야 한다 (전부 돌리면 커널이 이름 없이 섞인다).
+    def want(name: str) -> bool:
+        return not only or name in only
+
+    if want("warm_only"):
+        with nvtx(f"{group}/warm_only"):
+            out_stats["warm_only"] = graph_stats(warm_launch, reps, replays=replays)
 
     def cold_only(i: int) -> None:
         st.fill_expert_ids(ids_host[i])
         cold_step(i, None)
 
-    out_stats["cold_only"] = host_stats(cold_only, reps, replays=replays)
+    if want("cold_only"):
+        with nvtx(f"{group}/cold_only"):
+            out_stats["cold_only"] = host_stats(cold_only, reps, replays=replays)
 
     def combined(i: int) -> None:
         # graph 경로의 expert_ids 조달: device → pinned async D2H (캡처 가능).
@@ -354,16 +365,27 @@ def bench_group(group: str, shape: Shape, warm: dict, cold: ColdTier, res,
         warm_launch(i)
         cold.wrapper.sync(stream)
 
-    out_stats["combined"] = graph_stats(combined, reps, replays=replays)
+    if want("combined"):
+        with nvtx(f"{group}/combined"):
+            out_stats["combined"] = graph_stats(combined, reps, replays=replays)
 
     def combined_eager(i: int) -> None:
-        st.fill_expert_ids(ids_host[i])
-        submit(qlen_ptr, topk, st.expert_ids_ptr(), cold_in, cold_out, None, w_ptr)
-        warm_launch(i)
-        cold.wrapper.sync(None)
+        # eager 경로의 단계별 구간 — 이 변형이 nsys로 들여다보는 대상이므로
+        # cold submit / warm launch / cold sync를 각각 표시한다. 세 구간의
+        # 폭이 곧 "무엇이 임계경로인가"의 답이다.
+        with nvtx("eager/ids"):
+            st.fill_expert_ids(ids_host[i])
+        with nvtx("eager/cold_submit"):
+            submit(qlen_ptr, topk, st.expert_ids_ptr(), cold_in, cold_out, None, w_ptr)
+        with nvtx("eager/warm_launch"):
+            warm_launch(i)
+        with nvtx("eager/cold_sync"):
+            cold.wrapper.sync(None)
 
-    out_stats["combined_eager"] = host_stats(
-        combined_eager, reps, replays=replays, sync_cuda=True)
+    if want("combined_eager"):
+        with nvtx(f"{group}/combined_eager"):
+            out_stats["combined_eager"] = host_stats(
+                combined_eager, reps, replays=replays, sync_cuda=True)
 
     def combined_eager_latency(i: int) -> None:
         """eager지만 iteration마다 GPU까지 기다린다.
@@ -377,8 +399,10 @@ def bench_group(group: str, shape: Shape, warm: dict, cold: ColdTier, res,
         combined_eager(i)
         torch.cuda.current_stream().synchronize()
 
-    out_stats["combined_eager_latency"] = host_stats(
-        combined_eager_latency, reps, replays=replays)
+    if want("combined_eager_latency"):
+        with nvtx(f"{group}/combined_eager_latency"):
+            out_stats["combined_eager_latency"] = host_stats(
+                combined_eager_latency, reps, replays=replays)
 
     if with_staging:
         def combined_staged(i: int) -> None:
@@ -396,8 +420,9 @@ def bench_group(group: str, shape: Shape, warm: dict, cold: ColdTier, res,
             src = st.gateup_out(1) if group == "gateup" else st.down_out(1)
             src.to(device, non_blocking=True)
 
-        out_stats["combined_staged"] = graph_stats(
-            combined_staged, reps, replays=replays)
+        with nvtx(f"{group}/combined_staged"):
+            out_stats["combined_staged"] = graph_stats(
+                combined_staged, reps, replays=replays)
 
     warm_bytes = sum(topk * warm[p].split.k_warm * warm[p].split.n_cols * 2
                      for p in projs)
@@ -540,6 +565,11 @@ def main() -> None:
                    help="warm pinned 스토어를 둘 NUMA 노드 (기본 GPU 로컬 노드)")
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--dry-run", action="store_true", help="자원 소요만 출력")
+    p.add_argument("--only", default="",
+                   help="쉼표로 구분한 변형만 돈다 "
+                        "(warm_only,cold_only,combined,combined_eager,"
+                        "combined_eager_latency) — nsys 트레이스를 한 변형으로 "
+                        "좁힐 때 쓴다")
     p.add_argument("--out")
     a = p.parse_args()
 
@@ -588,7 +618,9 @@ def main() -> None:
         results[group] = bench_group(
             group, shape, warm, cold, res, reps=a.reps, replays=a.replays,
             device=device, with_staging=a.with_staging, masking=not a.dense,
-            qlen_ptr=qlen_pin.data_ptr())
+            qlen_ptr=qlen_pin.data_ptr(),
+            only=frozenset(v.strip() for v in a.only.split(",") if v.strip())
+            or None)
         if a.check:
             results[group]["check"] = check_masks(
                 group, shape, warm, cold, res, device=device,

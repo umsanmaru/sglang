@@ -30,6 +30,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import platform
@@ -80,6 +81,21 @@ class Shape:
     def as_dict(self) -> dict:
         return {"experts": self.experts, "topk": self.topk,
                 "hidden": self.hidden, "inter": self.inter}
+
+
+
+@contextlib.contextmanager
+def nvtx(name: str):
+    """NVTX 구간 — nsys 타임라인에서 어느 변형/어느 단계인지 구분하는 유일한 표시.
+
+    표시가 없으면 리포트에 네 변형(warm_only/cold_only/combined/eager)이 이름
+    없이 섞여서, 어느 커널이 어느 측정에 속하는지 순서로 추측해야 한다.
+    """
+    torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
 
 
 def add_shape_args(p) -> None:
