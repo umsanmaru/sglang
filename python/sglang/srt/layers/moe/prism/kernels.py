@@ -18,13 +18,13 @@ from __future__ import annotations
 from typing import Tuple
 
 _GPU_WARM_KERNELS: Tuple[str, ...] = ("gemv_worklist", "torch_bmm")
-_CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16",)
+_CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16")
 
 # cold packed 저장의 K축 타일 행 수 — **커널 키가 함의하는 값**이다 (계약 ①:
 # "cold의 저장 형식(pack)은 커널 키가 함의한다 — 별도 codec 필드 없음").
 # plan/자산이 지키는 정렬은 페어(%2)뿐이므로, 로더가 여기까지 올리고 0 행을
 # 채운다. 새 cold 커널은 자기 타일 크기를 여기 등록한다.
-_CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32}
+_CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32}
 
 
 class KernelError(ValueError):
