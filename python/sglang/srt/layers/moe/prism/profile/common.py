@@ -199,6 +199,50 @@ class Timing:
                 "p90_us": self.p90_us, "replays": self.replays}
 
 
+@dataclass(frozen=True)
+class SparseGemv:
+    """[k_rows, n_cols] weight 하나의 **sparse** GEMV 결과.
+
+    dense와 달리 "몇 바이트를 읽었나"가 두 개다 — 마스킹 전(dense_bytes)과 실제로
+    읽은 양(kept_bytes). GB/s를 dense 바이트로 나누면 대역폭이 과대평가되고 kept로
+    나누면 실효값이 나오므로 둘 다 노출한다 (한쪽만 두면 반드시 오독된다).
+    """
+
+    where: str            # "warm" (pinned/UVA) | "cold" (CPU/kt)
+    k_rows: int
+    n_cols: int
+    sparsity: float       # 요청값
+    keep_frac: float      # 실현값 (합성이 정확하므로 요청과 거의 같다)
+    dense_bytes: int
+    timing: Timing
+
+    @property
+    def us(self) -> float:
+        return self.timing.us
+
+    @property
+    def kept_bytes(self) -> int:
+        return int(self.dense_bytes * self.keep_frac)
+
+    @property
+    def gbps(self) -> float:
+        """실효 대역폭 — 실제로 읽은 바이트 기준."""
+        return gbps(self.kept_bytes, self.timing.us)
+
+    @property
+    def gbps_dense(self) -> float:
+        """마스킹 전 바이트 기준. dense 구성과 직접 비교할 때만 의미가 있다."""
+        return gbps(self.dense_bytes, self.timing.us)
+
+    def as_dict(self) -> dict:
+        d = dict(self.timing.as_dict())
+        d.update(where=self.where, k_rows=self.k_rows, n_cols=self.n_cols,
+                 sparsity=self.sparsity, keep_frac=round(self.keep_frac, 4),
+                 dense_bytes=self.dense_bytes, kept_bytes=self.kept_bytes,
+                 gbps=self.gbps, gbps_dense=self.gbps_dense)
+        return d
+
+
 @contextlib.contextmanager
 def nvtx(name: str):
     """NVTX 구간 — nsys 타임라인에서 어느 변형/어느 단계인지 구분하는 유일한 표시.

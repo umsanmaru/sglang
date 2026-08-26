@@ -35,6 +35,7 @@ import torch
 
 from sglang.srt.layers.moe.prism.profile.common import (
     GRID,
+    SparseGemv,
     K_STEP,
     NG,
     PAIR_GROUP,
@@ -739,3 +740,68 @@ def single_expert_warm_cold(hidden: int, inter: int, *, warm_frac: float = 0.125
     return WarmColdProfiler(
         Shape(experts=1, topk=1, hidden=hidden, inter=inter),
         warm_frac=warm_frac, sparsity=sparsity, **kw)
+
+
+def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
+                     reps: int = 100, replays: int = 20, device=0,
+                     mask_pattern: str = "random", seed: int = 0,
+                     warm_node: Optional[int] = None,
+                     x_row_is_pair: bool = False) -> SparseGemv:
+    """[k, n] weight 하나의 warm sparse GEMV — shape과 sparsity만 받는다.
+
+        warm_sparse_gemv(1792, 768, 0.9, device=1).us
+
+    `dense_gemv`의 sparse 짝이다: expert/top_k를 1로 접고, W는 pinned host에 두고
+    GPU가 UVA로 제자리 읽는다 (`gemv_worklist_indexed_pinned_sparse` —
+    `tiers.SparsePinnedGateUp`이 부르는 그 커널). 죽은 페어의 로드를 발행하지
+    않으므로 건너뛴 만큼이 그대로 PCIe 절약이다.
+
+    **주의 — 커널 상한이지 warm 티어 비용이 아니다.** top_k를 1로 접으면
+    (a) 블록이 `ceil(n/64)`뿐이라 SM이 덜 붙고 — outstanding 요청 한계가 SM당이라
+    실측에서 12블록은 PCIe 피크의 9%밖에 못 뽑았다 — (b) pair 블록마다 하던 thr
+    계산이 1회로 줄어 ~17% 낙관적이다. 티어 비용은 `WarmColdProfiler`로 잰다.
+    바이트를 보존해 비교하려면 top_k를 줄인 만큼 `n`을 키우면 된다.
+    """
+    from sglang.jit_kernel.prism_gemv import (
+        gemv_worklist_indexed_pinned_sparse,
+        warmup_jit,
+    )
+
+    from sglang.srt.layers.moe.prism.numa import alloc_pinned_on_node, gpu_numa_node
+    from sglang.srt.layers.moe.prism.profile.common import sparse_tables
+    from sglang.srt.layers.moe.prism.tiers import SparseSpec
+
+    dev = select_device(device)
+    warmup_jit()
+    if k % PAIR_GROUP:
+        raise ValueError(f"k must be even (pair group), got {k}")
+    node = warm_node if warm_node is not None else gpu_numa_node(dev.index or 0)
+
+    w = alloc_pinned_on_node((k, n), torch.bfloat16, node, "warm_sparse_gemv store")
+    w.normal_(0, 0.02)
+    row_off = torch.tensor([0, k], dtype=torch.int32, device=dev)
+    kidx = torch.arange(k, dtype=torch.int32).to(torch.uint16).to(dev)
+    a, c, thr, keep = sparse_tables(1, k, sparsity, pattern=mask_pattern, seed=seed)
+    spec = SparseSpec(a=a.to(dev), c=c.to(dev), thr=thr.to(dev),
+                      p=SPARSITY_P, lam=SPARSITY_LAM, pmax=PMAX, grid=GRID,
+                      ng=NG, renorm_it=RENORM_IT)
+    # x ≡ 1 — sparsity 합성이 x0=x1=1을 전제한다 (common.py의 역산).
+    x = torch.ones(m, k, dtype=torch.bfloat16, device=dev)
+    ids = torch.zeros(m, 1, dtype=torch.int32, device=dev)
+    tw = torch.ones(m, 1, dtype=torch.float32, device=dev)
+    out = torch.zeros(m, 1, n, dtype=torch.bfloat16, device=dev)
+
+    def launch(i: int) -> None:
+        gemv_worklist_indexed_pinned_sparse(
+            x, ids, tw, w, row_off, kidx, out, spec, 0, x_row_is_pair,
+            torch.cuda.current_stream())
+
+    try:
+        with nvtx("warm/sparse_gemv"):
+            timing = graph_timing(launch, reps, replays=replays)
+    finally:
+        del w, x, out
+        torch.cuda.empty_cache()
+
+    return SparseGemv(where="warm", k_rows=k, n_cols=n, sparsity=sparsity,
+                      keep_frac=keep, dense_bytes=m * k * n * 2, timing=timing)

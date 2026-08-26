@@ -39,6 +39,7 @@ import torch
 
 from sglang.srt.layers.moe.prism.profile.common import (
     GRID,
+    SparseGemv,
     K_STEP,
     NG,
     PMAX,
@@ -279,3 +280,38 @@ def cold_cpu_sweep(shape: Shape, experts: Sequence[int], *, iters: int = 100,
         "results": results,
         "env": env_stamp(None),
     }
+
+
+def cold_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, iters: int = 100,
+                     replays: int = 8, mask_pattern: str = "random",
+                     numa_split: float = 0.5, threads: Optional[int] = None,
+                     cpu_kernel: str = "kt_tile_k2_bf16", seed: int = 0,
+                     numa_map: Optional[Sequence[int]] = None) -> SparseGemv:
+    """[k, n] weight 하나의 cold sparse GEMV — shape과 sparsity만 받는다. CUDA 불필요.
+
+        cold_sparse_gemv(1792, 768, 0.9).us
+
+    `warm_sparse_gemv`의 CPU 짝이다: expert/top_k를 1로 접고 kt의 동기 진입점
+    `forward_gateup_partial`을 부른다 (`cold_backend`가 부르는 그 경로). s → thr →
+    점수 → 마스크 → masked GEMV가 전부 C++ 안에서 끝난다.
+
+    **주의 — 이 축약은 warm보다 cold에 훨씬 위험하다.** cold 비용에는 **활성
+    expert당 ~3.9 µs** 항이 있어서(버퍼 carve + BufferA pack + pair mask + plan
+    인코딩) top_k를 8에서 1로 접으면 그만큼이 사라진다. 실측: 같은 바이트에서
+    cold gateup이 260.7 → 36.4 µs였다 (kt eb780a4 이전 측정). 커널 상한을 볼 때만
+    쓰고, 티어 비용은 `ColdCpuProfiler`/`WarmColdProfiler`로 잰다.
+
+    `n`은 커널의 N 정렬을 지켜야 한다 — tile_k2는 노드당 256의 배수를 요구하므로
+    작은 `n`은 `cpu_kernel="kt_amx_bf16"`(32) 또는 `numa_map=[0]`을 쓴다.
+    """
+    if k % K_STEP:
+        raise ValueError(f"k must be a K_STEP({K_STEP}) multiple, got {k}")
+    shape = Shape(experts=1, topk=1, hidden=k, inter=n)
+    with ColdCpuProfiler(shape, cold_frac=1.0, sparsity=sparsity, proj="gateup",
+                         mask_pattern=mask_pattern, numa_split=numa_split,
+                         threads=threads, cpu_kernel=cpu_kernel, seed=seed,
+                         numa_map=numa_map) as prof:
+        rep = prof.measure(iters=iters, replays=replays)
+    return SparseGemv(where="cold", k_rows=k, n_cols=n, sparsity=sparsity,
+                      keep_frac=rep.keep_frac, dense_bytes=k * n * 2,
+                      timing=rep.timing)
