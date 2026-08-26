@@ -215,6 +215,11 @@ class SparseGemv:
     keep_frac: float      # 실현값 (합성이 정확하므로 요청과 거의 같다)
     dense_bytes: int
     timing: Timing
+    # cold 전용. NUMA N 분할은 요청값이 커널의 N 정렬로 **반올림**되므로
+    # (tile_k2는 노드당 256의 배수) 실현된 행 수를 같이 남긴다 — 저장된 JSON이
+    # 어느 분할에서 나온 값인지 스스로 말해야 한다.
+    numa_split: Optional[float] = None
+    node_rows: Optional[tuple] = None
 
     @property
     def us(self) -> float:
@@ -240,6 +245,12 @@ class SparseGemv:
                  sparsity=self.sparsity, keep_frac=round(self.keep_frac, 4),
                  dense_bytes=self.dense_bytes, kept_bytes=self.kept_bytes,
                  gbps=self.gbps, gbps_dense=self.gbps_dense)
+        if self.numa_split is not None:
+            d["numa_split"] = self.numa_split
+            d["node_rows"] = list(self.node_rows or ())
+            d["numa_split_realized"] = (
+                round(self.node_rows[0] / sum(self.node_rows), 4)
+                if self.node_rows else None)
         return d
 
 

@@ -156,8 +156,13 @@ class ColdCpuProfiler:
                     .to(torch.int32).repeat(E).tolist()
 
         align = N_ALIGN[cpu_kernel]
-        gu_off, gu_rows, _ = node_table(I, numa_split, self.nodes, align)
+        gu_off, gu_rows, gu_frac = node_table(I, numa_split, self.nodes, align)
         dn_off, dn_rows, _ = node_table(H, numa_split, self.nodes, align)
+        # 요청값과 실현값을 둘 다 들고 있는다 — 정렬 반올림이 이 둘을 벌린다.
+        self.numa_split = numa_split
+        self.node_gateup_rows = tuple(gu_rows)
+        self.node_gateup_frac = gu_frac
+        self.node_down_rows = tuple(dn_rows)
         cfg.partial.node_gateup_n_offset = gu_off
         cfg.partial.node_gateup_n_rows = gu_rows
         cfg.partial.node_down_n_offset = dn_off
@@ -312,6 +317,8 @@ def cold_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, iters: int = 100,
                          threads=threads, cpu_kernel=cpu_kernel, seed=seed,
                          numa_map=numa_map) as prof:
         rep = prof.measure(iters=iters, replays=replays)
+        rows = prof.node_gateup_rows   # proj="gateup" 고정
     return SparseGemv(where="cold", k_rows=k, n_cols=n, sparsity=sparsity,
                       keep_frac=rep.keep_frac, dense_bytes=k * n * 2,
-                      timing=rep.timing)
+                      timing=rep.timing, numa_split=numa_split,
+                      node_rows=rows)
