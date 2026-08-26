@@ -19,6 +19,9 @@ def _jit_prism_gemv_module() -> Module:
             ("gemv_worklist", "gemv_worklist"),
             ("gemv_worklist_pinned", "gemv_worklist_pinned"),
             ("gemv_worklist_indexed", "gemv_worklist_indexed"),
+            ("gemv_worklist_indexed_gateup", "gemv_worklist_indexed_gateup"),
+            ("gemv_worklist_indexed_pinned_sparse_gateup",
+             "gemv_worklist_indexed_pinned_sparse_gateup"),
             ("gemv_worklist_indexed_pinned", "gemv_worklist_indexed_pinned"),
             ("gemv_worklist_indexed_sparse", "gemv_worklist_indexed_sparse"),
             ("gemv_worklist_indexed_pinned_sparse",
@@ -139,3 +142,50 @@ def gemv_worklist_indexed_pinned_sparse(x2d, topk_ids, topk_weights, w_flat,
     _sparse_call(module.gemv_worklist_indexed_pinned_sparse, x2d, topk_ids,
                  topk_weights, w_flat, row_off, kidx, out3d, sp,
                  out_col_offset, x_row_is_pair, stream, vec)
+
+
+def gemv_worklist_indexed_gateup(x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
+                                 w_up, row_off_up, kidx_up, out3d,
+                                 out_col_gate, out_col_up, x_row_is_pair,
+                                 stream, vec=0) -> None:
+    """gate와 up을 **한 커널로** 발행한다 (device 상주 W, dense).
+
+    두 proj는 x·topk_ids·출력 버퍼를 공유하고 W·인덱스·출력 열 구간만 다르므로,
+    `blockIdx.z`가 그 셋을 고른다. 얻는 것은 grid.z로 블록이 2배가 되는 것이다 —
+    bs=1의 이 커널은 블록에 굶어 있어(96블록 / 114 SM) 그것이 곧 성능이다.
+    출력 원소당 누산 순서가 불변이라 두 번 launch한 것과 비트일치한다.
+    """
+    module = _jit_prism_gemv_module()
+    with torch.cuda.stream(stream):
+        module.gemv_worklist_indexed_gateup(
+            x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
+            w_up, row_off_up, kidx_up, out3d,
+            int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
+            int(vec))
+
+
+def gemv_worklist_indexed_pinned_sparse_gateup(
+        x2d, topk_ids, topk_weights, w_gate, row_off_gate, kidx_gate,
+        w_up, row_off_up, kidx_up, out3d, sp_gate, sp_up,
+        out_col_gate, out_col_up, x_row_is_pair, stream, vec=0) -> None:
+    """warm의 gate+up 융합 (pinned W, sparse).
+
+    두 proj가 x·topk_ids·라우터 가중·출력 버퍼를 공유하고 점수 재료만 갈린다.
+    예산 스칼라(pmax/grid/ng/renorm_it)는 plan 단위라 슬롯 0의 값을 쓰며, 두
+    spec이 다르면 C++가 아니라 여기서 거절한다 — 공유 전제를 호출부에서 지킨다.
+    """
+    for f in ("pmax", "grid", "ng", "renorm_it"):
+        if getattr(sp_gate, f) != getattr(sp_up, f):
+            raise ValueError(f"gateup fusion requires a shared sparsity budget; "
+                             f"{f} differs ({getattr(sp_gate, f)} vs {getattr(sp_up, f)})")
+    module = _jit_prism_gemv_module()
+    with torch.cuda.stream(stream):
+        module.gemv_worklist_indexed_pinned_sparse_gateup(
+            x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
+            w_up, row_off_up, kidx_up, out3d,
+            sp_gate.a, sp_gate.c, sp_gate.thr,
+            sp_up.a, sp_up.c, sp_up.thr, topk_weights,
+            int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), int(vec),
+            float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
+            float(sp_gate.pmax), float(sp_gate.grid),
+            int(sp_gate.ng), int(sp_gate.renorm_it))

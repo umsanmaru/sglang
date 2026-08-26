@@ -71,7 +71,7 @@ def _nvtx_pop() -> None:
 from sglang.srt.layers.moe.prism.cold_backend import ColdBackend
 from sglang.srt.layers.moe.prism.plan import Plan, Proj, Tier
 from sglang.srt.layers.moe.prism.resources import ExecutionResources
-from sglang.srt.layers.moe.prism.tiers import GpuTier, build_layer_tiers
+from sglang.srt.layers.moe.prism.tiers import LayerTiers, build_layer_tiers
 from sglang.srt.layers.moe.prism.weights import PreparedWeights
 
 
@@ -107,7 +107,7 @@ class PrismExecutor:
         self._force_graph_path = force_graph_path
         self._capture_mode_fn = capture_mode_fn or (lambda: False)
         self._layers: dict[int, PreparedWeights] = {}
-        self._tiers: dict[int, Mapping[tuple, GpuTier]] = {}
+        self._tiers: dict[int, LayerTiers] = {}
         self._layer_has_cold: dict[int, bool] = {}
         self._sparse = plan.sparsity is not None
         # cold task가 나중에 읽는 qlen — 주소 고정 멤버 (계약 ④의 포인터 경유)
@@ -287,19 +287,15 @@ class PrismExecutor:
         """
         parts = []
         for tier in (Tier.HOT, Tier.WARM):
-            tg, tu = tiers.get((Proj.GATE, tier)), tiers.get((Proj.UP, tier))
-            if tg is None and tu is None:
+            gu = tiers.gateup.get(tier)
+            if gu is None:
                 continue
-            # 둘 다 있으면 두 호출이 [:, :, :inter]/[inter:]를 완전히 덮는다.
-            alloc = torch.empty if (tg is not None and tu is not None) else torch.zeros
+            # 두 절반을 다 덮는 구현이면 empty로 족하다 (계약 ② overwrite).
+            alloc = torch.empty if gu.writes_all else torch.zeros
             buf = alloc(m, k, 2 * inter, dtype=torch.bfloat16, device=hidden.device)
             with _nvtx(f"{tier.value}.gu"):
-                if tg is not None:
-                    tg.run(hidden, topk_ids, topk_weights, buf, 0,
-                           x_row_is_pair=False, masking=masking)
-                if tu is not None:
-                    tu.run(hidden, topk_ids, topk_weights, buf, inter,
-                           x_row_is_pair=False, masking=masking)
+                gu.run(hidden, topk_ids, topk_weights, buf, inter,
+                       masking=masking)
             parts.append(buf)
         return parts
 
@@ -310,7 +306,7 @@ class PrismExecutor:
         act2d = act.reshape(m * k, inter)
         parts = []
         for tier in (Tier.HOT, Tier.WARM):
-            td = tiers.get((Proj.DOWN, tier))
+            td = tiers.down.get(tier)
             if td is None:
                 continue
             buf = torch.empty(m, k, h, dtype=torch.bfloat16, device=act.device)

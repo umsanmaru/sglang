@@ -86,19 +86,34 @@ template <typename IdxT, bool INDEXED, int V, bool SPARSE>
 __global__ void prism_gemv_worklist(
     const __nv_bfloat16* __restrict__ x,
     const IdxT* __restrict__ topk,
-    const __nv_bfloat16* __restrict__ w,
+    const __nv_bfloat16* __restrict__ w0,
     __nv_bfloat16* __restrict__ out,
-    const int32_t* __restrict__ row_off,   // INDEXED: [E+1] / else nullptr
-    const uint16_t* __restrict__ kidx,     // INDEXED: [Σ k[e]] / else nullptr
+    const int32_t* __restrict__ row_off0,  // INDEXED: [E+1] / else nullptr
+    const uint16_t* __restrict__ kidx0,    // INDEXED: [Σ k[e]] / else nullptr
     long long x_kx,          // x row 길이 (Kx)
     long long k_offset,      // 비인덱스 경로 전용
     long long k_rows,        // 비인덱스 경로 전용 (expert 공통)
     long long n_cols,        // N
     long long out_row,       // out3d의 마지막 축 길이 (W_row)
-    long long out_off,       // out_col_offset
+    long long out_off0,      // out_col_offset (슬롯 0)
     long long top_k,
     int x_row_is_pair,
-    SparseArgs sp) {
+    // ── 슬롯 1 (gate+up 융합) ───────────────────────────────────────────
+    // blockIdx.z 가 슬롯을 고른다. 융합하지 않는 진입점은 슬롯 0의 값을 그대로
+    // 두 번 넘기고 grid.z=1로 launch하므로 동작이 완전히 같다. 분기는 블록 내
+    // uniform이라 divergence가 없고, 얻는 것은 grid.z로 블록이 2배가 되는 것이다.
+    const __nv_bfloat16* __restrict__ w1,
+    const int32_t* __restrict__ row_off1,
+    const uint16_t* __restrict__ kidx1,
+    long long out_off1,
+    SparseArgs sp0, SparseArgs sp1) {
+  // 슬롯 선택 — 아래 본문은 손대지 않는다 (기존 이름으로 shadow).
+  const bool slot1 = (blockIdx.z != 0);
+  const __nv_bfloat16* const w = slot1 ? w1 : w0;
+  const int32_t* const row_off = slot1 ? row_off1 : row_off0;
+  const uint16_t* const kidx = slot1 ? kidx1 : kidx0;
+  const long long out_off = slot1 ? out_off1 : out_off0;
+  const SparseArgs& sp = slot1 ? sp1 : sp0;
   // 점수는 gather된 activation을 읽으므로 인덱스 경로만이 마스킹을 표현할 수
   // 있다 (밴드 경로는 전환기 잔재다).
   static_assert(!SPARSE || INDEXED, "SPARSE requires the indexed path");
@@ -300,7 +315,11 @@ inline void launch_gemv_worklist(
     const int32_t* row_off, const uint16_t* kidx,
     int64_t x_kx, int64_t k_offset, int64_t k_rows, int64_t n_cols,
     int64_t out_row, int64_t out_col_offset, int64_t top_k, int x_row_is_pair,
-    const SparseArgs& sp) {
+    const SparseArgs& sp,
+    // 슬롯 1 — nullptr이면 슬롯 0을 복제해 grid.z=1 동작이 된다.
+    const __nv_bfloat16* w1 = nullptr, const int32_t* row_off1 = nullptr,
+    const uint16_t* kidx1 = nullptr, int64_t out_col_offset1 = 0,
+    const SparseArgs* sp1 = nullptr) {
   using namespace host;
   const dim3 block(kNCol / V, 4 * V);  // 열 타일은 kNCol (커널 주석 참조)
   if (is_type<int32_t>(topk.dtype())) {
@@ -308,13 +327,17 @@ inline void launch_gemv_worklist(
         prism_gemv_worklist<int32_t, INDEXED, V, SPARSE>, x,
         static_cast<const int32_t*>(topk.data_ptr()), w, out, row_off, kidx,
         x_kx, k_offset, k_rows, n_cols, out_row, out_col_offset, top_k,
-        x_row_is_pair, sp);
+        x_row_is_pair, w1 ? w1 : w, row_off1 ? row_off1 : row_off,
+        kidx1 ? kidx1 : kidx, w1 ? out_col_offset1 : out_col_offset,
+        sp, sp1 ? *sp1 : sp);
   } else {
     LaunchKernel(grid, block, device)(
         prism_gemv_worklist<int64_t, INDEXED, V, SPARSE>, x,
         static_cast<const int64_t*>(topk.data_ptr()), w, out, row_off, kidx,
         x_kx, k_offset, k_rows, n_cols, out_row, out_col_offset, top_k,
-        x_row_is_pair, sp);
+        x_row_is_pair, w1 ? w1 : w, row_off1 ? row_off1 : row_off,
+        kidx1 ? kidx1 : kidx, w1 ? out_col_offset1 : out_col_offset,
+        sp, sp1 ? *sp1 : sp);
   }
 }
 
@@ -419,7 +442,14 @@ inline void gemv_worklist_indexed_impl(
     tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
     tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
     tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
-    int64_t vec, bool w_on_device, const SparseIn* sin) {
+    int64_t vec, bool w_on_device, const SparseIn* sin,
+    // gate+up 융합 (슬롯 1). nullptr이면 단일 슬롯이고 grid.z=1이라 동작 동일.
+    // 두 proj는 x·topk·출력 버퍼를 공유하고 W·인덱스·출력 열 구간만 다르다.
+    const tvm::ffi::TensorView* w_up = nullptr,
+    const tvm::ffi::TensorView* row_off_up = nullptr,
+    const tvm::ffi::TensorView* kidx_up = nullptr,
+    int64_t out_col_offset_up = 0,
+    const SparseIn* sin_up = nullptr) {
   using namespace host;
 
   auto Rx = SymbolicSize{"x_rows"};
@@ -428,6 +458,7 @@ inline void gemv_worklist_indexed_impl(
   auto K = SymbolicSize{"top_k"};
   auto R = SymbolicSize{"total_rows"};
   auto E1 = SymbolicSize{"num_experts_plus_one"};
+  auto R2 = SymbolicSize{"total_rows_up"};  // 융합 슬롯 1의 행 수 (sparse 블록도 본다)
   auto N = SymbolicSize{"n_cols"};
   auto W_row = SymbolicSize{"out_row"};
   auto cuda_device = SymbolicDevice{};
@@ -466,7 +497,7 @@ inline void gemv_worklist_indexed_impl(
                "gemv_worklist_indexed: out cols [", out_col_offset, ",",
                out_col_offset + n_cols, ") out of out width ", out_row);
 
-  SparseArgs sp{};
+  SparseArgs sp{}, sp_up{};
   if (sin != nullptr) {
     auto Ng = SymbolicSize{"sparsity_ng"};
     auto E = SymbolicSize{"num_experts"};
@@ -505,12 +536,57 @@ inline void gemv_worklist_indexed_impl(
     sp.grid = static_cast<float>(sin->grid);
     sp.ng = static_cast<int>(sin->ng);
     sp.renorm_it = static_cast<int>(sin->renorm_it);
+
+    if (sin_up != nullptr) {
+      // 슬롯 1의 점수 재료. proj별로 갈리는 것은 a/c/thr/p/lam **다섯**뿐이고
+      // topk_w(라우터 가중)와 예산 스칼라(pmax/grid/ng/renorm_it)는 공유한다 —
+      // 슬롯 0에서 복사한 뒤 그 다섯만 덮어 공유를 코드로 강제한다.
+      sp_up = sp;
+      TensorMatcher({R2}).with_dtype<float>().with_device(cuda_device).verify(sin_up->a);
+      auto Rp2 = SymbolicSize{"total_pairs_up"};
+      TensorMatcher({Rp2}).with_dtype<float>().with_device(cuda_device).verify(sin_up->c);
+      TensorMatcher({E, Ng}).with_dtype<float>().with_device(cuda_device).verify(sin_up->thr);
+      RuntimeCheck(Rp2.unwrap() * 2 == R2.unwrap(),
+                   "gemv_worklist_indexed_gateup: up pair_dot has ", Rp2.unwrap(),
+                   " entries but the up store has ", R2.unwrap(), " rows");
+      sp_up.a = static_cast<const float*>(sin_up->a.data_ptr());
+      sp_up.c = static_cast<const float*>(sin_up->c.data_ptr());
+      sp_up.thr_tab = static_cast<const float*>(sin_up->thr.data_ptr());
+      sp_up.p = static_cast<float>(sin_up->p);
+      sp_up.lam = static_cast<float>(sin_up->lam);
+    }
+  }
+
+  // 슬롯 1 검증. `E1`과 `N`을 재사용해 **expert 수와 출력 폭이 같음**을 강제하고
+  // (다르면 융합이 성립하지 않는다), 행 수만 별도 기호로 받는다 — gate와 up은
+  // per-expert k가 다를 수 있다 (계약 ①의 dual-pack).
+  const bool fused = (w_up != nullptr);
+  const __nv_bfloat16* w1p = nullptr;
+  const int32_t* row_off1p = nullptr;
+  const uint16_t* kidx1p = nullptr;
+  if (fused) {
+    RuntimeCheck(row_off_up != nullptr && kidx_up != nullptr,
+                 "gemv_worklist_indexed_gateup: up slot needs row_off and kidx");
+    TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(*row_off_up);
+    TensorMatcher({R2}).with_dtype<uint16_t>().with_device(cuda_device).verify(*kidx_up);
+    if (w_on_device) {
+      TensorMatcher({R2, N}).with_dtype<bf16_t>().with_device(cuda_device).verify(*w_up);
+    } else {
+      TensorMatcher({R2, N}).with_dtype<bf16_t>()
+          .with_device<kDLCPU, kDLCUDAHost>().verify(*w_up);
+    }
+    RuntimeCheck(out_col_offset_up >= 0 && out_col_offset_up + n_cols <= out_row,
+                 "gemv_worklist_indexed_gateup: up out cols [", out_col_offset_up,
+                 ",", out_col_offset_up + n_cols, ") out of out width ", out_row);
+    w1p = static_cast<const __nv_bfloat16*>(w_up->data_ptr());
+    row_off1p = static_cast<const int32_t*>(row_off_up->data_ptr());
+    kidx1p = static_cast<const uint16_t*>(kidx_up->data_ptr());
   }
 
   const DLDevice device = cuda_device.unwrap();
-  const dim3 block(64, 4);
   const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(kNCol))),
-                  static_cast<unsigned int>(m * top_k));
+                  static_cast<unsigned int>(m * top_k),
+                  fused ? 2u : 1u);
 
 #define PRISM_LAUNCH_INDEXED(V, SP)                                          \
   launch_gemv_worklist<true, V, SP>(                                         \
@@ -521,7 +597,9 @@ inline void gemv_worklist_indexed_impl(
       static_cast<const int32_t*>(row_off.data_ptr()),                       \
       static_cast<const uint16_t*>(kidx.data_ptr()),                         \
       x_kx, 0, 0, n_cols, out_row, out_col_offset, top_k,                    \
-      static_cast<int>(x_row_is_pair), sp)
+      static_cast<int>(x_row_is_pair), sp,                                   \
+      w1p, row_off1p, kidx1p, out_col_offset_up,                          \
+      (sin_up != nullptr) ? &sp_up : nullptr)
 #define PRISM_LAUNCH_INDEXED_V(V)                                            \
   do {                                                                       \
     if (sin != nullptr) PRISM_LAUNCH_INDEXED(V, true);                        \
@@ -560,6 +638,25 @@ void gemv_worklist_indexed(
                              x_row_is_pair, vec, true, nullptr);
 }
 
+// gate+up 융합 (device 상주 W, dense). 두 proj를 한 커널로 발행해 grid.z로
+// 블록을 2배로 만든다 — bs=1에서 이 커널이 블록에 굶는 것이 실측된 병목이다
+// (2026-08-26: 96블록에서 hot gate 17.8 µs, 192블록 프록시 19.7 µs로 2 launch
+// 35.5 µs 대비 1.8배). 출력 원소당 누산 순서는 불변이라 두 번 launch한 것과
+// **비트일치**한다.
+void gemv_worklist_indexed_gateup(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
+    tvm::ffi::TensorView kidx_gate,
+    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
+    tvm::ffi::TensorView kidx_up,
+    tvm::ffi::TensorView out, int64_t out_col_offset_gate,
+    int64_t out_col_offset_up, int64_t x_row_is_pair, int64_t vec) {
+  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                             out_col_offset_gate, x_row_is_pair, vec, true,
+                             nullptr, &w_up, &row_off_up, &kidx_up,
+                             out_col_offset_up);
+}
+
 void gemv_worklist_indexed_pinned(
     tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
     tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
@@ -584,6 +681,32 @@ void gemv_worklist_indexed_sparse(
   const SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
   gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
                              x_row_is_pair, vec, true, &sin);
+}
+
+// gate+up 융합의 warm 짝 (pinned W, sparse).
+void gemv_worklist_indexed_pinned_sparse_gateup(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
+    tvm::ffi::TensorView kidx_gate,
+    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
+    tvm::ffi::TensorView kidx_up,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView a_gate, tvm::ffi::TensorView c_gate,
+    tvm::ffi::TensorView thr_gate,
+    tvm::ffi::TensorView a_up, tvm::ffi::TensorView c_up,
+    tvm::ffi::TensorView thr_up, tvm::ffi::TensorView topk_w,
+    int64_t out_col_offset_gate, int64_t out_col_offset_up,
+    int64_t x_row_is_pair, int64_t vec,
+    double p_gate, double lam_gate, double p_up, double lam_up,
+    double pmax, double grid, int64_t ng, int64_t renorm_it) {
+  const SparseIn sin{a_gate, c_gate, thr_gate, topk_w, p_gate, lam_gate,
+                     pmax, grid, ng, renorm_it};
+  const SparseIn sin_up{a_up, c_up, thr_up, topk_w, p_up, lam_up,
+                        pmax, grid, ng, renorm_it};
+  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                             out_col_offset_gate, x_row_is_pair, vec, false,
+                             &sin, &w_up, &row_off_up, &kidx_up,
+                             out_col_offset_up, &sin_up);
 }
 
 void gemv_worklist_indexed_pinned_sparse(

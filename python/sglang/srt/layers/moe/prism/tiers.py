@@ -204,6 +204,230 @@ _DENSE_IMPL = {Tier.HOT: ResidentTier, Tier.WARM: PinnedDirectTier}
 _SPARSE_IMPL = {Tier.HOT: SparseResidentTier, Tier.WARM: SparsePinnedDirectTier}
 
 
+# ─── phase 단위 티어 (gate+up 융합) ────────────────────────────────────────
+#
+# executor가 도는 축은 (gateup, down)이고 "gate phase"는 존재하지 않는다. 그래서
+# 이 계층의 단위도 phase다: `GateUpRunner` 하나가 한 티어의 gate와 up을 함께
+# 들고, 가능하면 **커널 하나로** 발행한다.
+#
+# 왜 융합이 이득인가: 이 커널의 grid는 `(ceil(N/64), M×top_k)`뿐이라 bs=1에서
+# 블록이 SM 수에 못 미친다 (35B gate: 96블록 / H100 114 SM). gate와 up을 한
+# 커널에 넣으면 grid.z로 블록이 2배가 되고, 그것이 곧 성능이다 — 2026-08-26 실측
+# hot 30.8 → 17.7 µs (1.74배), warm sparse 31.7 → 22.8 µs (1.39배). 출력 원소당
+# 누산 순서가 불변이라 두 번 launch한 것과 **비트일치**한다 (계약 ⑤).
+class GateUpRunner(Protocol):
+    """한 티어의 gateup phase. `out3d`는 [M, k, 2·inter]이고 gate가 앞 절반,
+    up이 뒤 절반이다 (계약 ②의 overwrite 의미론).
+
+    `x_row_is_pair`가 인자에 없는 것은 phase가 그것을 결정하기 때문이다 —
+    gateup의 x는 hidden [M, H]이므로 항상 False다.
+    """
+
+    writes_all: bool   # 두 절반을 모두 덮는가 (아니면 호출자가 0으로 채워야 한다)
+
+    def run(self, x2d: torch.Tensor, topk_ids: torch.Tensor,
+            topk_weights: torch.Tensor, out3d: torch.Tensor, inter: int, *,
+            masking: bool) -> None: ...
+
+
+@dataclass(frozen=True)
+class _GateUpDense:
+    """dense 두 구현의 공통 본체. 갈리는 것은 어느 래퍼냐뿐이다."""
+
+    gate: TierShard
+    up: TierShard
+    writes_all: bool = True
+
+    def _single(self):
+        raise NotImplementedError
+
+    def _fused(self):
+        """융합 래퍼 — 없으면 None (그 조합의 진입점이 아직 없다는 뜻)."""
+        return None
+
+    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking) -> None:
+        stream = torch.cuda.current_stream()
+        fused = self._fused() if _worth_fusing(x2d) else None
+        if fused is not None:
+            fused(x2d, topk_ids,
+                  self.gate.w_flat, self.gate.row_off, self.gate.k_index,
+                  self.up.w_flat, self.up.row_off, self.up.k_index,
+                  out3d, 0, inter, False, stream)
+            return
+        fn = self._single()
+        fn(x2d, topk_ids, self.gate.w_flat, self.gate.row_off, self.gate.k_index,
+           out3d, 0, False, stream)
+        fn(x2d, topk_ids, self.up.w_flat, self.up.row_off, self.up.k_index,
+           out3d, inter, False, stream)
+
+
+@dataclass(frozen=True)
+class _GateUpSparse:
+    """sparse 두 구현의 공통 본체. dense와 갈리는 것은 spec이 더 붙는 것뿐이다."""
+
+    gate: TierShard
+    up: TierShard
+    gate_spec: SparseSpec
+    up_spec: SparseSpec
+    writes_all: bool = True
+
+    def _single(self):
+        raise NotImplementedError
+
+    def _single_dense(self):
+        raise NotImplementedError
+
+    def _fused(self):
+        return None
+
+    def _fused_dense(self):
+        return None
+
+    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking) -> None:
+        stream = torch.cuda.current_stream()
+        if not masking:
+            # prefill은 dense다 (계약 ①). 그 조합의 융합 진입점은 아직 없어서
+            # 2회 launch로 떨어지는데, prefill은 M이 커서 grid.y = M×top_k만으로
+            # 블록이 수천 개라 융합의 이득(블록 배증)이 애초에 없다 — 없는 것을
+            # 안 만든 것이고, 필요해지면 `_fused_dense`에 붙이면 된다.
+            fused = self._fused_dense() if _worth_fusing(x2d) else None
+            if fused is not None:
+                fused(x2d, topk_ids,
+                      self.gate.w_flat, self.gate.row_off, self.gate.k_index,
+                      self.up.w_flat, self.up.row_off, self.up.k_index,
+                      out3d, 0, inter, False, stream)
+                return
+            fn = self._single_dense()
+            fn(x2d, topk_ids, self.gate.w_flat, self.gate.row_off,
+               self.gate.k_index, out3d, 0, False, stream)
+            fn(x2d, topk_ids, self.up.w_flat, self.up.row_off, self.up.k_index,
+               out3d, inter, False, stream)
+            return
+        if topk_weights.dtype is not torch.float32:
+            raise TypeError(
+                f"sparse tier requires fp32 topk_weights, got {topk_weights.dtype}"
+            )
+        fused = self._fused() if _worth_fusing(x2d) else None
+        if fused is not None:
+            fused(x2d, topk_ids, topk_weights,
+                  self.gate.w_flat, self.gate.row_off, self.gate.k_index,
+                  self.up.w_flat, self.up.row_off, self.up.k_index,
+                  out3d, self.gate_spec, self.up_spec, 0, inter, False, stream)
+            return
+        fn = self._single()
+        fn(x2d, topk_ids, topk_weights, self.gate.w_flat, self.gate.row_off,
+           self.gate.k_index, out3d, self.gate_spec, 0, False, stream)
+        fn(x2d, topk_ids, topk_weights, self.up.w_flat, self.up.row_off,
+           self.up.k_index, out3d, self.up_spec, inter, False, stream)
+
+
+def _worth_fusing(x2d: torch.Tensor) -> bool:
+    """decode(M==1)에서만 융합한다.
+
+    융합의 이득은 블록 배증이고, 블록은 `ceil(N/64) × M × top_k`다. prefill은 M이
+    커서 이미 블록이 넘치므로 이득이 없고(실측: 768블록에서 이미 1788 GB/s로
+    대역폭 쪽에 붙어 있다), 그때 융합하면 리덕션·검증만 늘어난다. M을 여기서
+    보는 이유는 커널이 아니라 **호출 형태**를 고르는 결정이기 때문이다.
+    """
+    return x2d.shape[0] == 1
+
+
+@dataclass(frozen=True)
+class ResidentGateUp(_GateUpDense):
+    """HOT의 gateup — device 상주 W."""
+
+    def _single(self):
+        from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed
+
+        return gemv_worklist_indexed
+
+    def _fused(self):
+        from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_gateup
+
+        return gemv_worklist_indexed_gateup
+
+
+@dataclass(frozen=True)
+class PinnedGateUp(_GateUpDense):
+    """WARM의 gateup (dense) — sparsity 없는 plan의 warm이 여기로 온다.
+    융합 진입점(pinned+dense)은 아직 없어 2회 launch다."""
+
+    def _single(self):
+        from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_pinned
+
+        return gemv_worklist_indexed_pinned
+
+
+@dataclass(frozen=True)
+class SparseResidentGateUp(_GateUpSparse):
+    """HOT의 sparse gateup — 현재 SPARSE_TIERS가 고르지 않는다 (hot은 dense)."""
+
+    def _single(self):
+        from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_sparse
+
+        return gemv_worklist_indexed_sparse
+
+    def _single_dense(self):
+        from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed
+
+        return gemv_worklist_indexed
+
+    def _fused_dense(self):
+        from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_gateup
+
+        return gemv_worklist_indexed_gateup
+
+
+@dataclass(frozen=True)
+class SparsePinnedGateUp(_GateUpSparse):
+    """WARM의 sparse gateup — 실제 plan이 타는 경로."""
+
+    def _single(self):
+        from sglang.jit_kernel.prism_gemv import (
+            gemv_worklist_indexed_pinned_sparse,
+        )
+
+        return gemv_worklist_indexed_pinned_sparse
+
+    def _single_dense(self):
+        from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_pinned
+
+        return gemv_worklist_indexed_pinned
+
+    def _fused(self):
+        from sglang.jit_kernel.prism_gemv import (
+            gemv_worklist_indexed_pinned_sparse_gateup,
+        )
+
+        return gemv_worklist_indexed_pinned_sparse_gateup
+
+
+@dataclass(frozen=True)
+class _GateUpSingle:
+    """gate 또는 up **한쪽만** 이 티어에 있는 plan용 어댑터. 융합 대상이 없으므로
+    기존 단일 proj 티어를 그대로 감싸고, 호출자가 나머지 절반을 0으로 채운다."""
+
+    tier: GpuTier
+    col_off: int
+    writes_all: bool = False
+
+    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking) -> None:
+        self.tier.run(x2d, topk_ids, topk_weights, out3d, self.col_off,
+                      x_row_is_pair=False, masking=masking)
+
+
+@dataclass(frozen=True)
+class LayerTiers:
+    """한 레이어의 GPU 티어 — **phase 단위**다 (executor가 도는 축과 같다)."""
+
+    gateup: Mapping[Tier, GateUpRunner]
+    down: Mapping[Tier, GpuTier]
+
+
+_GATEUP_DENSE = {Tier.HOT: ResidentGateUp, Tier.WARM: PinnedGateUp}
+_GATEUP_SPARSE = {Tier.HOT: SparseResidentGateUp, Tier.WARM: SparsePinnedGateUp}
+
+
 def _sparse_spec(
     shard: TierShard, thr: torch.Tensor, plan: Plan, layer_idx: int, proj: Proj,
     where: str,
@@ -243,29 +467,60 @@ def build_layer_tiers(
     prepared: PreparedWeights,
     plan: Plan,
     layer_idx: int,
-) -> Mapping[tuple, Optional[GpuTier]]:
-    """Stage 2 산출물 → (proj, tier) → GpuTier. 없는 티어는 항목 자체가 없다.
+) -> LayerTiers:
+    """Stage 2 산출물 → phase 단위 티어. 없는 티어는 항목 자체가 없다.
 
     plan에 sparsity가 있으면 `SPARSE_TIERS`에 속한 티어만 sparse 구현을 받는다
     — 나머지는 dense 구현 그대로다 (계약 ⑤의 대가는 SPARSE_TIERS 주석 참조).
+
+    gateup은 gate와 up을 **한 객체**로 묶는다: 융합이 가능한 조합에서 커널 하나로
+    발행하기 위해서고, 그 판단은 그 객체 안에 있다 (executor는 모른다).
     """
     sparse_on = plan.sparsity is not None
-    tiers: dict[tuple, GpuTier] = {}
+    shards: dict = {}
+    specs: dict = {}
     for proj in Proj:
-        shards = {
-            Tier.HOT: None if prepared.hot is None else prepared.hot.band(proj),
-            Tier.WARM: prepared.warm.band(proj),
-        }
-        for tier, shard in shards.items():
+        avail = (
+            (Tier.HOT, None if prepared.hot is None else prepared.hot.band(proj)),
+            (Tier.WARM, prepared.warm.band(proj)),
+        )
+        for tier, shard in avail:
             if shard is None:
                 continue
+            shards[(proj, tier)] = shard
             if sparse_on and tier in SPARSE_TIERS:
                 where = f"layer {layer_idx} {proj.value} {tier.value}"
-                tiers[(proj, tier)] = _SPARSE_IMPL[tier](
-                    shard,
-                    _sparse_spec(shard, prepared.thr[proj], plan, layer_idx,
-                                 proj, where),
-                )
-            else:
-                tiers[(proj, tier)] = _DENSE_IMPL[tier](shard)
-    return tiers
+                specs[(proj, tier)] = _sparse_spec(
+                    shard, prepared.thr[proj], plan, layer_idx, proj, where)
+
+    def single(proj: Proj, tier: Tier) -> GpuTier:
+        shard = shards[(proj, tier)]
+        spec = specs.get((proj, tier))
+        if spec is not None:
+            return _SPARSE_IMPL[tier](shard, spec)
+        return _DENSE_IMPL[tier](shard)
+
+    gateup: dict = {}
+    down: dict = {}
+    for tier in (Tier.HOT, Tier.WARM):
+        if (Proj.DOWN, tier) in shards:
+            down[tier] = single(Proj.DOWN, tier)
+        has_g = (Proj.GATE, tier) in shards
+        has_u = (Proj.UP, tier) in shards
+        if has_g and has_u:
+            g, u = shards[(Proj.GATE, tier)], shards[(Proj.UP, tier)]
+            sg, su = specs.get((Proj.GATE, tier)), specs.get((Proj.UP, tier))
+            if (sg is None) != (su is None):
+                # sparsity는 (proj, tier)가 아니라 티어 단위 결정이므로 한쪽만
+                # sparse인 상태는 자산/plan의 모순이다 — 조용히 섞지 않는다.
+                raise ValueError(
+                    f"layer {layer_idx} {tier.value}: gate and up disagree on "
+                    f"sparsity (gate={sg is not None}, up={su is not None})")
+            gateup[tier] = (_GATEUP_SPARSE[tier](g, u, sg, su) if sg is not None
+                            else _GATEUP_DENSE[tier](g, u))
+        elif has_g:
+            gateup[tier] = _GateUpSingle(single(Proj.GATE, tier), 0)
+        elif has_u:
+            gateup[tier] = _GateUpSingle(
+                single(Proj.UP, tier), plan.dims.intermediate_size)
+    return LayerTiers(gateup=gateup, down=down)
