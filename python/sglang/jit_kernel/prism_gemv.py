@@ -20,6 +20,9 @@ def _jit_prism_gemv_module() -> Module:
             ("gemv_worklist_pinned", "gemv_worklist_pinned"),
             ("gemv_worklist_indexed", "gemv_worklist_indexed"),
             ("gemv_worklist_indexed_pinned", "gemv_worklist_indexed_pinned"),
+            ("gemv_worklist_indexed_sparse", "gemv_worklist_indexed_sparse"),
+            ("gemv_worklist_indexed_pinned_sparse",
+             "gemv_worklist_indexed_pinned_sparse"),
         ],
     )
 
@@ -91,3 +94,48 @@ def gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx, out3d,
         module.gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx,
                                             out3d, int(out_col_offset),
                                             int(bool(x_row_is_pair)), int(vec))
+
+
+def _sparse_call(fn, x2d, topk_ids, topk_weights, w_flat, row_off, kidx, out3d,
+                 sp, out_col_offset, x_row_is_pair, stream, vec) -> None:
+    """sparse 두 래퍼의 공통 본체 — 갈리는 것은 FFI 심볼 하나뿐이다.
+
+    `topk_weights`가 `sp`에 들어가지 않는 이유: sp는 로드 타임에 한 번 만들어
+    영구 보관하는 물건이고(a/c/thr는 device 상주 상수), 라우터 가중은 스텝마다
+    갈린다. 섞으면 스텝마다 spec을 복제하거나 공유 객체를 변조해야 한다."""
+    with torch.cuda.stream(stream):
+        fn(x2d, topk_ids, w_flat, row_off, kidx, out3d,
+           sp.a, sp.c, sp.thr, topk_weights,
+           int(out_col_offset), int(bool(x_row_is_pair)), int(vec),
+           float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid),
+           int(sp.ng), int(sp.renorm_it))
+
+
+def gemv_worklist_indexed_sparse(x2d, topk_ids, topk_weights, w_flat, row_off,
+                                 kidx, out3d, sp, out_col_offset,
+                                 x_row_is_pair, stream, vec=0) -> None:
+    """gemv_worklist_indexed의 sparse 변형 — 죽은 페어의 W 로드를 발행하지 않는다.
+
+    `sp`는 점수 재료와 예산을 담은 객체다 (a=wn², c=pair_dot, thr 곡선,
+    topk_weights, p/lam/pmax/grid/ng/renorm_it). threshold는 **커널이 직접
+    계산한다** — CPU가 계산한 값을 받으면 스텝마다 device sync가 생겨 CUDA
+    graph가 깨지고, 어차피 같은 순수 함수라 양쪽이 독립 계산해도 같은 값이다.
+
+    누산 순서는 dense와 같다 (마스크는 W 로드를 건너뛸 뿐 루프 모양을 바꾸지
+    않는다) — 그래서 전부 keep인 경우 dense와 **비트일치**한다.
+    """
+    module = _jit_prism_gemv_module()
+    _sparse_call(module.gemv_worklist_indexed_sparse, x2d, topk_ids,
+                 topk_weights, w_flat, row_off, kidx, out3d, sp,
+                 out_col_offset, x_row_is_pair, stream, vec)
+
+
+def gemv_worklist_indexed_pinned_sparse(x2d, topk_ids, topk_weights, w_flat,
+                                        row_off, kidx, out3d, sp,
+                                        out_col_offset, x_row_is_pair, stream,
+                                        vec=0) -> None:
+    """위의 쌍둥이 — W가 pinned CPU(WARM). 건너뛴 로드가 그대로 PCIe 절약이다."""
+    module = _jit_prism_gemv_module()
+    _sparse_call(module.gemv_worklist_indexed_pinned_sparse, x2d, topk_ids,
+                 topk_weights, w_flat, row_off, kidx, out3d, sp,
+                 out_col_offset, x_row_is_pair, stream, vec)

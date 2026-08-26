@@ -127,7 +127,7 @@ class PrismExecutor:
         if has_cold and self._cold is None:
             raise RuntimeError(f"layer {layer_idx} has COLD rows but no cold backend")
         self._layers[layer_idx] = prepared
-        self._tiers[layer_idx] = build_layer_tiers(prepared)
+        self._tiers[layer_idx] = build_layer_tiers(prepared, self._plan, layer_idx)
         self._layer_has_cold[layer_idx] = has_cold
 
     # ── 모드 결정 ──────────────────────────────────────────────────────────
@@ -182,6 +182,10 @@ class PrismExecutor:
         flow = self._plan_flow(m, topk_ids)
         # sparsity는 cold만, decode에서만 (prefill-dense).
         masking = self._sparse and m == 1
+        # GPU sparse 티어와 rejoin이 같은 fp32 텐서를 쓴다 — 캐스팅이 두 번
+        # 일어나면 스텝마다 할당이 하나 더 생긴다.
+        w32 = topk_weights if topk_weights.dtype is torch.float32 \
+            else topk_weights.to(torch.float32)
 
         # ── Phase 1: gateup ──────────────────────────────────────────────
         w_ptr = 0
@@ -216,7 +220,8 @@ class PrismExecutor:
                 )
             _nvtx_push("cold.gu.window")          # CPU expert 연산 재실 구간
 
-        gu_parts = self._run_gateup(tiers, hidden, topk_ids, m, k, inter)
+        gu_parts = self._run_gateup(tiers, hidden, topk_ids, w32, m, k, inter,
+                                    masking)
 
         cold_gu = None
         if has_cold:
@@ -249,7 +254,8 @@ class PrismExecutor:
                 )
             _nvtx_push("cold.dn.window")
 
-        down_parts = self._run_down(tiers, act, topk_ids, m, k, inter, h)
+        down_parts = self._run_down(tiers, act, topk_ids, w32, m, k, inter, h,
+                                    masking)
 
         cold_down = None
         if has_cold:
@@ -265,13 +271,14 @@ class PrismExecutor:
         with _nvtx("rejoin2.acc+wsum"):
             down = self._accumulate(down_parts + [cold_down], (m, k, h),
                                     hidden.device)
-            out = (down * topk_weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
+            out = (down * w32.unsqueeze(-1)).sum(dim=1)
         _nvtx_pop()                               # prism.L{layer_idx}
         return out.to(torch.bfloat16)
 
     # ── GPU 티어 ─────────────────────────────────────────────────────────
     @staticmethod
-    def _run_gateup(tiers, hidden, topk_ids, m, k, inter) -> list:
+    def _run_gateup(tiers, hidden, topk_ids, topk_weights, m, k, inter,
+                    masking) -> list:
         """티어별로 [M, k, 2·inter] partial 하나. gate가 앞 절반, up이 뒤 절반.
 
         티어마다 버퍼가 따로인 이유: 셋 다 **같은 열**에 쓰므로(계약 ②의
@@ -288,14 +295,17 @@ class PrismExecutor:
             buf = alloc(m, k, 2 * inter, dtype=torch.bfloat16, device=hidden.device)
             with _nvtx(f"{tier.value}.gu"):
                 if tg is not None:
-                    tg.run(hidden, topk_ids, buf, 0, x_row_is_pair=False)
+                    tg.run(hidden, topk_ids, topk_weights, buf, 0,
+                           x_row_is_pair=False, masking=masking)
                 if tu is not None:
-                    tu.run(hidden, topk_ids, buf, inter, x_row_is_pair=False)
+                    tu.run(hidden, topk_ids, topk_weights, buf, inter,
+                           x_row_is_pair=False, masking=masking)
             parts.append(buf)
         return parts
 
     @staticmethod
-    def _run_down(tiers, act, topk_ids, m, k, inter, h) -> list:
+    def _run_down(tiers, act, topk_ids, topk_weights, m, k, inter, h,
+                  masking) -> list:
         """act는 expert별 값이라 행이 pair (m, j)다 — x_row_is_pair=True."""
         act2d = act.reshape(m * k, inter)
         parts = []
@@ -305,7 +315,8 @@ class PrismExecutor:
                 continue
             buf = torch.empty(m, k, h, dtype=torch.bfloat16, device=act.device)
             with _nvtx(f"{tier.value}.dn"):
-                td.run(act2d, topk_ids, buf, 0, x_row_is_pair=True)
+                td.run(act2d, topk_ids, topk_weights, buf, 0,
+                       x_row_is_pair=True, masking=masking)
             parts.append(buf)
         return parts
 

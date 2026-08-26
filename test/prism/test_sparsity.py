@@ -39,6 +39,7 @@ from sglang.srt.layers.moe.prism.resources import (  # noqa: E402
     ExecutionResources,
     ResourceSpec,
 )
+from sglang.srt.layers.moe.prism.tiers import SPARSE_TIERS  # noqa: E402
 from sglang.srt.layers.moe.prism.weights import prepare_layer_weights  # noqa: E402
 
 try:
@@ -79,9 +80,16 @@ def make_exec_plan(kind, *, sparse=True):
     if kind == "mixed":
         gate_up = _proj_entry([[0, WARM_ROWS, "warm"], [WARM_ROWS, H, "cold"]], I, sparse)
         down = _proj_entry([[0, WARM_ROWS, "warm"], [WARM_ROWS, I, "cold"]], H, sparse)
-    else:  # all_warm — cold가 없으므로 threshold가 아무 영향을 주지 못해야 한다
+    elif kind == "all_hot":
+        # HOT만 — SPARSE_TIERS가 hot을 고르지 않으므로 thr이 무효여야 한다.
+        gate_up = _proj_entry([[0, H, "hot"]], I, sparse)
+        down = _proj_entry([[0, I, "hot"]], H, sparse)
+    elif kind == "all_warm":
+        # WARM만 — cold가 없어도 threshold가 걸린다 (2026-08-26 계약 개정).
         gate_up = _proj_entry([[0, H, "warm"]], I, sparse)
         down = _proj_entry([[0, I, "warm"]], H, sparse)
+    else:
+        raise ValueError(f"unknown plan kind {kind!r}")
     raw = {
         "schema_version": 2 if sparse else 1,
         "model_id": "test/tiny",
@@ -109,9 +117,14 @@ def make_exec_calib(tmp_path, thr_fill, seed=5):
         "cu": torch.randn(1, E, H // 2) * 0.1,
         "cd": torch.randn(1, E, I // 2) * 0.1,
     }
-    for key in ("tg2l", "tu2l", "td2l"):
-        blob[key] = torch.full((1, E, NG), float(thr_fill))
-    path = tmp_path / f"calib_{thr_fill}.pt"
+    # thr_fill은 스칼라이거나 {Proj: 값} 매핑이다 — proj마다 점수 스케일이
+    # 다르므로(down의 x는 act) 하나로 뭉갤 수 없는 경우가 있다.
+    fill = {p: thr_fill for p in Proj} if isinstance(thr_fill, (int, float)) \
+        else dict(thr_fill)
+    for key, proj in (("tg2l", Proj.GATE), ("tu2l", Proj.UP), ("td2l", Proj.DOWN)):
+        blob[key] = torch.full((1, E, NG), float(fill[proj]))
+    tag = "_".join(f"{float(fill[p]):.6g}" for p in Proj)
+    path = tmp_path / f"calib_{tag}.pt"
     torch.save(blob, path)
     spec = SparsitySpec(
         score="k2wl2", calib=CalibRef(path=str(path), sha256="a" * 64),
@@ -181,11 +194,41 @@ def ref_pair_importance(vec, a_sq, c):
     return out
 
 
+# 마스킹하는 티어 = cold(kt가 항상 마스킹) + GPU 쪽 SPARSE_TIERS. 정책의
+# 정의점은 tiers.SPARSE_TIERS 하나이고 여기서 파생한다 — 두 곳에 적으면
+# 정책을 바꿀 때 테스트가 조용히 옛 계약을 검사한다.
+_MASKED_TIERS = frozenset({Tier.COLD}) | SPARSE_TIERS
+
+
 def _cold_span(ep, proj):
     for b in ep.proj(proj).bands:
         if b.tier is Tier.COLD:
             return b.start, b.end
     return None
+
+
+def _masked_span(ep, proj):
+    """마스킹되는 티어들이 덮는 K 구간 [start, end).
+
+    2026-08-26부터 WARM도 cold와 **같은 threshold**로 마스킹하므로 대조의
+    단위가 "cold 밴드"에서 "마스킹 티어의 합집합"으로 넓어졌다. HOT은 dense라
+    (tiers.SPARSE_TIERS) 여기 들어가지 않는다.
+
+    합집합을 구간 하나로 돌려주는 것은 이 테스트의 plan들이 마스킹 티어를
+    연속으로 배치하기 때문이다 (warm 앞, cold 뒤). 불연속 배치를 쓰게 되면
+    구간 리스트로 넓혀야 한다 — 그때는 여기가 먼저 틀린다.
+    """
+    spans = [(b.start, b.end) for b in ep.proj(proj).bands
+             if b.tier in _MASKED_TIERS]
+    if not spans:
+        return None
+    lo, hi = min(s for s, _ in spans), max(e for _, e in spans)
+    covered = sum(e - s for s, e in spans)
+    assert covered == hi - lo, (
+        f"{proj.value}: 마스킹 티어가 [{lo}, {hi})를 연속으로 덮지 않는다 "
+        f"(덮은 행 {covered}) — _masked_span을 구간 리스트로 넓혀야 한다"
+    )
+    return lo, hi
 
 
 def _cold_imp(vec, proj, e, span, blob):
@@ -196,7 +239,7 @@ def _cold_imp(vec, proj, e, span, blob):
 
 
 def probe_thresholds(x, ids, w13, w2, plan, blob, q=0.5):
-    """**cold 구간**의 실제 imp 분포 분위수 → proj별 threshold.
+    """**마스킹 구간**의 실제 imp 분포 분위수 → proj별 threshold.
 
     무작위 벡터로 잡으면 스케일이 어긋나 전량 통과/차단이 되어 대조가
     0 vs 0의 무의미한 비교가 된다 — nnz assert로도 이중 방어한다.
@@ -209,29 +252,30 @@ def probe_thresholds(x, ids, w13, w2, plan, blob, q=0.5):
         for j in range(ids.shape[1]):
             e = int(ids[m, j])
             for proj in (Proj.GATE, Proj.UP):
-                span = _cold_span(ep, proj)
+                span = _masked_span(ep, proj)
                 if span:
                     vals[proj].append(_cold_imp(xf[m], proj, e, span, blob))
             act = torch.nn.functional.silu(xf[m] @ gate_w[e].t()) * (
                 xf[m] @ up_w[e].t())
-            span = _cold_span(ep, Proj.DOWN)
+            span = _masked_span(ep, Proj.DOWN)
             if span:
                 vals[Proj.DOWN].append(_cold_imp(act, Proj.DOWN, e, span, blob))
     return {p: float(torch.cat(v).quantile(q)) for p, v in vals.items() if v}
 
 
-def cold_masked_reference(x, ids, w, w13, w2, plan, blob, thr):
-    """**cold 밴드만** 마스킹한 fp32 레퍼런스 — warm이 dense임을 검증한다.
+def masked_reference(x, ids, w, w13, w2, plan, blob, thr):
+    """마스킹 티어(warm + cold)를 마스킹한 fp32 레퍼런스.
 
-    warm 구간까지 마스킹하면 이 대조가 깨진다. 즉 이 테스트가 "warm dense"
-    결정이 실제 실행에 반영됐는지의 검출기다.
+    2026-08-26 이전에는 cold 밴드만 마스킹했고, 그것이 "warm은 dense"의
+    검출기였다. warm이 같은 threshold로 마스킹하게 되면서 대조 구간이
+    `_masked_span`으로 넓어졌다 — HOT이 있으면 그 구간은 여전히 dense다.
     """
     gate_w, up_w = w13[:, :I, :].float(), w13[:, I:, :].float()
     down_w = w2.float()
     ep = plan.expert(0, 0)
 
     def apply_mask(vec, proj, e, t):
-        span = _cold_span(ep, proj)
+        span = _masked_span(ep, proj)
         if span is None:
             return vec
         s, en = span
@@ -302,17 +346,57 @@ def test_zero_threshold_matches_dense_path(tmp_path):
 
 
 @cuda_required
-def test_all_warm_plan_ignores_threshold(tmp_path):
-    """cold 밴드가 없으면 threshold가 아무 영향을 주지 못한다 (warm은 dense).
+def test_warm_masks_with_the_same_threshold(tmp_path):
+    """warm도 cold와 **같은 threshold**로 마스킹한다 (2026-08-26 계약 개정).
 
-    warm 마스킹이 남아 있으면 thr=∞에서 출력이 0이 되어 이 테스트가 깨진다.
+    thr=∞면 warm 페어가 전부 죽으므로 all-warm plan의 출력은 정확히 0이다.
+    이전 계약(warm은 dense)에서는 같은 입력이 dense와 일치했다 — 그 테스트가
+    이 구현으로 바뀌면서 발화했고, 그것이 warm 마스킹이 실제로 걸린다는 증거다.
+    """
+    w13, w2 = make_exec_weights()
+    x, ids, w = make_exec_inputs(1, seed=32)
+    calib, _ = make_exec_calib(tmp_path, 1e9)
+    masked = run_exec(build_exec(make_exec_plan("all_warm"), w13, w2, calib),
+                      x, ids, w)
+    assert torch.count_nonzero(masked) == 0, (
+        "thr=∞인데 살아남은 원소가 있다 — warm 마스크가 걸리지 않았다"
+    )
+
+
+@cuda_required
+def test_warm_zero_threshold_is_bit_identical_to_dense(tmp_path):
+    """thr=0이면 warm sparse 커널이 dense와 **비트일치**해야 한다.
+
+    이것이 커널에서 압축 리스트를 쓰지 않고 dense 루프 모양(스레드 y가 행
+    y, y+NY, …)을 유지한 이유의 검증이다. 생존 페어를 압축하면 누산 순서가
+    달라져 전량 keep에서도 마지막 비트가 갈리고, 순서 재현은 계약 ⑤의 요구다.
+    tolerance 비교로는 이 회귀가 안 잡힌다 — `torch.equal`이어야 한다.
     """
     w13, w2 = make_exec_weights()
     x, ids, w = make_exec_inputs(1, seed=32)
     dense = run_exec(build_exec(make_exec_plan("all_warm", sparse=False), w13, w2),
                      x, ids, w)
-    calib, _ = make_exec_calib(tmp_path, 1e9)
+    calib, _ = make_exec_calib(tmp_path, 0.0)
     masked = run_exec(build_exec(make_exec_plan("all_warm"), w13, w2, calib),
+                      x, ids, w)
+    assert torch.equal(masked, dense)
+
+
+@cuda_required
+def test_hot_stays_dense(tmp_path):
+    """HOT은 마스킹하지 않는다 (tiers.SPARSE_TIERS의 정책).
+
+    thr=∞여도 all-hot plan은 dense와 일치한다. 이 정책을 뒤집으면(hot을
+    SPARSE_TIERS에 넣으면) 이 테스트가 발화해야 한다 — 정책 변경이 조용히
+    일어나지 않게 하는 것이 목적이다.
+    """
+    assert Tier.HOT not in SPARSE_TIERS
+    w13, w2 = make_exec_weights()
+    x, ids, w = make_exec_inputs(1, seed=32)
+    dense = run_exec(build_exec(make_exec_plan("all_hot", sparse=False), w13, w2),
+                     x, ids, w)
+    calib, _ = make_exec_calib(tmp_path, 1e9)
+    masked = run_exec(build_exec(make_exec_plan("all_hot"), w13, w2, calib),
                       x, ids, w)
     assert torch.equal(masked, dense)
 
@@ -342,17 +426,24 @@ def test_cold_masked_matches_reference(tmp_path):
     calib, blob = make_exec_calib(tmp_path, 0.0)
     plan = make_exec_plan("mixed")
 
-    # thr 곡선을 고른 값으로 채운 자산으로 다시 만든다 — wn/pair_dot은
-    # 같은 seed라 동일하므로 probe로 구한 분위수가 그대로 유효하다.
+    # thr 곡선을 probe한 값으로 채운 자산으로 다시 만든다 — wn/pair_dot은
+    # 같은 seed라 동일하므로 분위수가 그대로 유효하다.
+    #
+    # **proj별로** 채우는 것이 중요하다. 세 값을 평균 하나로 뭉개면 down이
+    # 무너진다: down의 x는 act(=silu(g)·u)라 gate/up의 hidden보다 스케일이
+    # 훨씬 작고, gate/up 쪽으로 끌려간 threshold가 down 페어를 전량 죽인다.
+    # warm이 dense였을 때는 그 피해가 cold 밴드에 갇혀 있어 드러나지 않았다.
     picked = probe_thresholds(x, ids, w13, w2, plan, blob, q=0.5)
-    value = float(sum(picked.values()) / len(picked))
-    calib2, blob2 = make_exec_calib(tmp_path, value)
+    calib2, blob2 = make_exec_calib(tmp_path, picked)
     assert torch.equal(blob2["wn_g"], blob["wn_g"])  # 자산 재생성이 재현적인지
     ex = build_exec(plan, w13, w2, calib2)
-    thr = {p: torch.full((1, K), value) for p in Proj}
+    thr = {p: torch.full((1, K), picked[p]) for p in Proj}
 
     out = run_exec(ex, x, ids, w)
-    ref = cold_masked_reference(x, ids, w, w13, w2, plan, blob, thr)
+    ref = masked_reference(x, ids, w, w13, w2, plan, blob, thr)
     d = rel_diff(out, ref)
-    print(f"cold-only masked: rel diff = {d:.6f}")
+    print(f"warm+cold masked: rel diff = {d:.6f}")
+    # 마스크가 실제로 뭔가 죽였는지 — 전량 통과/차단이면 0 vs 0의 무의미한
+    # 대조가 되므로 이중 방어한다.
+    assert torch.count_nonzero(out) > 0, "전량 차단 — threshold가 너무 크다"
     assert d < 0.03
