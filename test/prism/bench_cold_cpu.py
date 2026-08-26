@@ -87,7 +87,7 @@ def numa_nodes() -> int:
 
 
 def build_cold(shape, k_cold, *, sparsity, pattern, seed, numa_split, threads,
-               kernel_key, band, nodes, split_index):
+               kernel_key, band, nodes, split_index, numa_map=None):
     """kt partial 인스턴스 하나 + 주입 텐서. cold_backend가 Plan에서 굽는 것과
     같은 config를 CLI에서 굽는다."""
     from kt_kernel import kt_kernel_ext
@@ -95,7 +95,21 @@ def build_cold(shape, k_cold, *, sparsity, pattern, seed, numa_split, threads,
 
     E, topk = shape.experts, shape.topk
     H, I = shape.hidden, shape.inter
-    cpuinfer = kt_kernel_ext.CPUInfer(threads)
+    # numa_map이 주어지면 그 노드들만 쓴다 — 실모델의 SGLANG_PRISM_NUMA_MAP과
+    # 같은 경로(WorkerPoolConfig)다. 소켓당 스레드 수가 offcore 큐 점유를
+    # 결정하고 그것이 프리페처 부호를 정하므로, 이 축을 못 고정하면 측정이
+    # 실모델과 다른 동작점에 놓인다.
+    if numa_map:
+        cfg_pool = kt_kernel_ext.WorkerPoolConfig()
+        cfg_pool.subpool_count = len(numa_map)
+        cfg_pool.subpool_numa_map = list(numa_map)
+        cfg_pool.subpool_thread_count = [
+            threads // len(numa_map) + (1 if i < threads % len(numa_map) else 0)
+            for i in range(len(numa_map))
+        ]
+        cpuinfer = kt_kernel_ext.CPUInfer(cfg_pool)
+    else:
+        cpuinfer = kt_kernel_ext.CPUInfer(threads)
     cfg = kt_kernel_ext.moe.MOEConfig(E, topk, H, I, 0)
     cfg.max_len = 1
     cfg.layer_idx = 0
@@ -165,10 +179,15 @@ def run(args, E: int) -> dict:
         if kc % K_STEP:
             raise SystemExit(f"{p}: cold rows {kc} not a K_STEP multiple")
 
-    nodes = numa_nodes()
+    numa_map = [int(x) for x in args.numa_map.split(",") if x.strip()] or None
+    # shard table의 항목 수는 tp_count(=subpool 수)와 같아야 한다. numa_map을
+    # 주면 subpool이 그 길이만큼만 생기므로 nodes도 같이 좁혀야 한다 —
+    # 안 그러면 kt가 "partial shard table size != tp_count"로 즉사한다.
+    nodes = len(numa_map) if numa_map else numa_nodes()
     wrapper, cpuinfer, rows, keep = build_cold(
         shape, k_cold, sparsity=args.sparsity, pattern=args.mask_pattern,
         seed=args.seed, numa_split=args.numa_split, threads=args.threads,
+        numa_map=numa_map,
         kernel_key=args.cpu_kernel, band=args.band, nodes=nodes,
         split_index=args.split_index)
 
@@ -237,6 +256,10 @@ def main() -> None:
     p.add_argument("--mask-pattern", default="random", choices=("random", "block"))
     p.add_argument("--cpu-kernel", default="kt_tile_k2_bf16",
                    choices=tuple(_N_ALIGN))
+    p.add_argument("--numa-map", default="",
+                   help="쉼표로 구분한 NUMA 노드 목록 (예: 0 / 1 / 0,1). "
+                        "실모델의 SGLANG_PRISM_NUMA_MAP과 같은 의미. 비우면 "
+                        "머신 전 노드에 스레드를 분배한다")
     p.add_argument("--numa-split", type=float, default=0.5)
     p.add_argument("--threads", type=int, default=None)
     p.add_argument("--iters", type=int, default=100)
