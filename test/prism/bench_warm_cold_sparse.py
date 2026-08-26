@@ -219,14 +219,31 @@ class ColdTier:
 
     def __init__(self, shape: Shape, splits: dict, *, sparsity: float,
                  pattern: str, seed: int, numa_split: float, threads: int,
-                 kernel_key: str):
+                 kernel_key: str, numa_map=None):
         from kt_kernel import kt_kernel_ext
         from kt_kernel.experts_partial import PartialMoEWrapper
 
         E, topk = shape.experts, shape.topk
         H, I = shape.hidden, shape.inter
-        self.nodes = numa_node_count()
-        self.cpuinfer = kt_kernel_ext.CPUInfer(threads)
+        # `numa_map`이 주어지면 그 노드들만 쓴다 — 실모델이
+        # SGLANG_PRISM_NUMA_MAP으로 하는 것과 **같은 경로**여야 벤치와 e2e가
+        # 같은 동작점이 된다 (method.py의 WorkerPoolConfig 분기 참조).
+        # 기본(None)은 머신의 전 노드에 스레드를 나눠 갖는 CPUInfer(threads)이고,
+        # 그건 실모델의 단일 소켓 설정과 다르다 — 소켓당 스레드 수가 절반이 되어
+        # offcore 큐가 덜 채워지므로 대역폭 결론이 뒤집힐 수 있다.
+        if numa_map:
+            cfg_pool = kt_kernel_ext.WorkerPoolConfig()
+            cfg_pool.subpool_count = len(numa_map)
+            cfg_pool.subpool_numa_map = list(numa_map)
+            cfg_pool.subpool_thread_count = [
+                threads // len(numa_map) + (1 if i < threads % len(numa_map) else 0)
+                for i in range(len(numa_map))
+            ]
+            self.nodes = len(numa_map)
+            self.cpuinfer = kt_kernel_ext.CPUInfer(cfg_pool)
+        else:
+            self.nodes = numa_node_count()
+            self.cpuinfer = kt_kernel_ext.CPUInfer(threads)
         cfg = kt_kernel_ext.moe.MOEConfig(E, topk, H, I, 0)
         cfg.max_len = 1              # sparse는 decode 전용 (qlen==1)
         cfg.layer_idx = 0
@@ -565,6 +582,10 @@ def main() -> None:
                    help="warm pinned 스토어를 둘 NUMA 노드 (기본 GPU 로컬 노드)")
     p.add_argument("--device", type=int, default=0)
     p.add_argument("--dry-run", action="store_true", help="자원 소요만 출력")
+    p.add_argument("--numa-map", default="",
+                   help="쉼표로 구분한 NUMA 노드 목록 (예: 0 또는 1 또는 0,1). "
+                        "실모델의 SGLANG_PRISM_NUMA_MAP과 같은 의미 — 비우면 "
+                        "머신 전 노드에 스레드를 분배한다")
     p.add_argument("--only", default="",
                    help="쉼표로 구분한 변형만 돈다 "
                         "(warm_only,cold_only,combined,combined_eager,"
@@ -605,7 +626,8 @@ def main() -> None:
     }
     cold = ColdTier(shape, splits, sparsity=a.sparsity, pattern=a.mask_pattern,
                     seed=a.seed, numa_split=a.numa_split, threads=threads,
-                    kernel_key=a.cpu_kernel)
+                    kernel_key=a.cpu_kernel,
+        numa_map=([int(x) for x in a.numa_map.split(',')] if a.numa_map else None))
     res = ExecutionResources(ResourceSpec(
         max_tokens=1, top_k=shape.topk, hidden_size=shape.hidden,
         intermediate_size=shape.inter, device=device))
