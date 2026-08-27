@@ -45,6 +45,44 @@ _ENV_NUMA_MAP = "SGLANG_PRISM_NUMA_MAP"
 # eager에서도 cold submit/sync를 stream host node로 보내는 opt-in.
 # (graph 경로는 env와 무관하게 항상 stream 통합 — executor 참조.)
 _ENV_COLD_STREAM = "SGLANG_PRISM_COLD_STREAM"
+# prefill grouped GEMM 임계 M (미설정 = executor 기본값). 벤치·회귀 비교용 노브.
+_ENV_GROUPED_MIN_M = "SGLANG_PRISM_GROUPED_MIN_M"
+# grouped 경로에서 hot/warm 스트림 분리 (기본 1). "0"으로 끄면 직렬 발행.
+_ENV_SPLIT_STREAMS = "SGLANG_PRISM_SPLIT_STREAMS"
+# 이 M 이상의 prefill에서 cold를 GPU가 packed slab 제자리 읽기로 계산.
+# 미설정 = executor.COLD_GPU_MIN_M(실측 교차점), "0" = 끔 (slab host-register도 안 함
+# — 등록은 cold 전량을 pinned로 만들어 프로세스 수명 동안 잠근다).
+_ENV_COLD_GPU_MIN_M = "SGLANG_PRISM_COLD_GPU_MIN_M"
+# cold hybrid: cold GPU 조건에서 expert의 이 비율만 GPU, 나머지 CPU 동시 계산 (미설정 = 끔).
+_ENV_COLD_HYBRID_FRAC = "SGLANG_PRISM_COLD_HYBRID_FRAC"
+# warm을 kt 포맷 slab(pinned) 한 벌로 (row-major pinned 대신). GPU는 packed GEMV /
+# cold-layout grouped로 읽는다. cold GPU view가 필요하다 (COLD_GPU_MIN_M=0이면 불가).
+_ENV_WARM_KT = "SGLANG_PRISM_WARM_KT"
+# warm-kt 모드에서 이 M 이상의 prefill은 warm을 CPU(warm-kt 인스턴스)가 계산 (미설정 = GPU).
+_ENV_WARM_CPU_MIN_M = "SGLANG_PRISM_WARM_CPU_MIN_M"
+# cold를 전용 stream + 플래그 wait로 (블로킹 콜백 없음). eager 전용. hybrid와 동시 불가.
+_ENV_COLD_ASYNC = "SGLANG_PRISM_COLD_ASYNC"
+
+
+def _hybrid_local_node(device) -> int:
+    from sglang.srt.layers.moe.prism.numa import gpu_numa_node
+
+    phys = gpu_numa_node(device)
+    numa_map = os.environ.get(_ENV_NUMA_MAP)
+    if numa_map:
+        nodes = [int(x) for x in numa_map.split(",")]
+        return nodes.index(phys) if phys in nodes else 0
+    return phys
+
+
+def _cold_gpu_min_m():
+    from sglang.srt.layers.moe.prism.executor import PrismExecutor
+
+    raw = os.environ.get(_ENV_COLD_GPU_MIN_M)
+    if raw is None:
+        return PrismExecutor.COLD_GPU_MIN_M
+    v = int(raw)
+    return None if v <= 0 else v
 
 
 def _sglang_capture_mode() -> bool:
@@ -82,6 +120,9 @@ class _PrismRuntime:
     def executor(self, device: torch.device):
         if self._executor is None:
             from sglang.jit_kernel.prism_gemv import warmup_jit
+            from sglang.jit_kernel.prism_grouped import (
+                warmup_jit as warmup_grouped_jit,
+            )
             from sglang.srt.layers.moe.prism.executor import PrismExecutor
             from sglang.srt.layers.moe.prism.kernels import resolve_gpu_kernel
             from sglang.srt.layers.moe.prism.resources import (
@@ -93,15 +134,33 @@ class _PrismRuntime:
             # GEMV 커널의 lazy JIT을 startup으로 앞당긴다 — 첫 호출이 캡처
             # 워밍업이면 컴파일이 캡처 순서에 얽힌다.
             warmup_jit()
+            warmup_grouped_jit()
+            # rejoin Triton 커널도 캡처 워밍업 전에 컴파일한다.
+            from sglang.srt.layers.moe.prism.rejoin import warmup as warmup_rejoin
+
+            d = self.plan.dims
+            warmup_rejoin(device, d.intermediate_size, d.hidden_size, d.top_k)
             spec = ResourceSpec.from_plan(
                 self.plan, max_tokens=self.max_tokens, device=device)
             self._resources = ExecutionResources(spec)
             # 조립 지점: env·runner 같은 외부 입력은 전부 여기서 읽어 명시
             # 인자로 주입한다 (executor는 hidden input 없음).
+            gmin = os.environ.get(_ENV_GROUPED_MIN_M)
             self._executor = PrismExecutor(
                 self.plan, self._resources, self.cold(),
                 cold_stream=os.environ.get(_ENV_COLD_STREAM) == "1",
                 capture_mode_fn=_sglang_capture_mode,
+                grouped_min_m=None if gmin is None else int(gmin),
+                split_streams=os.environ.get(_ENV_SPLIT_STREAMS, "1") != "0",
+                cold_gpu_min_m=_cold_gpu_min_m(),
+                cold_hybrid_frac=(tuple(float(v) for v in os.environ[_ENV_COLD_HYBRID_FRAC].split(","))
+                                  if os.environ.get(_ENV_COLD_HYBRID_FRAC) else None),
+                # plan shard 인덱스 중 GPU-local NUMA 노드: NUMA_MAP이 있으면 그 리스트에서 찾고,
+                # 없으면 shard 인덱스 = 물리 노드.
+                hybrid_local_node=_hybrid_local_node(device),
+                warm_cpu_min_m=(int(os.environ[_ENV_WARM_CPU_MIN_M])
+                                if os.environ.get(_ENV_WARM_CPU_MIN_M) else None),
+                cold_async=os.environ.get(_ENV_COLD_ASYNC) == "1",
             )
         return self._executor
 
@@ -116,6 +175,11 @@ class _PrismRuntime:
             default_threads = max(2, (os.cpu_count() or 4) // 2 - 2)
             threads = int(os.environ.get(_ENV_CPUINFER, str(default_threads)))
             numa_map = os.environ.get(_ENV_NUMA_MAP)
+            # cold GPU 읽기가 켜져 있으면 slab을 이 device에 host-register한다.
+            gpu_view_device = (
+                torch.device(torch.cuda.current_device())
+                if _cold_gpu_min_m() is not None else None
+            )
             if numa_map:
                 from kt_kernel import kt_kernel_ext
 
@@ -132,6 +196,8 @@ class _PrismRuntime:
                     max_tokens=self.max_tokens,
                     num_numa_nodes=len(nodes),
                     cpuinfer=kt_kernel_ext.CPUInfer(cfg),
+                    gpu_view_device=gpu_view_device,
+                    hybrid_mask=bool(os.environ.get(_ENV_COLD_HYBRID_FRAC)),
                 )
             else:
                 self._cold = KtColdBackend(
@@ -139,6 +205,8 @@ class _PrismRuntime:
                     max_tokens=self.max_tokens,
                     num_numa_nodes=numa_node_count(),
                     cpuinfer_threads=threads,
+                    gpu_view_device=gpu_view_device,
+                    hybrid_mask=bool(os.environ.get(_ENV_COLD_HYBRID_FRAC)),
                 )
         return self._cold
 
@@ -255,17 +323,22 @@ class PrismMoEMethod(FusedMoEMethodBase):
         # 존립 근거를 무너뜨리는데, 결과는 정확하고 느리기만 해서 어떤 테스트도
         # 잡지 못한다 — 그래서 로더가 배치 후 실제 노드를 검증하고 즉사한다.
         device = torch.device(torch.cuda.current_device())
+        warm_kt = os.environ.get(_ENV_WARM_KT) == "1"
         prepared = prepare_layer_weights(
             self.layer_id, w13, w2, runtime.plan,
             calib=runtime.calib, device=device,
             warm_node=gpu_numa_node(device),
             # cold 스토어의 타일 올림 단위는 커널 키가 함의한다 (계약 ①).
             cold_tile_rows=cold_pack_tile_rows(runtime.plan.kernels.cpu_cold),
+            warm_kt=warm_kt,
         )
         ep = runtime.plan.expert(self.layer_id, 0)
         if any(ep.proj(p).has_tier(Tier.COLD) for p in Proj):
             runtime.cold().load_layer(self.layer_id, prepared.cold, prepared.thr)
             prepared.cold = None  # 주입 완료 — 소유권은 C++ (계약 ③)
+        if prepared.warm_kt is not None:
+            runtime.cold().load_warm_layer(self.layer_id, prepared.warm_kt, prepared.thr,
+                                           local_node=_hybrid_local_node(device))
 
         runtime.executor(device).register_layer(self.layer_id, prepared)
 

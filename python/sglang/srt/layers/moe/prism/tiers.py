@@ -21,6 +21,8 @@ from typing import Mapping, Optional, Protocol
 
 import torch
 
+from sglang.srt.layers.moe.prism.cold_gpu import ColdGpuLayer, ColdSlab
+from sglang.srt.layers.moe.prism.grouping import Grouping
 from sglang.srt.layers.moe.prism.plan import Plan, Proj, Tier
 from sglang.srt.layers.moe.prism.weights import PreparedWeights, TierShard
 
@@ -82,7 +84,8 @@ class GpuTier(Protocol):
     def run(self, x2d: torch.Tensor, topk_ids: torch.Tensor,
             topk_weights: torch.Tensor,
             out3d: torch.Tensor, out_col_off: int, *,
-            x_row_is_pair: bool, masking: bool) -> None: ...
+            x_row_is_pair: bool, masking: bool,
+            grouping: Optional[Grouping] = None) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -94,9 +97,25 @@ class _IndexedTier:
     def _fn(self):
         raise NotImplementedError
 
+    def _grouped(self):
+        raise NotImplementedError
+
+    def _grouped_max_blocks(self) -> int:
+        return 0  # device(hot): 상한 없음
+
+    def _grouped_wres(self) -> int:
+        return 0  # device(hot): 스트리밍 커널
+
     def run(self, x2d, topk_ids, topk_weights, out3d, out_col_off, *,
-            x_row_is_pair, masking) -> None:
+            x_row_is_pair, masking, grouping=None) -> None:
         s = self.shard
+        if grouping is not None:
+            self._grouped()(
+                x2d, grouping, s.w_flat, s.row_off, s.k_index, out3d,
+                out_col_off, x_row_is_pair, torch.cuda.current_stream(),
+                self._grouped_max_blocks(), self._grouped_wres(),
+            )
+            return
         self._fn()(
             x2d, topk_ids, s.w_flat, s.row_off, s.k_index, out3d,
             out_col_off, x_row_is_pair, torch.cuda.current_stream(),
@@ -116,10 +135,27 @@ class _SparseIndexedTier:
     def _dense_fn(self):
         raise NotImplementedError
 
+    def _grouped(self):
+        raise NotImplementedError
+
+    def _grouped_max_blocks(self) -> int:
+        return 0
+
+    def _grouped_wres(self) -> int:
+        return 0
+
     def run(self, x2d, topk_ids, topk_weights, out3d, out_col_off, *,
-            x_row_is_pair, masking) -> None:
+            x_row_is_pair, masking, grouping=None) -> None:
         s = self.shard
         stream = torch.cuda.current_stream()
+        if grouping is not None:
+            _reject_masked_grouping(masking)
+            self._grouped()(
+                x2d, grouping, s.w_flat, s.row_off, s.k_index, out3d,
+                out_col_off, x_row_is_pair, stream, self._grouped_max_blocks(),
+                self._grouped_wres(),
+            )
+            return
         if not masking:
             self._dense_fn()(
                 x2d, topk_ids, s.w_flat, s.row_off, s.k_index, out3d,
@@ -148,6 +184,11 @@ class ResidentTier(_IndexedTier):
 
         return gemv_worklist_indexed
 
+    def _grouped(self):
+        from sglang.jit_kernel.prism_grouped import grouped_gemm_indexed
+
+        return grouped_gemm_indexed
+
 
 @dataclass(frozen=True)
 class PinnedDirectTier(_IndexedTier):
@@ -162,6 +203,17 @@ class PinnedDirectTier(_IndexedTier):
         from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_pinned
 
         return gemv_worklist_indexed_pinned
+
+    def _grouped(self):
+        from sglang.jit_kernel.prism_grouped import grouped_gemm_indexed_pinned
+
+        return grouped_gemm_indexed_pinned
+
+    def _grouped_max_blocks(self) -> int:
+        return _warm_max_blocks()
+
+    def _grouped_wres(self) -> int:
+        return _wres_k_max(self.shard)
 
 
 @dataclass(frozen=True)
@@ -182,6 +234,11 @@ class SparseResidentTier(_SparseIndexedTier):
 
         return gemv_worklist_indexed
 
+    def _grouped(self):
+        from sglang.jit_kernel.prism_grouped import grouped_gemm_indexed
+
+        return grouped_gemm_indexed
+
 
 @dataclass(frozen=True)
 class SparsePinnedDirectTier(_SparseIndexedTier):
@@ -198,6 +255,17 @@ class SparsePinnedDirectTier(_SparseIndexedTier):
         from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_pinned
 
         return gemv_worklist_indexed_pinned
+
+    def _grouped(self):
+        from sglang.jit_kernel.prism_grouped import grouped_gemm_indexed_pinned
+
+        return grouped_gemm_indexed_pinned
+
+    def _grouped_max_blocks(self) -> int:
+        return _warm_max_blocks()
+
+    def _grouped_wres(self) -> int:
+        return _wres_k_max(self.shard)
 
 
 _DENSE_IMPL = {Tier.HOT: ResidentTier, Tier.WARM: PinnedDirectTier}
@@ -227,7 +295,7 @@ class GateUpRunner(Protocol):
 
     def run(self, x2d: torch.Tensor, topk_ids: torch.Tensor,
             topk_weights: torch.Tensor, out3d: torch.Tensor, inter: int, *,
-            masking: bool) -> None: ...
+            masking: bool, grouping: Optional[Grouping] = None) -> None: ...
 
 
 @dataclass(frozen=True)
@@ -245,8 +313,23 @@ class _GateUpDense:
         """융합 래퍼 — 없으면 None (그 조합의 진입점이 아직 없다는 뜻)."""
         return None
 
-    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking) -> None:
+    def _grouped_gateup(self):
+        raise NotImplementedError
+
+    def _grouped_max_blocks(self) -> int:
+        return 0
+
+    def _grouped_wres(self) -> int:
+        return 0
+
+    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking,
+            grouping=None) -> None:
         stream = torch.cuda.current_stream()
+        if grouping is not None:
+            _run_grouped_gateup(self._grouped_gateup(), self.gate, self.up, x2d,
+                                grouping, out3d, inter, stream,
+                                self._grouped_max_blocks(), self._grouped_wres())
+            return
         fused = self._fused() if _worth_fusing(x2d) else None
         if fused is not None:
             fused(x2d, topk_ids,
@@ -283,8 +366,24 @@ class _GateUpSparse:
     def _fused_dense(self):
         return None
 
-    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking) -> None:
+    def _grouped_gateup(self):
+        raise NotImplementedError
+
+    def _grouped_max_blocks(self) -> int:
+        return 0
+
+    def _grouped_wres(self) -> int:
+        return 0
+
+    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking,
+            grouping=None) -> None:
         stream = torch.cuda.current_stream()
+        if grouping is not None:
+            _reject_masked_grouping(masking)
+            _run_grouped_gateup(self._grouped_gateup(), self.gate, self.up, x2d,
+                                grouping, out3d, inter, stream,
+                                self._grouped_max_blocks(), self._grouped_wres())
+            return
         if not masking:
             # prefill은 dense다 (계약 ①). 그 조합의 융합 진입점은 아직 없어서
             # 2회 launch로 떨어지는데, prefill은 M이 커서 grid.y = M×top_k만으로
@@ -321,6 +420,45 @@ class _GateUpSparse:
            self.up.k_index, out3d, self.up_spec, inter, False, stream)
 
 
+def _reject_masked_grouping(masking: bool) -> None:
+    """grouped 경로는 dense다. 마스킹은 decode(M==1) 전용이고 그룹핑은 prefill
+    전용이라 겹칠 수 없는데, 겹치면 조용히 마스크가 사라지므로 즉사한다."""
+    if masking:
+        raise ValueError("grouped GEMM path does not support masking "
+                         "(sparsity is decode-only; grouping is prefill-only)")
+
+
+def _wres_k_max(*shards) -> int:
+    """PCIe(pinned/cold) launch을 W-resident 커널로 보낼 때의 k_max. 0 = 스트리밍 커널.
+    k_max는 32의 배수여야 한다 (커널 K 스텝) — 로더가 그렇게 굽지 않은 스토어(밴드
+    퇴화형에서 임의 k)는 32로 올린다."""
+    from sglang.jit_kernel import prism_grouped
+
+    if not prism_grouped.WRES_PCIE:
+        return 0
+    k = max(int(getattr(sh, "k_max", 0) or 0) for sh in shards)
+    return (k + 31) // 32 * 32
+
+
+def _warm_max_blocks() -> int:
+    """PCIe launch의 블록 수 상한 — 호출 시점에 모듈 값을 읽는다 (벤치가 스윕할 수
+    있게). 0 = 상한 없음. 근거는 prism_grouped.WARM_MAX_BLOCKS 주석."""
+    from sglang.jit_kernel import prism_grouped
+
+    return int(prism_grouped.WARM_MAX_BLOCKS)
+
+
+def _run_grouped_gateup(fn, gate: TierShard, up: TierShard, x2d, grouping,
+                        out3d, inter: int, stream, max_blocks: int = 0,
+                        wres_k_max: int = 0) -> None:
+    """gate+up을 grouped GEMM **한 launch**로. 두 티어 구현(device/pinned)이
+    공유하는 호출 형태."""
+    fn(x2d, grouping,
+       gate.w_flat, gate.row_off, gate.k_index,
+       up.w_flat, up.row_off, up.k_index,
+       out3d, 0, inter, False, stream, max_blocks, wres_k_max)
+
+
 def _worth_fusing(x2d: torch.Tensor) -> bool:
     """decode(M==1)에서만 융합한다.
 
@@ -346,16 +484,35 @@ class ResidentGateUp(_GateUpDense):
 
         return gemv_worklist_indexed_gateup
 
+    def _grouped_gateup(self):
+        from sglang.jit_kernel.prism_grouped import grouped_gemm_indexed_gateup
+
+        return grouped_gemm_indexed_gateup
+
 
 @dataclass(frozen=True)
 class PinnedGateUp(_GateUpDense):
     """WARM의 gateup (dense) — sparsity 없는 plan의 warm이 여기로 온다.
-    융합 진입점(pinned+dense)은 아직 없어 2회 launch다."""
+    융합 진입점(pinned+dense)은 아직 없어 2회 launch다 (decode). prefill은
+    grouped GEMM 한 launch다."""
 
     def _single(self):
         from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_pinned
 
         return gemv_worklist_indexed_pinned
+
+    def _grouped_gateup(self):
+        from sglang.jit_kernel.prism_grouped import (
+            grouped_gemm_indexed_pinned_gateup,
+        )
+
+        return grouped_gemm_indexed_pinned_gateup
+
+    def _grouped_max_blocks(self) -> int:
+        return _warm_max_blocks()
+
+    def _grouped_wres(self) -> int:
+        return _wres_k_max(self.gate, self.up)
 
 
 @dataclass(frozen=True)
@@ -376,6 +533,11 @@ class SparseResidentGateUp(_GateUpSparse):
         from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_gateup
 
         return gemv_worklist_indexed_gateup
+
+    def _grouped_gateup(self):
+        from sglang.jit_kernel.prism_grouped import grouped_gemm_indexed_gateup
+
+        return grouped_gemm_indexed_gateup
 
 
 @dataclass(frozen=True)
@@ -401,6 +563,19 @@ class SparsePinnedGateUp(_GateUpSparse):
 
         return gemv_worklist_indexed_pinned_sparse_gateup
 
+    def _grouped_gateup(self):
+        from sglang.jit_kernel.prism_grouped import (
+            grouped_gemm_indexed_pinned_gateup,
+        )
+
+        return grouped_gemm_indexed_pinned_gateup
+
+    def _grouped_max_blocks(self) -> int:
+        return _warm_max_blocks()
+
+    def _grouped_wres(self) -> int:
+        return _wres_k_max(self.gate, self.up)
+
 
 @dataclass(frozen=True)
 class _GateUpSingle:
@@ -411,14 +586,145 @@ class _GateUpSingle:
     col_off: int
     writes_all: bool = False
 
-    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking) -> None:
+    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking,
+            grouping=None) -> None:
         self.tier.run(x2d, topk_ids, topk_weights, out3d, self.col_off,
-                      x_row_is_pair=False, masking=masking)
+                      x_row_is_pair=False, masking=masking, grouping=grouping)
+
+
+# ─── cold의 GPU 읽기 (prefill 대배치 전용) ──────────────────────────────────
+#
+# cold는 GpuTier Protocol에 들어오지 않는다고 계약 ④가 못박았다 — CPU 완료 대기가
+# `run` 하나로 접히지 않기 때문이다. 아래 둘은 그 예외가 아니라 **다른 물건**이다:
+# cold의 weight를 CPU 대신 GPU가 읽는 경로이고, 그때 cold는 hot/warm과 같은
+# "launch만 하고 반환하는" 티어가 된다 (PCIe 제자리 읽기 = warm과 같은 종류,
+# 레이아웃만 kt packed). grouped 경로에서만 유효하다 (grouping 필수, dense).
+@dataclass(frozen=True)
+class ColdGpuTier:
+    """한 proj의 cold를 GPU가 읽는다 — 노드 shard마다 launch 하나 (서로소 열)."""
+
+    slabs: tuple  # ColdSlab per node
+
+    def run(self, x2d, topk_ids, topk_weights, out3d, out_col_off, *,
+            x_row_is_pair, masking, grouping=None) -> None:
+        from sglang.jit_kernel.prism_grouped import grouped_gemm_cold
+
+        _require_grouping(grouping, masking)
+        stream = torch.cuda.current_stream()
+        for slab in self.slabs:
+            grouped_gemm_cold(x2d, grouping, slab, out3d, out_col_off,
+                              x_row_is_pair, stream, _warm_max_blocks(), _wres_k_max(slab))
+
+
+@dataclass(frozen=True)
+class ColdGpuGateUp:
+    """cold gate+up — 노드마다 한 launch (같은 노드의 gate/up slab 융합)."""
+
+    gate: tuple
+    up: tuple
+    writes_all: bool = True  # 노드 shard의 합집합이 [0, N) 전체다 (plan 검증)
+
+    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking,
+            grouping=None) -> None:
+        from sglang.jit_kernel.prism_grouped import grouped_gemm_cold_gateup
+
+        _require_grouping(grouping, masking)
+        stream = torch.cuda.current_stream()
+        for g, u in zip(self.gate, self.up):
+            grouped_gemm_cold_gateup(x2d, grouping, g, u, out3d, 0, inter, False,
+                                     stream, _warm_max_blocks(), _wres_k_max(g, u))
+
+
+# ─── warm = kt 포맷 slab (2026-08-27) ────────────────────────────────────────
+#
+# warm의 거처가 row-major pinned에서 **kt packed slab(pinned, host-register)**으로
+# 바뀐 모드. GPU 읽기는 decode엔 packed worklist GEMV(prism_gemv_packed.cuh; sparse
+# 포함), prefill엔 cold-layout grouped GEMM(W-resident)이다. 계산 계약은 row-major
+# warm과 같고(정확표현 입력에서 비트일치) 저장 포맷만 kt와 한 벌이 된다 — 같은 slab을
+# prefill에서 CPU(kt warm 인스턴스)가 계산할 수도 있다 (executor의 hybrid).
+@dataclass(frozen=True)
+class PackedWarmTier:
+    """한 proj의 warm-kt (GPU-local 노드 slab 하나)."""
+
+    slab: ColdSlab
+    spec: Optional[SparseSpec] = None
+
+    def run(self, x2d, topk_ids, topk_weights, out3d, out_col_off, *,
+            x_row_is_pair, masking, grouping=None) -> None:
+        from sglang.jit_kernel.prism_gemv_packed import gemv_packed, gemv_packed_sparse
+        from sglang.jit_kernel.prism_grouped import grouped_gemm_cold
+
+        stream = torch.cuda.current_stream()
+        if grouping is not None:
+            _reject_masked_grouping(masking)
+            grouped_gemm_cold(x2d, grouping, self.slab, out3d, out_col_off, x_row_is_pair,
+                              stream, _warm_max_blocks(), _wres_k_max(self.slab))
+            return
+        if masking and self.spec is not None:
+            if topk_weights.dtype is not torch.float32:
+                raise TypeError("sparse tier requires fp32 topk_weights")
+            gemv_packed_sparse(x2d, topk_ids, topk_weights, self.slab, self.spec, out3d,
+                               out_col_off, x_row_is_pair, stream)
+            return
+        gemv_packed(x2d, topk_ids, self.slab, out3d, out_col_off, x_row_is_pair, stream)
+
+
+@dataclass(frozen=True)
+class PackedWarmGateUp:
+    gate: ColdSlab
+    up: ColdSlab
+    gate_spec: Optional[SparseSpec] = None
+    up_spec: Optional[SparseSpec] = None
+    writes_all: bool = True
+
+    def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking,
+            grouping=None) -> None:
+        from sglang.jit_kernel.prism_gemv_packed import (
+            gemv_packed_gateup, gemv_packed_sparse_gateup,
+        )
+        from sglang.jit_kernel.prism_grouped import grouped_gemm_cold_gateup
+
+        stream = torch.cuda.current_stream()
+        if grouping is not None:
+            _reject_masked_grouping(masking)
+            grouped_gemm_cold_gateup(x2d, grouping, self.gate, self.up, out3d, 0, inter, False,
+                                     stream, _warm_max_blocks(), _wres_k_max(self.gate, self.up))
+            return
+        if masking and self.gate_spec is not None:
+            if topk_weights.dtype is not torch.float32:
+                raise TypeError("sparse tier requires fp32 topk_weights")
+            gemv_packed_sparse_gateup(x2d, topk_ids, topk_weights, self.gate, self.up,
+                                      self.gate_spec, self.up_spec, out3d, 0, inter, False, stream)
+            return
+        gemv_packed_gateup(x2d, topk_ids, self.gate, self.up, out3d, 0, inter, False, stream)
+
+
+def _slab_sparse_spec(slab: ColdSlab, calib, thr, plan: Plan, layer_idx: int, proj: Proj) -> SparseSpec:
+    """warm-kt slab의 sparse 재료 — 패딩된 인덱스로 gather된 calib(a=0, c=0인 패딩 행은
+    energy 0이라 thr>0이면 죽고, weight도 0이라 어느 쪽이든 무해)."""
+    spec = plan.sparsity
+    ep = plan.expert(layer_idx, 0).proj(proj)
+    dev = slab.row_off.device
+    return SparseSpec(
+        a=calib.wn_sq.to(dev, torch.float32), c=calib.pair_dot.to(dev, torch.float32),
+        thr=thr.to(dev, torch.float32), p=float(ep.sparsity_p), lam=float(ep.sparsity_lambda),
+        pmax=spec.pmax, grid=spec.grid, ng=spec.ng, renorm_it=spec.renorm_it,
+    )
+
+
+def _require_grouping(grouping, masking: bool) -> None:
+    if grouping is None:
+        raise ValueError("cold GPU path requires a Grouping (grouped prefill only)")
+    _reject_masked_grouping(masking)
 
 
 @dataclass(frozen=True)
 class LayerTiers:
-    """한 레이어의 GPU 티어 — **phase 단위**다 (executor가 도는 축과 같다)."""
+    """한 레이어의 GPU 티어 — **phase 단위**다 (executor가 도는 축과 같다).
+
+    `Tier.COLD` 키는 cold GPU view가 있을 때만 존재하고, executor가 **대배치
+    prefill에서만** 그 항목을 돈다 (그 외에는 cold가 CPU 경로다). 둘이 같은
+    partial을 두 번 내지 않게 하는 것은 executor의 분기 하나다."""
 
     gateup: Mapping[Tier, GateUpRunner]
     down: Mapping[Tier, GpuTier]
@@ -467,6 +773,9 @@ def build_layer_tiers(
     prepared: PreparedWeights,
     plan: Plan,
     layer_idx: int,
+    cold_gpu: Optional[ColdGpuLayer] = None,
+    warm_kt: Optional[ColdGpuLayer] = None,
+    warm_kt_calib: Optional[dict] = None,
 ) -> LayerTiers:
     """Stage 2 산출물 → phase 단위 티어. 없는 티어는 항목 자체가 없다.
 
@@ -523,4 +832,24 @@ def build_layer_tiers(
         elif has_u:
             gateup[tier] = _GateUpSingle(
                 single(Proj.UP, tier), plan.dims.intermediate_size)
+    if cold_gpu is not None:
+        if not (cold_gpu.gate and cold_gpu.up and cold_gpu.down):
+            raise ValueError(f"layer {layer_idx}: cold GPU view must cover all projections")
+        gateup[Tier.COLD] = ColdGpuGateUp(cold_gpu.gate, cold_gpu.up)
+        down[Tier.COLD] = ColdGpuTier(cold_gpu.down)
+    if warm_kt is not None:
+        # warm-kt는 GPU-local 노드 slab 하나여야 한다 (원격 UVA 읽기는 느리다).
+        for name, slabs in (("gate", warm_kt.gate), ("up", warm_kt.up), ("down", warm_kt.down)):
+            if len(slabs) != 1:
+                raise ValueError(f"layer {layer_idx}: warm-kt {name} needs exactly one slab, got {len(slabs)}")
+        if Tier.WARM in gateup or Tier.WARM in down:
+            raise ValueError(f"layer {layer_idx}: warm-kt and row-major warm cannot coexist")
+        sparse_warm = sparse_on and Tier.WARM in SPARSE_TIERS and warm_kt_calib is not None
+        def spec(proj, slab):
+            if not sparse_warm:
+                return None
+            return _slab_sparse_spec(slab, warm_kt_calib[proj], prepared.thr[proj], plan, layer_idx, proj)
+        g, u, d = warm_kt.gate[0], warm_kt.up[0], warm_kt.down[0]
+        gateup[Tier.WARM] = PackedWarmGateUp(g, u, spec(Proj.GATE, g), spec(Proj.UP, u))
+        down[Tier.WARM] = PackedWarmTier(d, spec(Proj.DOWN, d))
     return LayerTiers(gateup=gateup, down=down)

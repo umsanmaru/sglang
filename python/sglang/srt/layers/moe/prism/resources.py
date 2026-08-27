@@ -73,6 +73,11 @@ class ColdStaging:
         # fp32 누산은 GPU rejoin에서 upcast로 수행)
         self._partial_gateup = torch.empty(m, k, 2 * i, dtype=torch.bfloat16, **kw)
         self._partial_down = torch.empty(m, k, h, dtype=torch.bfloat16, **kw)
+        # warm-kt 인스턴스(prefill에서 CPU가 warm 행을 계산하는 모드)의 partial — cold와
+        # 같은 (m, j) 행을 전 N열에 쓰므로 버퍼가 따로여야 한다. 지연 할당 (모드가 꺼져
+        # 있으면 만들지 않는다; 만든 뒤에는 재할당 금지 — 계약 ④).
+        self._warm_partial_gateup: Optional[torch.Tensor] = None
+        self._warm_partial_down: Optional[torch.Tensor] = None
         # 라우터 가중 (정규화 전). kt가 threshold를 직접 구하는 데 쓴다:
         # s = clip(p - lam*(g_e - ḡ), 0, pmax) → 격자 조회. _x와 같은 취급이면
         # 충분하다 — 채우기가 stream D2H이므로 다음 레이어의 쓰기가 cold host
@@ -133,6 +138,28 @@ class ColdStaging:
     def gateup_out(self, num_tokens: int) -> torch.Tensor:
         return self._partial_gateup[:num_tokens]
 
+    def _ensure_warm(self) -> None:
+        if self._warm_partial_gateup is None:
+            m, k = self.spec.max_tokens, self.spec.top_k
+            h, i = self.spec.hidden_size, self.spec.intermediate_size
+            kw = dict(pin_memory=self._partial_gateup.is_pinned())
+            self._warm_partial_gateup = torch.empty(m, k, 2 * i, dtype=torch.bfloat16, **kw)
+            self._warm_partial_down = torch.empty(m, k, h, dtype=torch.bfloat16, **kw)
+
+    def warm_partial_gateup_ptr(self) -> int:
+        self._ensure_warm()
+        return self._warm_partial_gateup.data_ptr()
+
+    def warm_partial_down_ptr(self) -> int:
+        self._ensure_warm()
+        return self._warm_partial_down.data_ptr()
+
+    def warm_gateup_out(self, num_tokens: int) -> torch.Tensor:
+        return self._warm_partial_gateup[:num_tokens]
+
+    def warm_down_out(self, num_tokens: int) -> torch.Tensor:
+        return self._warm_partial_down[:num_tokens]
+
     def down_out(self, num_tokens: int) -> torch.Tensor:
         return self._partial_down[:num_tokens]
 
@@ -143,6 +170,21 @@ class ExecutionResources:
     def __init__(self, spec: ResourceSpec, *, pin_memory: bool = True):
         self.spec = spec
         self.staging = ColdStaging(spec, pin_memory=pin_memory)
-        # warm 전용 스트림은 stager와 함께 사라졌다 — GPU 티어는 current
-        # stream에만 launch한다. 스트림은 cold의 host node가 타는 current
-        # stream 하나로 족하다.
+        # warm 전용 스트림 (2026-08-26 부활 — 용도는 다르다). stager 시절엔
+        # 전송용이었고, 지금은 prefill grouped 경로에서 warm(PCIe 바운드)
+        # 커널을 hot(compute 바운드)과 겹치기 위한 것이다. executor가 fork/join
+        # 이벤트를 관리하고, 여기는 소유만 한다 (스트림 핸들은 storage가 아니라
+        # 계약 ④의 재할당 금지 대상이 아니지만, 프로세스에 1개면 족하다).
+        self.warm_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device=spec.device)
+            if spec.device.type == "cuda" and torch.cuda.is_available() else None
+        )
+        # cold_async 모드의 cold 전용 stream + 완료 플래그 (pinned int32, kt가 쓰고 GPU가 읽음).
+        # 플래그는 단조 증가 seq — phase마다 값을 올려 재사용한다 (재할당 금지, 계약 ④).
+        self.cold_stream: Optional[torch.cuda.Stream] = (
+            torch.cuda.Stream(device=spec.device)
+            if spec.device.type == "cuda" and torch.cuda.is_available() else None
+        )
+        self.cold_flag = torch.zeros(1, dtype=torch.int32, pin_memory=pin_memory) if pin_memory \
+            else torch.zeros(1, dtype=torch.int32)
+        self.cold_seq = 0

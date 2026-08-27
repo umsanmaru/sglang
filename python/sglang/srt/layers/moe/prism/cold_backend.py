@@ -65,7 +65,14 @@ class KtColdBackend:
     """kt-kernel 구현. CPUInfer(스레드풀)와 레이어별 wrapper의 소유자."""
 
     def __init__(self, plan: Plan, *, max_tokens: int, num_numa_nodes: int,
-                 cpuinfer=None, cpuinfer_threads: int = 60):
+                 cpuinfer=None, cpuinfer_threads: int = 60,
+                 gpu_view_device=None, hybrid_mask: bool = False):
+        """gpu_view_device: 주면 load_layer가 kt packed slab을 그 device에서 읽을 수
+        있게 host-register하고 `gpu_view(layer)`로 기술자를 낸다 (cold_gpu.py).
+        None이면 cold는 CPU 전용이다.
+        hybrid_mask: kt config에 expert skip 마스크(pinned uint8 [E], C++가 매 호출
+        읽는다)를 단다. executor가 호출 직전에 값을 써 "이 expert는 GPU가 계산"을
+        알린다 (cold hybrid). 마스크가 1인 expert의 partial 행은 kt가 0으로 채운다."""
         from kt_kernel import kt_kernel_ext  # 지연 import
 
         self._ext = kt_kernel_ext
@@ -74,6 +81,18 @@ class KtColdBackend:
         self._num_nodes = num_numa_nodes
         self.cpuinfer = cpuinfer if cpuinfer is not None else kt_kernel_ext.CPUInfer(cpuinfer_threads)
         self._wrappers: dict[int, object] = {}
+        self._gpu_view_device = gpu_view_device
+        self._gpu_views: dict[int, object] = {}
+        self._warm_wrappers: dict[int, object] = {}
+        self._warm_views: dict[int, object] = {}
+        # 전 레이어 공유 — 층마다 값을 바꿔도 kt는 호출 시점의 값을 읽는다.
+        # 노드별 마스크: 소켓마다 GPU 몫이 다르다 (GPU-local 노드만 expert 분할, 원격
+        # 노드는 CPU가 전부 — 원격 slab의 UVA 읽기는 UPI를 건너 느리다).
+        self.hybrid_masks: Optional[list] = (
+            [torch.zeros(plan.dims.num_experts, dtype=torch.uint8, pin_memory=True)
+             for _ in range(num_numa_nodes)]
+            if hybrid_mask else None
+        )
 
     # ── Plan → kt config 번역 (유일한 번역 지점) ─────────────────────────
     @staticmethod
@@ -91,7 +110,10 @@ class KtColdBackend:
         if any(r != shard.row_off[e + 1] - shard.row_off[e] for e, r in enumerate(real)):
             dst.real_rows = real
 
-    def _build_config(self, layer_idx: int, cold: PendingColdTensors):
+    def _build_config(self, layer_idx: int, cold: PendingColdTensors,
+                      n_shards: Optional[dict] = None):
+        """n_shards: {"gateup": (offsets, rows), "down": (offsets, rows)} — 주면 plan의
+        cold_shards 대신 이 노드 테이블을 쓴다 (warm-kt: GPU-local 노드에 전량)."""
         plan, dims = self._plan, self._plan.dims
         # P0: expert 간 균일 기하 (weights.py 로더와 같은 요구)
         ep = plan.expert(layer_idx, 0)
@@ -106,8 +128,11 @@ class KtColdBackend:
         if ep.gate.cold_shards != ep.up.cold_shards:
             raise PlanError(f"{where}: gate and up must share cold N shards")
 
-        gu_off, gu_rows = _shard_tables(ep.gate.cold_shards, self._num_nodes, f"{where}.gateup")
-        dn_off, dn_rows = _shard_tables(ep.down.cold_shards, self._num_nodes, f"{where}.down")
+        if n_shards is None:
+            gu_off, gu_rows = _shard_tables(ep.gate.cold_shards, self._num_nodes, f"{where}.gateup")
+            dn_off, dn_rows = _shard_tables(ep.down.cold_shards, self._num_nodes, f"{where}.down")
+        else:
+            (gu_off, gu_rows), (dn_off, dn_rows) = n_shards["gateup"], n_shards["down"]
 
         cfg = self._ext.moe.MOEConfig(
             dims.num_experts, dims.top_k, dims.hidden_size, dims.intermediate_size, 0
@@ -184,6 +209,82 @@ class KtColdBackend:
             sparsity_tables=tables,
         )
         self._wrappers[layer_idx] = wrapper
+        if self.hybrid_masks is not None:
+            for node, mask in enumerate(self.hybrid_masks):
+                wrapper.set_node_gpu_experts_mask(node, mask)
+        if self._gpu_view_device is not None:
+            from sglang.srt.layers.moe.prism.cold_gpu import build_cold_gpu_layer
+
+            views = wrapper.cold_slab_views()
+            self._gpu_views[layer_idx] = build_cold_gpu_layer(
+                views, self._plan, layer_idx,
+                {Proj.GATE: cold.gate, Proj.UP: cold.up, Proj.DOWN: cold.down},
+                torch.device(self._gpu_view_device),
+            )
+
+    def gpu_view(self, layer_idx: int):
+        """ColdGpuLayer 또는 None (gpu_view_device 미설정)."""
+        return self._gpu_views.get(layer_idx)
+
+    # ── warm-kt: warm 행을 kt 포맷 slab으로 (GPU-local 노드 전량, 다른 노드 0행) ──
+    def load_warm_layer(self, layer_idx: int, warm: PendingColdTensors, thr=None,
+                        local_node: int = 0):
+        """warm 행의 kt 인스턴스. 계산은 (prefill CPU 몫이 있을 때만) 이 인스턴스가 하고,
+        저장은 slab을 host-register해 GPU가 packed 레이아웃으로 읽는다 (cold_gpu.py).
+        gpu_view_device가 필요하다 — warm의 존재 이유가 GPU 읽기이므로."""
+        from kt_kernel.experts_partial import PartialMoEWrapper
+        from sglang.srt.layers.moe.prism.cold_gpu import build_cold_gpu_layer
+
+        if self._gpu_view_device is None:
+            raise ValueError("warm-kt requires gpu_view_device (GPU reads the slab)")
+        if layer_idx in self._warm_wrappers:
+            raise RuntimeError(f"warm layer {layer_idx} already loaded")
+        dims = self._plan.dims
+        n = self._num_nodes
+        def table(full):
+            offs = [full if i != local_node else 0 for i in range(n)]
+            rows = [0 if i != local_node else full for i in range(n)]
+            return offs, rows
+        n_shards = {"gateup": table(dims.intermediate_size), "down": table(dims.hidden_size)}
+        cfg = self._build_config(layer_idx, warm, n_shards=n_shards)
+        tables = None
+        if self._plan.sparsity is not None:
+            if thr is None or any(b.calib is None for b in (warm.gate, warm.up, warm.down)):
+                raise PlanError(f"layer {layer_idx}: warm-kt sparse needs calib/thr")
+            tables = {
+                "gate_wn_sq": warm.gate.calib.wn_sq, "gate_pair_dot": warm.gate.calib.pair_dot,
+                "up_wn_sq": warm.up.calib.wn_sq, "up_pair_dot": warm.up.calib.pair_dot,
+                "down_wn_sq": warm.down.calib.wn_sq, "down_pair_dot": warm.down.calib.pair_dot,
+                "thr_gate": thr[Proj.GATE], "thr_up": thr[Proj.UP], "thr_down": thr[Proj.DOWN],
+            }
+        wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=self._plan.kernels.cpu_cold)
+        wrapper.load_weights_from_tensors(warm.gate.w_flat, warm.up.w_flat, warm.down.w_flat,
+                                          sparsity_tables=tables)
+        self._warm_wrappers[layer_idx] = wrapper
+        # plan cold_shards 대신 n_shards 기하로 view를 만든다 — build_cold_gpu_layer가 plan을
+        # 참조하므로 임시 shard 객체로 대체한다.
+        views = [v for v in wrapper.cold_slab_views() if int(v["node"]) == local_node]
+        self._warm_views[layer_idx] = build_cold_gpu_layer(
+            views, self._plan, layer_idx,
+            {Proj.GATE: warm.gate, Proj.UP: warm.up, Proj.DOWN: warm.down},
+            torch.device(self._gpu_view_device),
+            shard_override={Proj.GATE: (local_node, 0, dims.intermediate_size),
+                            Proj.UP: (local_node, 0, dims.intermediate_size),
+                            Proj.DOWN: (local_node, 0, dims.hidden_size)},
+        )
+
+    def warm_view(self, layer_idx: int):
+        return self._warm_views.get(layer_idx)
+
+    def submit_warm_gateup(self, layer_idx, qlen_ptr, k, expert_ids_ptr, x_ptr, out_ptr,
+                           cuda_stream=None, weights_ptr=0):
+        self._warm_wrappers[layer_idx].submit_forward_gateup(
+            qlen_ptr, k, expert_ids_ptr, x_ptr, out_ptr, cuda_stream, weights_ptr)
+
+    def submit_warm_down(self, layer_idx, qlen_ptr, k, expert_ids_ptr, act_ptr, out_ptr,
+                         cuda_stream=None, weights_ptr=0):
+        self._warm_wrappers[layer_idx].submit_forward_down(
+            qlen_ptr, k, expert_ids_ptr, act_ptr, out_ptr, cuda_stream, weights_ptr)
 
     def _wrapper(self, layer_idx: int):
         try:
@@ -201,6 +302,10 @@ class KtColdBackend:
                     weights_ptr=0):
         self._wrapper(layer_idx).submit_forward_down(
             qlen_ptr, k, expert_ids_ptr, act_ptr, out_ptr, cuda_stream, weights_ptr)
+
+    def submit_signal(self, cuda_stream: int, flag_ptr: int, value: int) -> None:
+        """stream host node로 kt 큐 끝에 '플래그=value' 태스크를 붙인다 (cold_async)."""
+        self.cpuinfer.submit_with_cuda_stream(cuda_stream, self.cpuinfer.signal_task(flag_ptr, value))
 
     def sync(self, cuda_stream=None):
         if cuda_stream is None:

@@ -95,6 +95,8 @@ class TierShard:
     uniform_k: Optional[int] = None
     band_start: Optional[int] = None
     calib: Optional[CalibShard] = None
+    # expert당 최대 K 행 (host에서 로드 시 1회 계산) — grouped W-resident 커널의 smem 예산.
+    k_max: int = 0
 
     @property
     def num_experts(self) -> int:
@@ -142,6 +144,7 @@ class TierShard:
             contiguous=True,
             uniform_k=k,
             band_start=k_offset,
+            k_max=k,
         )
 
 
@@ -220,6 +223,10 @@ class PreparedWeights:
     hot: Optional[HotStore]  # VRAM 상주 밴드 (없으면 세 proj 모두 None)
     warm: WarmStore
     cold: PendingColdTensors  # S5 이후: ColdHandle
+    # warm을 kt 포맷 slab(pinned)으로 두는 모드(2026-08-27): warm 행을 cold와 같은
+    # ckpt-방향 flat(타일 올림)으로 잘라 kt 인스턴스에 주입한다. 이때 `warm`의 shard는
+    # 전부 None이다 — GPU는 kt slab을 packed GEMV/grouped(cold-layout)로 읽는다.
+    warm_kt: Optional[PendingColdTensors] = None
     # proj → [E, ng] fp32 threshold 곡선. dense plan이면 None.
     thr: Optional[Mapping[Proj, torch.Tensor]] = None
 
@@ -309,6 +316,8 @@ def _build_shard(
     warm=pinned). row_off·k_index는 **항상 커널이 읽는 device**로 간다."""
     uniform_k, band_start = _uniform_band(ti)
     flat = _gather_flat(src, ti, uniform_k, band_start)
+    ro = ti.row_off
+    k_max = int((ro[1:] - ro[:-1]).max()) if ti.num_experts > 0 else 0
     return TierShard(
         w_flat=place(flat),
         row_off=ti.row_off.to(idx_device),
@@ -317,6 +326,7 @@ def _build_shard(
         uniform_k=uniform_k,
         band_start=band_start,
         calib=calib,
+        k_max=k_max,
     )
 
 
@@ -327,6 +337,20 @@ def _proj_source(w13: torch.Tensor, w2: torch.Tensor, inter: int, proj: Proj):
     if proj is Proj.UP:
         return w13[:, inter:, :]
     return w2
+
+
+def _warm_kt_tensors(enabled: bool, shards: dict, layer_idx: int):
+    """warm-kt 인스턴스 입력. kt partial 인스턴스는 세 proj를 모두 요구하므로(cold와
+    같은 제약) warm이 일부 proj에만 있는 plan은 이 모드로 실행할 수 없다 — 조용히
+    row-major로 떨어지지 않고 즉사한다."""
+    if not enabled or all(v is None for v in shards.values()):
+        return None
+    if any(v is None for v in shards.values()):
+        missing = [p.value for p, v in shards.items() if v is None]
+        raise PlanError(
+            f"layer {layer_idx}: warm-kt needs warm rows on all projections "
+            f"(missing {missing}) — kt partial instances carry gate/up/down together")
+    return PendingColdTensors(gate=shards[Proj.GATE], up=shards[Proj.UP], down=shards[Proj.DOWN])
 
 
 def prepare_layer_weights(
@@ -340,6 +364,7 @@ def prepare_layer_weights(
     device: Optional[torch.device] = None,
     warm_node: Optional[int] = None,
     cold_tile_rows: int = 32,
+    warm_kt: bool = False,
 ) -> PreparedWeights:
     """한 레이어의 full weight를 Plan대로 절단·변환·배치한다.
 
@@ -383,6 +408,7 @@ def prepare_layer_weights(
 
     hot_shards: dict[Proj, Optional[TierShard]] = {}
     warm_shards: dict[Proj, Optional[TierShard]] = {}
+    warm_kt_shards: dict[Proj, Optional[ColdShard]] = {}
     cold_shards: dict[Proj, Optional[ColdShard]] = {}
 
     if any(layer_index.get(p, Tier.HOT) is not None for p in Proj) and device is None:
@@ -419,10 +445,24 @@ def prepare_layer_weights(
                 tuple(t.shape), t.dtype, warm_node, f"{where} warm store")
             store.copy_(t)
             return store
-        warm_shards[proj] = None if warm_ti is None else _build_shard(
-            src, warm_ti, idx_device=idx_device, place=place_warm,
-            calib=tier_calib(warm_ti, "warm"),
-        )
+        if warm_kt:
+            # warm = kt 포맷: cold와 같은 절단(타일 올림, ckpt 방향). 저장은 kt가 pack.
+            warm_shards[proj] = None
+            if warm_ti is None:
+                warm_kt_shards[proj] = None
+            else:
+                real = [warm_ti.k_rows(e) for e in range(dims.num_experts)]
+                flat, off, idx, real_t = _cold_flat(src, warm_ti, real, cold_tile_rows)
+                padded = TierIndex(row_off=off, idx=idx, contiguous=warm_ti.contiguous)
+                warm_kt_shards[proj] = ColdShard(
+                    w_flat=flat, row_off=off, k_index=idx, real_rows=real_t,
+                    calib=tier_calib(padded, "warm", real_rows=real),
+                )
+        else:
+            warm_shards[proj] = None if warm_ti is None else _build_shard(
+                src, warm_ti, idx_device=idx_device, place=place_warm,
+                calib=tier_calib(warm_ti, "warm"),
+            )
 
         cold_ti = layer_index.get(proj, Tier.COLD)
         if cold_ti is None:
@@ -454,4 +494,5 @@ def prepare_layer_weights(
             None if calib is None
             else {proj: calib.thr(layer_idx, proj) for proj in Proj}
         ),
+        warm_kt=_warm_kt_tensors(warm_kt, warm_kt_shards, layer_idx),
     )
