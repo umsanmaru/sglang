@@ -95,9 +95,11 @@ def test_staging_shapes():
 
 @cuda_required
 def test_execution_resources_bundle():
-    """남은 영구 자원은 staging 하나다 — arena·stager 스크래치·sel 버퍼는
-    소비자(bmm의 연속 배치 축)와 함께 사라졌다."""
+    """남은 영구 storage는 staging 하나다 — arena·stager 스크래치·sel 버퍼는
+    소비자(bmm의 연속 배치 축)와 함께 사라졌다. warm_stream은 storage가 아니라
+    스트림 핸들이고, prefill grouped 경로의 hot∥warm 겹침용으로 되살아났다
+    (2026-08-26)."""
     res = ExecutionResources(make_spec(), pin_memory=True)
     assert isinstance(res.staging, ColdStaging)
     assert not hasattr(res, "arena")
-    assert not hasattr(res, "warm_stream")
+    assert isinstance(res.warm_stream, torch.cuda.Stream)

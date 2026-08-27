@@ -36,7 +36,18 @@ Prism = K-split hot/warm/cold 티어링 MoE 오프로드. 패키지명이자 프
 - `COLD` — weight가 **pageable host(NUMA-local)** 에 상주. CPU가 읽고 계산한다.
 
 HOT과 WARM의 **계산 계약은 완전히 동일하다**: 같은 dense 스토어 방향, 같은
-커널, 같은 출력 레이아웃. 다른 것은 포인터가 가리키는 메모리의 종류 하나뿐이고,
+커널, 같은 출력 레이아웃.
+
+> **2026-08-27 prefill 개정.** GPU 티어의 커널은 M에 따라 둘이다 — decode/소배치
+> (M < `GROUPED_MIN_M`)는 pair-native worklist GEMV, 그 이상은 **expert-grouped
+> GEMM**(`prism_grouped.cuh`; pair를 expert로 정렬해 W를 expert당 한 번 읽는다).
+> 둘은 같은 스토어·같은 출력 레이아웃을 읽고 쓰며 정확표현 입력에서 비트일치한다 —
+> 커널 선택은 호출 형태의 결정이고 계약이 아니다. 그리고 **COLD도 큰 M에서는 GPU가
+> 읽을 수 있다**: kt가 pack한 AMX 레이아웃 slab을 `cudaHostRegister`로 매핑하고
+> grouped GEMM의 COLD 레이아웃 로더가 재배치 없이 해석한다 (`cold_gpu.py`). 이때
+> cold의 거처(pageable host, C++ 소유)는 그대로이고 **읽는 주체만** CPU에서 GPU로
+> 바뀐다 — weight는 여전히 한 벌이다(계약 ③). 선택은 executor의 `cold_gpu_min_m`
+> 하나이며, 한 호출에서 cold partial은 CPU 또는 GPU 정확히 한쪽만 낸다. 다른 것은 포인터가 가리키는 메모리의 종류 하나뿐이고,
 그것이 `gemv_worklist` ↔ `gemv_worklist_pinned`(`w_on_device` 플래그) 차이의
 전부다. 초판의 "step마다 선택된 expert의 밴드만 GPU로 전송되어"는 폐기한다 —
 전송하는 경로(arena staging)는 bmm이 연속 배치 축을 요구해서 존재했고, 가변

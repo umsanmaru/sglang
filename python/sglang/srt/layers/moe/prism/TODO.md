@@ -43,7 +43,275 @@ AVX 쪽이 상속으로 버퍼를 공유하는데, 그 버퍼가 제자리 변�
 
 ---
 
-## grouped GEMM prefill (worklist 대비 1.7배 회수)
+## ~~grouped GEMM prefill~~ — ✅ 완료 (2026-08-26/27, 3단계)
+
+**진단** (35B dims h12.5/w12.5/cold75, H100, 레이어 1개, M=2048): 층 264 ms 중
+warm 250 ms — worklist가 pair마다 W를 다시 읽어(중복도 M·k/E = 64배) 층당
+12.9 GB를 PCIe로 읽었다 (스토어는 192 MiB). 엔진 prefill 5.1 ms/tok, 2688토큰
+TTFT 13.8 s.
+
+**1단계 — grouped GEMM** (`prism_grouped.cuh`, `grouping.py`, tiers/executor
+grouped 경로, `GROUPED_MIN_M=16`): pair를 expert로 묶어 W를 expert당 한 번 읽는
+wmma bf16 커널. hot/warm 같은 커널(포인터 종류만 다름), gate+up 융합 launch.
+M=2048: warm gateup 167 → 2.64 ms(63배, PCIe 51 GB/s = 스토어 1회 읽기 이론치),
+hot gateup 3.47 → 0.65 ms. 층 264 → 33 ms. **엔진 TTFT 13.8 → 1.90 s (7.3배),
+0.71 ms/tok.** 임계 M: M=8은 worklist 우세, M≥16 grouped 우세 (warm PCIe가 결정).
+
+**2단계 — hot∥warm 스트림 분리** (`resources.warm_stream`, executor
+`split_streams`, `SGLANG_PRISM_SPLIT_STREAMS`, warm launch grid 상한
+`WARM_MAX_TILES`): 엔진 TTFT 1.90 → 1.74 s (−8%). 단 마이크로벤치(cold 없는
+h50/w50)에서는 layer 21.3 → 20.6 ms로 이득이 작다 — warm 그리드 상한을 132/32/16
+블록으로 낮춰도 hot이 거의 겹치지 않는다 (아래 미룸 항목 "UVA 커널과 compute
+커널의 동시 실행" 참조). warm 커널은 그리드 32 타일(512블록)로도 PCIe를 포화한다.
+
+**3단계 — cold GPU 읽기** (`cold_gpu.py`, kt `alloc_cold_slabs` +
+`cold_slab_views()`, 커널 COLD 레이아웃 로더, executor `cold_gpu_min_m`,
+`SGLANG_PRISM_COLD_GPU_MIN_M`): kt packed AMX 레이아웃을 cudaHostRegister로
+매핑해 GPU가 **재배치 없이 제자리 읽기** — weight 한 벌. cold 75% = 1.15 GiB/층
+→ 23.6 ms/층 @ 51 GB/s, M과 무관. CPU cold(14스레드)는 M=512 12 ms / 2048
+28 ms / 4096 49 ms → **교차점 M≈1500–2000** (스레드 수·PCIe 세대에 따라 이동).
+정합: CPU cold 대비 rel 8e-5 (bf16 누산 순서 차이). **엔진 TTFT** (cold GPU 강제
+vs CPU cold, 둘 다 grouped+split): 672tok 806 vs 715 ms, 1344tok 1049 vs 1044,
+2688tok **1485 vs 1744 (−15%)**, 4032tok 1925 ms (0.48 ms/tok). 기본 임계
+`COLD_GPU_MIN_M = 1536`. 켜면 cold 전량(35B 45 GiB)이 host-register되어 pinned가
+된다 — `SGLANG_PRISM_COLD_GPU_MIN_M=0`이 끄는 스위치.
+
+**누적**: prefill 2688tok TTFT 13.8 s → 1.49 s (**9.3배**), 5.14 → 0.55 ms/tok.
+측정은 전부 GPU1(H100)이 조용할 때; 08:10 이후 타 사용자 vLLM이 GPU1을 점유해
+`WARM_MAX_BLOCKS=128` 기본값의 executor 수준 확인(nocold plan)은 미완 — 커널 단독
+실험 근거로 기본값을 뒀다.
+
+**kt 기본 커널 vs prism, 단일 소켓(node0) 6스레드, GPU0 Blackwell, TTFT min/3
+(2026-08-27)** — 1-node plan `q36_h125_w0125_1node_wl`:
+
+| tok | kt 기본(cold-only CPU) | prism CPU cold | prism cold GPU(≥1536) |
+|---|---|---|---|
+| 168 | 453 | 804 | 771 |
+| 672 | 720 | 1200 | 1343 |
+| 1344 | 1080 | 1675 | 1927 |
+| 2688 | 1632 | 2571 | **1602** |
+| 4032 | 2236 | 3470 | **2190** |
+| 5376 (4096+1280 청크) | 3168 | 5000 | 3796 |
+| 8064 (2청크) | 4468 | 6850 | **4277** |
+
+읽는 법: (1) **CPU cold 경로는 6스레드에서 kt 기본에 진다** — 일이 75%인데 층당
+cold 69 ms(M=2688) vs kt 기본 전체 41 ms. 원인은 partial 계약의 구조 비용: cold가
+(token, slot)별 partial을 bf16 [M,k,2I]/[M,k,H]로 내보내고(kt 기본은 라우터 가중
+합 [M,H]만 냄 — 출력 8배), act [M,k,I] D2H, phase마다 sync·GPU rejoin 동안 CPU
+유휴. 스레드가 적을수록 CPU 계산이 짧아져 이 고정비가 지배한다. (2) **cold GPU면
+kt 기본과 동급~4% 우세** (PCIe 바운드: 청크 4096당 warm+cold 52 GiB ≈ 1.1 s
+이론, 실측은 토큰 타일 2개 재읽기로 +30%). (3) 4096 청크 다음의 짧은 꼬리
+청크(1280)는 CPU cold로 떨어져 5376이 4032보다 1.6 s 느리다 — 청크 단위가 아니라
+**요청 단위**로 cold 경로를 정하거나 hybrid로 가야 한다. (4) 168~1344에서 cold GPU
+켠 런이 CPU cold 런보다 10% 느린 것은 마이크로벤치로 재현되지 않았다(slab
+등록은 CPU cold 속도에 영향 없음) — 엔진 런 간 노이즈로 본다.
+
+**nsys 리포트 3종** (`profiles/{kt_q36_1s6t_prefill2688, prism_q36_1s6t_prefill2688_cpucold,
+prism_q36_1s6t_prefill2688_coldgpu}.nsys-rep`, 2688tok, node0 6thr, GPU0; 드라이버
+scratchpad `engine_nsys_prefill.py`, 요약 `summarize_nsys.py`):
+
+| | TTFT | GPU 커널 합 | 주역 |
+|---|---|---|---|
+| kt 기본 | 1634 ms | 64 ms (4%) | 전부 CPU AMX — 층당 ~39 ms에 expert 100% |
+| prism CPU cold | 2712 | 482 (18%) | `cold.*.window` 2075 ms(77%) = CPU 75% 행에 층당 ~50 ms; hot/warm GPU 324 ms는 그 안에 숨음; H2D 97 + D2H 27 |
+| prism cold GPU | 1617 | 1547 (96%) | cold grouped GEMM 1113 ms(72%, 층당 28 ms ≈ 43 GB/s), hot/warm 273, rejoin ~100, memcpy 0.5 |
+
+행당 CPU 효율: kt 네이티브 39 ms/100% vs partial 경로 50 ms/75% → **1.7배 열세**
+(출력 8배·gather/pack·2-phase). cold GPU 경로의 rejoin/elementwise 100 ms(6%)는
+fp32 누산·silu·캐스팅 분리 launch — 융합하면 회수 가능. `s1.topk_d2h`(eager 경로의
+`topk_ids.to("cpu")`)는 cold GPU에서 불필요한 sync 포인트다.
+
+**partial export 병렬화 (kt `export_rows_parallel`, 2026-08-27)**: `KT_PARTIAL_TIMING=1`
+단계 분해(M=2688, 6thr)에서 export가 **단일 스레드 memcpy**로 gateup 6.4 + down 14.5 =
+층당 21 ms(CPU cold 층 60 ms의 1/3)였다 — down이 gateup만큼 걸리던 이유의 절반
+(나머지 절반은 K=384 짧은 down GEMM의 효율 2.5 vs 3.5 TFLOPS). subpool 16토큰 블록
+work-stealing으로 → export 1.6 + 3.2 ms, 층당 44 ms. 엔진(CPU cold 6thr): 2688tok
+2571 → **2099 ms**, 8064tok 6850 → **5332**. kt 기본(1632/4468) 대비 남은 격차 ~1.25배
+= 출력 8배 D2H/H2D + down GEMM 효율 + 2-phase sync. kt 기본 경로는 이 함수를 쓰지
+않아 무영향. 남은 CPU 단계: gateup pack(x gather) 4.8 ms/층.
+
+**apple-to-apple CPU 커널 (kt 네이티브 `forward_prefill` vs partial 경로, 같은 층·M=2688·
+node0 6thr·균등 라우팅, `KT_PARTIAL_TIMING=1`; scratchpad `bench_kt_native_vs_partial.py`,
+2026-08-27)**:
+
+| 단계 (ms/층) | kt 네이티브 100% | partial 100% | partial 75% |
+|---|---|---|---|
+| gate/up GEMM (+to_mat) | 24.3 | **24.3** | 19.1 |
+| down GEMM (+to_mat) | 16.0 | **15.6** | 13.3 |
+| 나머지 | cpy_input 2.2 + packA 2.9 + act 1.4 + packA_down 0.6 + weight_sum 1.6 = 8.7 | pack 5.1+1.7 + export 1.6+3.2 = 11.6 | 3.9+1.4 + 1.6+3.2 = 10.1 |
+| 합 | 49.1 | 51.8 | 43.0 |
+
+**GEMM은 동일하다** — 같은 `do_*_gemm`/`to_mat`/work-stealing 코드라 시간이 소수점까지
+같다. CPU 커널이 느린 것이 아니고, partial의 CPU측 초과분은 층당 +2.9 ms(pack이
+native의 cpy_input+packA보다 크고, export가 weight_sum보다 큼)뿐이다. 남은 엔진 격차
+(2099 vs 1632 = 층당 52 vs 41 ms)는 CPU 밖에 있다: partial 경로는 층마다 **CPU 구간 ↔
+GPU 구간(rejoin#1 silu·캐스팅 ~2.5 ms, D2H/H2D 3 ms, attention/dense 1.6 ms)이 직렬**로
+번갈아 돌아 CPU가 층당 ~7 ms 유휴다 (40층 × 7 ≈ 280 ms). kt 네이티브는 GPU 구간이
+attention 1.6 ms뿐이다. 해법은 CPU/GPU 파이프라이닝 — cold-down deferral(다음 층 attention
+아래로) 또는 M을 반으로 쪼개 반쪽 rejoin 동안 다른 반쪽 cold 계산.
+
+주의: 마이크로벤치(균등 라우팅) 네이티브 49 ms vs 엔진 kt 기본 ~41 ms/층 — 엔진 프롬프트
+("alpha bravo …" 16단어 반복)는 라우팅이 소수 expert에 몰려 expert당 M이 커 AMX 효율이
+높다(M_STEP 패딩↓, B 재사용↑). 두 경로가 같은 프롬프트를 쓰므로 비교는 공정하지만,
+절대값은 프롬프트 의존이다 — 실제 텍스트로 재측정할 것.
+
+**"graph를 씌우면?"의 상한 실측** — `SGLANG_PRISM_COLD_STREAM=1`(cold submit/sync를
+stream host node로, host 블로킹 제거 = graph가 없앨 수 있는 성분만 제거), CPU cold 6thr:
+2688tok 2099 → 1964 ms(−6%), 8064tok 5332 → 5450(±0). 즉 host dispatch 갭은 층당 ≤3 ms고
+나머지 격차는 CPU↔GPU 의존 사슬의 직렬화다 — graph로는 안 없어지고 파이프라이닝(deferral
+/ M 분할)이 필요하다.
+
+**rejoin 융합 (`rejoin.py`, Triton 2커널, 2026-08-27)**: torch 사슬(캐스팅·add·split·
+silu·mul·wsum, 층당 ~30 launch·2.5 ms GPU) → partial을 한 번만 읽는 커널 2개. 207
+테스트 통과(정확표현 비트일치 포함). 마이크로벤치 비-CPU 잔여 6.6 → 4.9 ms/층.
+엔진(6thr): CPU cold 2688tok 2099 → 2073, 8064 5332 → 5213; cold GPU 2688 1602 →
+1509, **8064 4277 → 4016 (kt 기본 4468 대비 −10%)**. 다음은 M 분할 파이프라인
+(cold 반쪽씩 → GPU 구간을 다른 반쪽 CPU 시간 아래로).
+
+**host launch 오버헤드 실측 (nsys cuda_api_sum, 2688tok 6thr)**: CPU cold 경로 launch
+API 63 ms/4826회(**13.1 µs/회 — 정상 5–6의 2배**, host 스레드가 node0의 kt 워커 6개와
+코어 경합 추정) + Python dispatch(추정 ~20 µs/회 ≈ 100 ms) ≈ **160 ms ≈ 4 ms/층 ≈ 8%**.
+cold GPU 경로는 5.7 µs/회·28 ms(호스트가 놀아서 정상). 이 성분이 graph/host 선행
+발행으로 지울 수 있는 상한이고, `COLD_STREAM=1`의 −6%가 그 대부분이다. 나머지
+미설명 ~4 ms/층은 kt 풀의 phase 진입/sync 지연으로 남는다. 저렴한 시도: scheduler
+스레드를 kt 워커 코어 밖에 pin(13 → 6 µs면 ~35 ms).
+
+**prefill MoE 층 CUDA graph 실측** (`bench_layer_tiers.py --graph 1`: `force_graph_path`
+executor로 캡처, cold는 stream host node, 6thr node0): eager → replay ms/층 — CPU cold
+M=672 25.19 → 24.56, M=2688 48.84 → 48.43; cold GPU M=2688 28.76 → 27.91. 출력 동일.
+**graph 이득 ≤ 1 ms/층(≤3%)** — prefill은 launch 바운드가 아니다. API 트레이스의 63 ms
+launch 시간은 host가 앞서 발행하며 CPU 계산과 겹치는 부분이 대부분이었다. 미설명
+잔여는 kt 풀 phase 진입/sync 지연 + sglang 측 층 밖 오버헤드로 남는다.
+
+**cold hybrid (2026-08-27)** — cold GPU 조건에서 expert를 GPU/CPU로 나눠 **동시** 계산.
+kt skip 마스크(`gpu_experts_mask`, pinned u8, 호출 직전 host 쓰기; skip 행은 kt가 0-fill)
++ 제한 그룹핑(`build_grouping(expert_mask=)`) + 4-part rejoin. env
+`SGLANG_PRISM_COLD_HYBRID_FRAC=gu,dn` (phase별 비율 — down은 CPU export 고정비가 커
+GPU 몫이 더 커야 균형). eager·비-stream 호출에서만 켠다. 정합: CPU cold 대비 rel 4e-5.
+
+| M=2688, ms/층 | CPU cold | all-GPU cold | hybrid 최적 |
+|---|---|---|---|
+| node0 6thr | 47.8 | 28.4 | **26.8** (0.65, 0.85) → −6% |
+| 2노드 14thr | 31.3 | 28.6 | **25.0** (0.55, 0.80) → −13% |
+
+분해(6thr, 0.65/0.85): CPU gu 12.8 / dn 6.3 vs GPU(warm+cold) 12.9 / 8.1 — phase 균형은
+맞고, 이득이 작은 이유는 (a) 6스레드 CPU가 cold의 1/3만 가져가 GPU측이 27.6 → 21로만
+줄고, (b) CPU partial의 H2D(3 ms)·4-part rejoin·zero-fill export(3.1 ms)가 그 절반을
+되먹는다. 이득 ∝ CPU 몫. 개선 여지: rejoin이 (m,j) 소유를 마스크로 골라 읽으면
+zero-fill·H2D 절반 제거(~2 ms/층).
+
+**dual socket 14thr 엔진 비교 (2026-08-27, 2-node plan `q36_h125_w0125_dense`)**:
+
+| tok | kt 기본 2s14t | prism CPU cold | prism all-GPU cold | prism hybrid(expert, 비용모델) |
+|---|---|---|---|---|
+| 2688 | **1370** | 1439 (+5%) | 1721 | 1492 |
+| 8064 | **3312** | 3764 (+14%) | 5124 | 4074 |
+
+- all-GPU cold가 1노드 plan(4016)보다 훨씬 느린 이유: node1 slab을 GPU0(node0)이
+  **원격 소켓 UVA**로 읽는다 — warm의 GPU-local NUMA 규칙이 cold GPU에도 그대로 적용된다.
+- hybrid 분할은 **비용 모델**로 바꿨다(`_balance_hybrid`): GPU 비용 ∝ expert 수(W 바이트),
+  CPU 비용 ∝ pair 수 → 꼬리 expert를 GPU, 몰린 expert를 CPU. 첫 판(몰린 expert를 GPU)은
+  6thr 8064tok에서 7.3 s로 역효과였다. 강한 skew에선 모델이 all-GPU로 수렴한다(active
+  expert가 줄어 GPU가 전부 싸짐).
+- **다음 = 계층 분할**: 소켓 경계는 N-shard(원격 shard → 그 소켓 CPU 전부, GPU-local
+  shard → GPU + local CPU expert 분할), shard 비율은 plan `cold_shards`로 재조정(node0↑).
+  필요한 kt 변경: 노드별 `gpu_experts_mask` 포인터(지금은 TP 래퍼 공용). 어림 층당
+  ~17 ms @2688 (kt dual ≈ 31·(2688/4096) 환산과 비교 시 ~1.8배).
+
+**W-resident grouped GEMM (2026-08-27, `prism_grouped_gemm_wres`, PCIe 경로 기본 ON
+`WRES_PCIE`)**: 블록 = (expert, 열 타일)이 W 슬라이스를 smem에 1회 올리고 토큰 타일을
+순회 → pair 수와 무관하게 W 1회 읽기. smem이 부족하면(GPU0 sm_120 99 KB) K를 조각내
+fp32 scratch로 누산을 이어간다(BN=64 유지 — BN=16 폴백은 A gather 16배로 회귀했다:
+cold gateup 15.8 → 18.7). 비트일치(row-major·cold 레이아웃, skew·pair>128 포함). 속도
+(GPU0, uniq 바이트 기준): warm gateup M=4096 skew 8.6 → 2.7 ms(16 → 49 GB/s), cold
+gateup skew 12.9 → 8.2, 균등 M=2688 회귀 없음(15.9), **M=4096 층 46.6 → 30.8 ms**.
+
+**packed-layout GEMV (decode, `prism_gemv_packed.cuh`)**: kt 32×32 VNNI 타일을 그대로
+읽는 worklist GEMV — dense·gate+up 융합·**k2wl2 sparse**(페어 마스크 = 타일의 16-dword
+행 하나) 전부 row-major 커널과 비트일치. M=1 pinned 90 µs (row-major pinned 107).
+→ warm을 **kt 포맷 slab 한 벌(pinned)**로 두는 모드 `SGLANG_PRISM_WARM_KT=1`
+(loader `warm_kt`, backend `load_warm_layer`(GPU-local 노드 전량·타 노드 0행 — kt 검증
+완화), tiers `PackedWarmTier/GateUp`). 다음: prefill에서 warm-kt 인스턴스를 CPU가
+계산하는 경로(hot=0 → kt 네이티브와 같은 FLOPs) + warm/cold 공통 hybrid.
+
+**W-resident + hybrid 이중 합산 버그 (2026-08-27 발견·수정)**: `prism_grouped_gemm_wres`가
+expert 루프에서 `tile_off`(hybrid의 expert 마스크)를 보지 않아 GPU가 cold 100%를 계산
+→ CPU 몫 행이 rejoin에서 두 번 더해졌다. hybrid nsys에서 cold 커널 863 ms(all-GPU
+~600)로 드러남. `tile_off[e+1]==tile_off[e]`면 skip으로 수정, 정합 복구(rel 5e-5),
+회귀 테스트 `test_cold_hybrid_matches_cpu_cold`. 그 사이의 hybrid+wres 수치(6thr
+2688 1411/1510 ms)는 무효.
+
+**warm-kt 판정**: h125 warm-kt(GPU packed/grouped) 8064tok 2602 ms = row-major 2592와
+동일; hot=0 전부 GPU 2812; hot=0 전부 CPU(warm-kt+cold) 7785(kt 4468) — CPU 계산은
+이 하드웨어에서 GPU 읽기에 못 미친다. **기본 경로는 row-major warm + W-resident +
+cold GPU**, warm-kt는 `SGLANG_PRISM_WARM_KT=1` 옵션으로만 유지.
+
+**hybrid nsys (수정 후, 2688tok 6thr, `profiles/prism_q36_1s6t_prefill2688_hybrid`)**:
+TTFT 1335 ms(비프로파일) vs all-GPU cold 1061 — **hybrid가 더 느리다**. 분해: GPU cold
+wres 703 ms(8.8 ms/launch), CPU `cold.gu.window` 3.9 ms/층, **`cold.dn.h2d_out` 3.5 ms/층**
+(88 MB H2D가 이론 1.7의 2배 — GPU의 UVA W 읽기와 같은 H2D 방향 PCIe를 나눠 쓴다),
+H2D 합 133 ms. 즉 hybrid의 구조 비용 = CPU partial H2D가 GPU W 읽기와 **링크 경합** +
+zero-fill export + 4-part rejoin. 6스레드에서는 CPU 몫(~1/3)의 절감보다 이 비용이 커서
+순손실. hybrid는 CPU가 충분히 강하거나(14thr 마이크로벤치 −13%) PCIe가 널널할 때만
+의미가 있다 — 기본은 **all-GPU cold(≥임계) / CPU cold(그 아래)**, hybrid는 옵션.
+비용 모델 ratio도 보정점 상수(`HYBRID_CALIB_PAIRS`)로 고정했다 (이전엔 현재 분포로
+환산해 small-M에서 전부 GPU로 몰았다).
+
+**small-M prefill (100–300 tok × 10, hot=0/warm12.5, 2노드 14thr, TTFT ms min/3, 2026-08-27)**:
+
+| tok | kt dual 14thr | prism CPU cold | **CPU cold + COLD_STREAM=1** | cold GPU(강제) | hybrid(비용모델) |
+|---|---|---|---|---|---|
+| 102 | 348 | 452 | **353** | 526 | 436 |
+| 138 | 275 | 393 | **288** | 604 | 380 |
+| 178 | 316 | 407 | **304** | 626 | 406 |
+| 217 | 382 | 454 | **322** | 642 | 426 |
+| 265 | 421 | 450 | **335** | 661 | 455 |
+| 295 | 367 | 468 | **360** | 697 | 481 |
+
+- 이 구간은 층당 CPU 계산 1–3 ms라 **host 고정비가 지배**: CPU cold는 kt의 1.07–1.43배,
+  `COLD_STREAM=1`(host 선행 발행)로 **0.80–1.05배** — kt와 동급~우위. 소수 프롬프트에서
+  노이즈 큼(kt 138tok < 102tok).
+- cold GPU 강제는 1.3–2.2× — PCIe 고정비. 기본 임계(`COLD_GPU_MIN_M=1536`)가 맞다.
+- hybrid는 ratio 수정 후 CPU와 동급(GPU pair 몫 1–2%로 스스로 수렴) — 이전 판(현재
+  분포로 c/g 환산)은 전부 GPU로 몰아 1.5–1.9배였다.
+- 함의: 작은 M의 기본은 CPU cold + COLD_STREAM=1. 단 COLD_STREAM은 host 즉시쓰기
+  (qlen pin, hybrid 마스크)가 stream 순서 밖이라 M이 층마다 바뀌는 상황·hybrid와 동시
+  사용 전에 그 값들을 stream-ordered로 옮겨야 한다 (아래 남은 것).
+
+**cold_async — 미완, 격리됨 (2026-08-27)**: cold를 전용 stream + 완료 플래그(kt
+`signal_task` → pinned int32 → `prism_wait_flag` 커널)로 받아 블로킹 sync 콜백을 없애
+hot/warm과의 콜백 스레드 직렬화를 풀려는 시도. 배관(kt binding, resources.cold_stream/
+cold_flag, backend.submit_signal, executor._cold_phase_async, env SGLANG_PRISM_COLD_ASYNC)은
+들어갔으나 **두 버그로 비활성**: (1) 첫 호출 결과 오답 — partial H2D가 flag wait보다 앞서
+실행됨(두 번째 호출은 blocking과 비트일치 → 순수 순서 문제), (2) `prism_wait_flag` 스핀
+커널이 wrapper의 stream 컨텍스트를 안 타고 default stream에 실려 GPU hang/segfault. 기본
+꺼짐 + 테스트 skip + 생성자 경고. **재구현 방향**: 스핀 커널을 드라이버 네이티브
+`cuStreamWaitValue32`로 교체(hang 위험 제거), H2D를 wait 커널 뒤 같은 stream에 명시적으로
+순서 넣기. 동기는 여전히 유효 — `COLD_STREAM=1` nsys에서 warm과 cold 콜백이 직렬화됐다.
+
+### 남은 것 (이 작업에서 파생)
+
+- **UVA 커널과 compute 커널의 동시 실행**: 스트림을 나누고 warm의 블록 수를
+  줄여도 hot이 그 아래로 숨지 않는다. 가설은 UVA(sysmem) 로드가 SM의 메모리
+  파이프라인(MSHR/LSU 큐)을 점유해 같은 SM의 다른 블록도 멈춘다는 것 — 확인은
+  nsys로 두 커널의 시간 구간이 실제로 겹치는지, SM당 점유가 어떤지 보는 것.
+  겹침이 원리적으로 불가하면 대안은 SM 분할(green context) 또는 hot을 cold GPU
+  읽기와 같은 스트림에 두고 "겹침"을 포기하는 것.
+- **토큰 타일 재읽기**: kBM=128이라 expert당 pair가 128을 넘으면(M·k/E > 128,
+  35B에서 M > 4096) W를 타일 수만큼 다시 읽는다 (M=4096: warm 2.64 → 3.9 ms,
+  cold 23.6 → 35 ms). BM=256 변형 또는 K-분할 없는 큰 타일이 해법.
+- **hot grouped 커널 효율**: M=2048 h50 gateup 34 GFLOP에 2.6 ms = 13 TFLOPS
+  (H100 bf16 dense의 2%). A gather + BK=32 + 파이프라인 없음. cold/warm이 PCIe
+  바운드인 지금은 임계경로가 아니지만 hot 비율이 큰 plan(h875)에서는 보인다 —
+  cp.async 파이프라인, BK=64, A gather 벡터화.
+- **cold hybrid**: 교차점 근처에서는 cold 행을 CPU와 GPU가 **나눠** 읽는 편이
+  둘 중 하나보다 빠르다 (M=2048: CPU 28 ∥ GPU 23.6 → 절반씩이면 ~13 ms).
+  N shard(노드)를 단위로 한 노드는 CPU, 다른 노드는 GPU로 보내는 것이 가장 싼
+  형태 — 노드별 partial이 이미 서로소 열이다.
+- `cold_gpu_min_m` 기본값은 이 머신 실측(≈1500)이고 plan/하드웨어 의존이다 —
+  planner가 정해 Plan에 적는 것이 맞다 (지금은 env).
+
+## (기록) grouped GEMM prefill — 착수 전 메모
 
 - **현상**: prefill이 decode와 같은 pair-native worklist GEMV를 탄다 (2026-08-25,
   S6). 실측으로 bmm 경로 대비 **1.6~1.9배**다 (35B gate 치수, M=1024~4096:
