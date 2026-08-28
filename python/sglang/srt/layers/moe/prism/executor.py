@@ -244,35 +244,40 @@ class PrismExecutor:
         stream_arg = (
             torch.cuda.current_stream().cuda_stream if use_cold_stream else None
         )
-        if graph_flow:
+        # graph **또는** stream 경로: cold의 expert_ids를 device→pinned **async** D2H로
+        # 내리고 kt를 stream host node로 submit한다 (kt native와 동일). blocking
+        # `topk_ids.to("cpu")`가 없어 host가 앞으로 달린다 — 그 blocking이 작은 M에서
+        # 층당 4.7 ms의 노출된 파이프라인 대기로 찍혔다 (2026-08-27 nsys). qlen은
+        # 매 스텝 host 쓰기(stream 순서 밖) 대신 **고정 pinned 상수 버퍼**를 쓴다.
+        if graph_flow or self._cold_stream:
             qlen_pin = self._qlen_pins_graph.get(m)
             if qlen_pin is None:
-                # 캡처 전 워밍업에서 생성된다 — 실제 캡처 중 신규 bs가 나타나면
-                # 이 할당은 캡처 밖 host alloc이라 안전하지만, sglang 워밍업
-                # 순서상 도달하지 않는 것이 정상.
                 qlen_pin = torch.full((1,), m, dtype=torch.int32)
                 self._qlen_pins_graph[m] = qlen_pin
             return _LayerFlow(
-                graph_flow=True, use_cold_stream=True, stream_arg=stream_arg,
+                graph_flow=graph_flow, use_cold_stream=True, stream_arg=stream_arg,
                 qlen_ptr=qlen_pin.data_ptr(), ids_cpu=None,
             )
-        # eager: cold가 expert_ids를 host에서 읽으므로 D2H 1회. cold_async는 pinned로
-        # async D2H하므로(graph 경로와 같음) 여기서 블록하지 않는다.
+        # 순수 eager(스트림 통합 없음): cold가 expert_ids를 host에서 읽으므로 blocking
+        # D2H 1회. 그 blocking이 뒤따르는 host 쓰기(qlen_pin)의 사실상 throttle이다
+        # (계약 ④ Task8-3). cold_async는 자기 stream에서 async로 내린다.
         if self._cold_async:
             ids_cpu = None
         else:
             with _nvtx("s1.topk_d2h"):
                 ids_cpu = topk_ids.to("cpu")
         return _LayerFlow(
-            graph_flow=False, use_cold_stream=use_cold_stream,
+            graph_flow=False, use_cold_stream=False,
             stream_arg=stream_arg, qlen_ptr=self._qlen_pin.data_ptr(),
             ids_cpu=ids_cpu,
         )
 
     # ── 본체 ──────────────────────────────────────────────────────────────
     def run_layer(self, layer_idx: int, hidden: torch.Tensor,
-                  topk_ids: torch.Tensor, topk_weights: torch.Tensor) -> torch.Tensor:
+                  topk_ids: torch.Tensor, topk_weights: torch.Tensor,
+                  swiglu_limit: Optional[float] = None) -> torch.Tensor:
         """hidden [M, H] bf16 cuda, topk_ids [M, k] int64, topk_weights [M, k].
+        swiglu_limit: 모델의 SwiGLU clamp (DSV4-Flash 10.0; None = 없음) — rejoin#1에서 적용.
         반환 [M, H] bf16 cuda (router 가중 expert 합 완료)."""
         has_cold = self._layer_has_cold[layer_idx]
         tiers = self._tiers[layer_idx]
@@ -354,13 +359,14 @@ class PrismExecutor:
                 # stream 통합 시 non_blocking: kt host node가 같은 stream에
                 # 순서대로 실행되므로 host-측 완료 보장이 불필요하다.
                 res.staging.fill_x(hidden, non_blocking=flow.use_cold_stream)
-                if flow.graph_flow:
-                    # device topk_ids → pinned int64 async D2H (캡처 가능).
+                if flow.use_cold_stream:
+                    # device topk_ids → pinned int64 async D2H (graph·stream 공통).
+                    # qlen은 고정 pinned 버퍼라 여기서 쓰지 않는다.
                     res.staging.fill_expert_ids(topk_ids, non_blocking=True)
                     pin = self._qlen_pins_graph[m]
                     assert int(pin[0]) == m, (
                         f"qlen_pin_graph[{m}]={int(pin[0])} != {m} — "
-                        f"graph path must never write this buffer"
+                        f"stream/graph path must never write this buffer"
                     )
                 else:
                     res.staging.fill_expert_ids(flow.ids_cpu)
@@ -412,7 +418,7 @@ class PrismExecutor:
         # 사슬(캐스팅 3 + add 2 + split/silu/mul/cast)은 prefill에서 88 MB 텐서를
         # ~10번 왕복해 층당 2.5 ms였다 (2026-08-27 nsys).
         with _nvtx("rejoin1.acc+silu"):
-            act = rejoin_gateup(gu_parts + [cold_gu, warm_gu], inter)
+            act = rejoin_gateup(gu_parts + [cold_gu, warm_gu], inter, swiglu_limit)
 
         # ── Phase 2: down ────────────────────────────────────────────────
         if hybrid:
