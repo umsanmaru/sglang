@@ -46,6 +46,7 @@ class ColdSlab:
     node: int
     proj: Proj
     k_max: int = 0          # expert당 최대 K(타일 올림) — W-resident 커널의 smem 크기
+    fmt: object = None      # StoreFormat — slab 레이아웃(bf16 packed / kt fp4)과 GPU 진입점을 정한다
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,7 @@ def _tensor_view(ptr: int, nbytes: int) -> torch.Tensor:
 
 def build_cold_gpu_layer(
     views: Sequence[dict], plan: Plan, layer_idx: int, cold_shards: dict,
-    device: torch.device, shard_override: Optional[dict] = None,
+    device: torch.device, shard_override: Optional[dict] = None, fmt=None,
 ) -> ColdGpuLayer:
     """kt `cold_slab_views()` 결과 + 로더의 ColdShard(패딩된 row_off/k_index) →
     ColdGpuLayer. 여기서 slab을 host-register하고 기하를 대조한다.
@@ -88,6 +89,10 @@ def build_cold_gpu_layer(
     cold_shards: {Proj: ColdShard} — pack 직전의 텐서 소유자. row_off/k_index만
     쓰고 w_flat은 건드리지 않는다 (그 바이트는 이미 kt slab 안에 있다).
     """
+    if fmt is None:
+        from sglang.srt.layers.moe.prism.formats import BF16
+
+        fmt = BF16
     ep = plan.expert(layer_idx, 0)
     E = plan.dims.num_experts
     out: dict = {Proj.GATE: {}, Proj.UP: {}, Proj.DOWN: {}}
@@ -119,14 +124,14 @@ def build_cold_gpu_layer(
         if ptr % 4096 or nbytes % 4096:
             raise PlanError(f"{where}: slab must be page aligned (ptr=0x{ptr:x}, bytes={nbytes})")
         _register_host(ptr, nbytes)
+        slab, blk_off = fmt.cold_slab(ptr, nbytes, expert_off, device)
         out[proj][node] = ColdSlab(
-            slab=_tensor_view(ptr, nbytes),
-            blk_off=torch.tensor([o // 2 for o in expert_off[:-1]], dtype=torch.int64, device=device),
+            slab=slab, blk_off=blk_off,
             row_off=row_off_cpu.to(device=device, dtype=torch.int32),
             k_index=shard.k_index.to(device),
             n=int(v["n"]), n_start=n_start,
             n_block=int(v["n_block"]), k_block=int(v["k_block"]),
-            node=node, proj=proj, k_max=max(k_pad) if k_pad else 0,
+            node=node, proj=proj, k_max=max(k_pad) if k_pad else 0, fmt=fmt,
         )
     for proj in Proj:
         nodes = sorted(out[proj])

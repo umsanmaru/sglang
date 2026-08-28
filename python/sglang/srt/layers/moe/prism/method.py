@@ -30,7 +30,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.moe.prism.plan import Plan, PlanError, parse_plan, validate_static
+from sglang.srt.layers.moe.prism.plan import Plan, PlanError, Proj, Tier, parse_plan, validate_static
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,11 @@ def _cold_gpu_min_m():
 
     raw = os.environ.get(_ENV_COLD_GPU_MIN_M)
     if raw is None:
-        return PrismExecutor.COLD_GPU_MIN_M
+        # 기본값은 스토어 포맷이 정한다 (bf16: 실측 교차점, mxfp4: grouped 경계 = CPU prefill 없음).
+        gmin = os.environ.get(_ENV_GROUPED_MIN_M)
+        return _get_runtime().fmt.default_cold_gpu_min_m(
+            PrismExecutor.COLD_GPU_MIN_M,
+            PrismExecutor.GROUPED_MIN_M if gmin is None else int(gmin))
     v = int(raw)
     return None if v <= 0 else v
 
@@ -108,7 +112,24 @@ class _PrismRuntime:
     """
 
     def __init__(self, plan: Plan, calib=None):
+        from sglang.srt.layers.moe.prism.kernels import gpu_store_format
+
         self.plan = plan
+        # 스토어 포맷 — plan의 GPU 커널 키가 함의한다 (계약 ①). 파라미터 등록·full 텐서
+        # 인출·gather·커널 진입점이 전부 이 객체를 통한다 (formats.py).
+        self.fmt = gpu_store_format(plan.kernels.gpu_warm)
+        # 모델의 SwiGLU clamp (DSV4-Flash swiglu_limit=10). create_moe_runner가 layer의
+        # MoeRunnerConfig에서 읽어 채운다 — 전 층 공통 값이라 프로세스 1벌.
+        self.swiglu_limit: Optional[float] = None
+        # cold(CPU) 행이 plan 어디에도 없으면 kt 백엔드(스레드풀)를 만들지 않는다 — GPU
+        # 스트리밍 전용 plan(mxfp4)에서 idle 워커가 CPU를 점유할 이유가 없다.
+        self.has_cold = any(
+            plan.expert(l, e).proj(p).has_tier(Tier.COLD)
+            for (l, e) in plan.experts for p in Proj
+        )
+        if self.has_cold:
+            # 스토어 포맷과 cold 커널의 호환 (mxfp4 ↔ kt_amx_fp4 / bf16 ↔ kt_*_bf16) — startup에서 즉사.
+            self.fmt.check_cold_kernel(plan.kernels.cpu_cold)
         # sparsity 점수·threshold 테이블 (dense plan이면 None). 프로세스에 1벌 —
         # 레이어마다 다시 열면 382MB 자산을 40번 읽게 된다.
         self.calib = calib
@@ -119,10 +140,6 @@ class _PrismRuntime:
 
     def executor(self, device: torch.device):
         if self._executor is None:
-            from sglang.jit_kernel.prism_gemv import warmup_jit
-            from sglang.jit_kernel.prism_grouped import (
-                warmup_jit as warmup_grouped_jit,
-            )
             from sglang.srt.layers.moe.prism.executor import PrismExecutor
             from sglang.srt.layers.moe.prism.kernels import resolve_gpu_kernel
             from sglang.srt.layers.moe.prism.resources import (
@@ -131,15 +148,14 @@ class _PrismRuntime:
             )
 
             resolve_gpu_kernel(self.plan.kernels.gpu_warm)  # 이름 검증
-            # GEMV 커널의 lazy JIT을 startup으로 앞당긴다 — 첫 호출이 캡처
+            # 이 포맷의 GEMV/grouped 커널 lazy JIT을 startup으로 앞당긴다 — 첫 호출이 캡처
             # 워밍업이면 컴파일이 캡처 순서에 얽힌다.
-            warmup_jit()
-            warmup_grouped_jit()
+            self.fmt.warmup()
             # rejoin Triton 커널도 캡처 워밍업 전에 컴파일한다.
             from sglang.srt.layers.moe.prism.rejoin import warmup as warmup_rejoin
 
             d = self.plan.dims
-            warmup_rejoin(device, d.intermediate_size, d.hidden_size, d.top_k)
+            warmup_rejoin(device, d.intermediate_size, d.hidden_size, d.top_k, self.swiglu_limit)
             spec = ResourceSpec.from_plan(
                 self.plan, max_tokens=self.max_tokens, device=device)
             self._resources = ExecutionResources(spec)
@@ -147,7 +163,7 @@ class _PrismRuntime:
             # 인자로 주입한다 (executor는 hidden input 없음).
             gmin = os.environ.get(_ENV_GROUPED_MIN_M)
             self._executor = PrismExecutor(
-                self.plan, self._resources, self.cold(),
+                self.plan, self._resources, self.cold() if self.has_cold else None,
                 cold_stream=os.environ.get(_ENV_COLD_STREAM) == "1",
                 capture_mode_fn=_sglang_capture_mode,
                 grouped_min_m=None if gmin is None else int(gmin),
@@ -256,8 +272,19 @@ class PrismMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(self, layer, moe_runner_config):
         # base 클래스에 실체(raise NotImplementedError)가 있어 __getattr__이
         # 안 잡는다 — 명시적 위임 (runner는 gpu_method 것이 생성되지만
-        # apply를 우리가 전유하므로 사용되지 않음)
-        return self.gpu_method.create_moe_runner(layer, moe_runner_config)
+        # apply를 우리가 전유하므로 사용되지 않음). 모델의 SwiGLU clamp는 여기서만
+        # 보이므로(MoeRunnerConfig.swiglu_limit) runtime에 적어 rejoin이 쓴다.
+        limit = getattr(moe_runner_config, "swiglu_limit", None)
+        runtime = _get_runtime()
+        if limit is not None:
+            if runtime.swiglu_limit is not None and runtime.swiglu_limit != limit:
+                raise PlanError(f"swiglu_limit differs across layers ({runtime.swiglu_limit} vs {limit})")
+            runtime.swiglu_limit = float(limit)
+        try:
+            return self.gpu_method.create_moe_runner(layer, moe_runner_config)
+        except Exception as exc:  # 내부 method의 runner는 쓰이지 않는다 — 실패해도 진행
+            logger.warning("[prism] inner quant method create_moe_runner failed (ignored): %s", exc)
+            return None
 
     # ── Stage 2 훅들 ─────────────────────────────────────────────────────
     def create_weights(self, layer, num_experts, hidden_size,
@@ -277,27 +304,14 @@ class PrismMoEMethod(FusedMoEMethodBase):
                 f"!= model dims {(num_experts, hidden_size, inter_full)} — "
                 f"plan이 다른 모델에 적용되고 있음"
             )
-        if params_dtype != torch.bfloat16:
-            raise NotImplementedError(f"Prism P0 supports bf16 only, got {params_dtype}")
-
-        # full weight를 CPU에 — GPU에는 warm arena만 간다 (계약 ③).
+        # full weight를 CPU에 — GPU에는 hot 스토어만 간다 (계약 ③). 파라미터의 이름/shape/
+        # dtype/attrs는 포맷이 정한다 (bf16: sglang 기본 w13/w2; mxfp4: DeepSeekMxfp4MoEMethod와
+        # 동일한 int8 nibble + fp32 BLOCK 배율 — 그 이름으로 로더가 채운다).
         # trap 방어 (weights.py docstring): gate-first w13 순서 가정 검증
         if getattr(self.gpu_method, "load_up_proj_weight_first", False):
             raise NotImplementedError("Prism assumes gate-first w13 ordering")
-        w13 = torch.nn.Parameter(
-            torch.empty(num_experts, 2 * inter_full, hidden_size,
-                        dtype=params_dtype, device="cpu"),
-            requires_grad=False,
-        )
-        w2 = torch.nn.Parameter(
-            torch.empty(num_experts, hidden_size, inter_full,
-                        dtype=params_dtype, device="cpu"),
-            requires_grad=False,
-        )
-        layer.register_parameter("w13_weight", w13)
-        layer.register_parameter("w2_weight", w2)
-        set_weight_attrs(w13, extra_weight_attrs)
-        set_weight_attrs(w2, extra_weight_attrs)
+        runtime.fmt.create_params(layer, num_experts, hidden_size, inter_full, params_dtype,
+                                  extra_weight_attrs)
 
     def process_weights_after_loading(self, layer) -> None:
         from sglang.srt.layers.moe.prism.kernels import cold_pack_tile_rows
@@ -311,12 +325,10 @@ class PrismMoEMethod(FusedMoEMethodBase):
         # 읽으므로 반드시 CPU 사본에서 슬라이스해야 한다 — CUDA 텐서의
         # data_ptr()를 넘기면 device 주소를 memcpy하다 segfault (2026-08-20
         # 스모크에서 실제 발생). TODO: 컨텍스트 왕복(H2D+D2H ~2.4GB/층) 회피.
-        w13 = layer.w13_weight.data
-        w2 = layer.w2_weight.data
-        if w13.is_cuda:
-            w13 = w13.cpu()
-        if w2.is_cuda:
-            w2 = w2.cpu()
+        import time as _time
+        _t0 = _time.perf_counter()
+        full = runtime.fmt.take_full(layer)
+        _t1 = _time.perf_counter()
         # hot 밴드는 이 device에, warm pinned store는 그 GPU의 PCIe root와 같은
         # NUMA 노드에 상주한다 — 둘 다 로더의 입력이고 여기가 결정 지점이다
         # (계약 ③). 원격 소켓 warm은 UVA 읽기에 소켓 간 홉을 추가해 warm의
@@ -325,17 +337,21 @@ class PrismMoEMethod(FusedMoEMethodBase):
         device = torch.device(torch.cuda.current_device())
         warm_kt = os.environ.get(_ENV_WARM_KT) == "1"
         prepared = prepare_layer_weights(
-            self.layer_id, w13, w2, runtime.plan,
+            self.layer_id, full.w13, full.w2, runtime.plan,
             calib=runtime.calib, device=device,
             warm_node=gpu_numa_node(device),
             # cold 스토어의 타일 올림 단위는 커널 키가 함의한다 (계약 ①).
             cold_tile_rows=cold_pack_tile_rows(runtime.plan.kernels.cpu_cold),
             warm_kt=warm_kt,
+            fmt=runtime.fmt, w13_scale=full.w13_scale, w2_scale=full.w2_scale,
         )
+        del full
+        _t2 = _time.perf_counter()
         ep = runtime.plan.expert(self.layer_id, 0)
         if any(ep.proj(p).has_tier(Tier.COLD) for p in Proj):
             runtime.cold().load_layer(self.layer_id, prepared.cold, prepared.thr)
             prepared.cold = None  # 주입 완료 — 소유권은 C++ (계약 ③)
+        _t3 = _time.perf_counter()
         if prepared.warm_kt is not None:
             runtime.cold().load_warm_layer(self.layer_id, prepared.warm_kt, prepared.thr,
                                            local_node=_hybrid_local_node(device))
@@ -343,12 +359,13 @@ class PrismMoEMethod(FusedMoEMethodBase):
         runtime.executor(device).register_layer(self.layer_id, prepared)
 
         # full 텐서 소멸 (계약 ③) — host RAM 회수
-        layer.w13_weight.data = torch.empty(0, dtype=layer.w13_weight.dtype)
-        layer.w2_weight.data = torch.empty(0, dtype=layer.w2_weight.dtype)
+        runtime.fmt.release(layer)
         self._registered = True
-        logger.info("[prism] layer %d registered (hot=%s cold=%s)", self.layer_id,
+        logger.info("[prism] layer %d registered (hot=%s cold=%s) take_full %.1fs prepare %.1fs cold_load %.1fs register %.1fs",
+                    self.layer_id,
                     any(ep.proj(p).has_tier(Tier.HOT) for p in Proj),
-                    any(ep.proj(p).has_tier(Tier.COLD) for p in Proj))
+                    any(ep.proj(p).has_tier(Tier.COLD) for p in Proj),
+                    _t1 - _t0, _t2 - _t1, _t3 - _t2, _time.perf_counter() - _t3)
 
     # ── step-time ────────────────────────────────────────────────────────
     def apply(self, layer, dispatch_output):
@@ -358,8 +375,15 @@ class PrismMoEMethod(FusedMoEMethodBase):
         topk = dispatch_output.topk_output
         runtime = _get_runtime()
         out = runtime.executor(x.device).run_layer(
-            self.layer_id, x, topk.topk_ids, topk.topk_weights
+            self.layer_id, x, topk.topk_ids, topk.topk_weights,
+            swiglu_limit=runtime.swiglu_limit,
         )
+        if runtime.swiglu_limit is not None:
+            # DSV4 2604B 경로 체커: 모델이 "SwiGLU clamp를 적용하는 MoE 경로가 정확히 1회 돌았다"를
+            # 층마다 단언한다 (deepseek_v4.py). prism은 clamp를 rejoin에서 적용하므로 같은 신호를 올린다.
+            from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
+
+            deepseek_v4_moe_code_path_checker.observed += 1
         return StandardCombineInput(hidden_states=out.to(x.dtype))
 
 

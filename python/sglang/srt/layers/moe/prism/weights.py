@@ -53,6 +53,7 @@ from typing import Mapping, Optional
 import torch
 
 from sglang.srt.layers.moe.prism.calib import CalibShard, CalibTables
+from sglang.srt.layers.moe.prism.formats import BF16, FullWeights, ProjSource, StoreFormat
 from sglang.srt.layers.moe.prism.index import (
     IDX_DTYPE,
     LayerIndex,
@@ -87,10 +88,14 @@ class TierShard:
     곧 밴드 경로를 지울 때다.
     """
 
-    w_flat: torch.Tensor       # bf16 [Σₑ k[e], N] — hot=device / warm=pinned
-    row_off: torch.Tensor      # int32 [E+1] (device — 커널이 읽는다)
+    w_flat: torch.Tensor       # bf16 [Σₑ k[e], N] (또는 mxfp4 codes u8 [Σₑ k[e]/2, N]) — hot=device / warm=pinned
+    row_off: torch.Tensor      # int32 [E+1] (device — 커널이 읽는다) — 항상 **k 단위**
     k_index: torch.Tensor      # uint16 [Σₑ k[e]] (device)
     contiguous: bool
+    # 스토어 포맷 (formats.py). 커널 진입점·정렬·스토어 인자 형태를 이 객체가 정한다.
+    fmt: StoreFormat = BF16
+    # mxfp4만: E8M0 배율 u8 [Σₑ k[e]/32, N] — w_flat과 같은 거처.
+    s_flat: Optional[torch.Tensor] = None
     # 밴드 퇴화형일 때만 채워진다 (전환기 호환용, 로드 시 host에서 계산).
     uniform_k: Optional[int] = None
     band_start: Optional[int] = None
@@ -104,7 +109,11 @@ class TierShard:
 
     @property
     def total_rows(self) -> int:
-        return int(self.w_flat.shape[0])
+        return int(self.row_off[-1])
+
+    def store_args(self) -> tuple:
+        """커널 래퍼에 넘기는 스토어 텐서들 — 포맷이 정한다 (bf16: (w_flat,), mxfp4: (codes, scales))."""
+        return self.fmt.store_args(self)
 
     # ── 전환기 호환 ──────────────────────────────────────────────────────
     @property
@@ -188,11 +197,13 @@ class ColdShard:
     dense 경로에서 무해하고, sparse 경로의 tail 비트는 kt가 `real_rows`로 끈다.
     """
 
-    w_flat: torch.Tensor       # bf16 [Σₑ N·k_pad(e)] (expert 블록 [N, k_pad])
-    row_off: torch.Tensor      # int32 [E+1] — **패딩된** 행 기준
+    w_flat: torch.Tensor       # bf16 [Σₑ N·k_pad(e)] (expert 블록 [N, k_pad]) / mxfp4: u8 nibble [N, k_pad/2]
+    row_off: torch.Tensor      # int32 [E+1] — **패딩된** 행 기준 (k 단위)
     k_index: torch.Tensor      # uint16 [Σₑ k_pad(e)] — 패딩 항목은 0을 가리킨다
     real_rows: torch.Tensor    # int32 [E] — 패딩 전 행 수
     calib: Optional[CalibShard] = None
+    fmt: StoreFormat = BF16
+    s_flat: Optional[torch.Tensor] = None   # mxfp4: bf16 배율 블록 [N, k_pad/32] flat
 
     @property
     def num_experts(self) -> int:
@@ -305,38 +316,32 @@ def _cold_flat(
 
 
 def _build_shard(
-    src: torch.Tensor,
+    src: ProjSource,
     ti: TierIndex,
     *,
+    fmt: StoreFormat,
     idx_device: torch.device,
     place,
     calib: Optional[CalibShard],
 ) -> TierShard:
-    """티어 스토어 하나. `place`가 flat을 최종 거처로 옮긴다 (hot=device /
-    warm=pinned). row_off·k_index는 **항상 커널이 읽는 device**로 간다."""
+    """티어 스토어 하나. `fmt.gather`가 포맷대로 flat을 만들고 `place`가 최종 거처로 옮긴다
+    (hot=device / warm=pinned). row_off·k_index는 **항상 커널이 읽는 device**로 간다."""
     uniform_k, band_start = _uniform_band(ti)
-    flat = _gather_flat(src, ti, uniform_k, band_start)
+    w_flat, s_flat = fmt.gather(src, ti, uniform_k, band_start)
     ro = ti.row_off
     k_max = int((ro[1:] - ro[:-1]).max()) if ti.num_experts > 0 else 0
     return TierShard(
-        w_flat=place(flat),
+        w_flat=place(w_flat),
         row_off=ti.row_off.to(idx_device),
         k_index=ti.idx.to(idx_device),
         contiguous=ti.contiguous,
+        fmt=fmt,
+        s_flat=None if s_flat is None else place(s_flat),
         uniform_k=uniform_k,
         band_start=band_start,
         calib=calib,
         k_max=k_max,
     )
-
-
-def _proj_source(w13: torch.Tensor, w2: torch.Tensor, inter: int, proj: Proj):
-    """proj의 ckpt-방향 소스 [E, N, K] 뷰."""
-    if proj is Proj.GATE:
-        return w13[:, :inter, :]
-    if proj is Proj.UP:
-        return w13[:, inter:, :]
-    return w2
 
 
 def _warm_kt_tensors(enabled: bool, shards: dict, layer_idx: int):
@@ -365,6 +370,9 @@ def prepare_layer_weights(
     warm_node: Optional[int] = None,
     cold_tile_rows: int = 32,
     warm_kt: bool = False,
+    fmt: Optional[StoreFormat] = None,
+    w13_scale: Optional[torch.Tensor] = None,
+    w2_scale: Optional[torch.Tensor] = None,
 ) -> PreparedWeights:
     """한 레이어의 full weight를 Plan대로 절단·변환·배치한다.
 
@@ -381,8 +389,15 @@ def prepare_layer_weights(
     바인딩 없음 = 할당 스레드가 어디 떠 있었느냐에 달린 운.
     device는 HOT 밴드가 있을 때만 필요하다 (없으면 요구하지 않는다 — CPU
     전용 테스트가 hot 없는 plan으로 계속 돌 수 있어야 하므로).
+    fmt는 스토어 포맷(formats.py). None이면 plan의 gpu_warm 커널 키가 함의하는 포맷
+    (kernels.gpu_store_format). mxfp4면 w13_scale/w2_scale([E, N, K/32])이 필수다.
     """
     dims = plan.dims
+    if fmt is None:
+        from sglang.srt.layers.moe.prism.kernels import gpu_store_format
+
+        fmt = gpu_store_format(plan.kernels.gpu_warm)
+    full = FullWeights(w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale)
     if (plan.sparsity is None) != (calib is None):
         raise PlanError(
             f"layer {layer_idx}: plan.sparsity and calib must both be present "
@@ -391,15 +406,7 @@ def prepare_layer_weights(
         )
     if calib is not None:
         calib.check_dims(dims, plan.sparsity)
-    expected_w13 = (dims.num_experts, 2 * dims.intermediate_size, dims.hidden_size)
-    expected_w2 = (dims.num_experts, dims.hidden_size, dims.intermediate_size)
-    if tuple(w13.shape) != expected_w13 or tuple(w2.shape) != expected_w2:
-        raise PlanError(
-            f"layer {layer_idx}: weight shape mismatch vs plan dims: "
-            f"w13 {tuple(w13.shape)} (expected {expected_w13}), "
-            f"w2 {tuple(w2.shape)} (expected {expected_w2}) — "
-            f"plan이 다른 모델에 적용되고 있을 가능성"
-        )
+    fmt.check_full_shapes(full, dims, f"layer {layer_idx}")
 
     # 티어 멤버십을 인덱스로 확정하고 **순열·페어를 검증한다** (계약 ①).
     # 밴드 검증이 plan.py에서 사라진 자리를 여기가 메운다 — 로드마다 돈다.
@@ -421,7 +428,11 @@ def prepare_layer_weights(
     for proj in Proj:
         pp = plan.expert(layer_idx, 0).proj(proj)
         where = f"layer {layer_idx} {proj.value}"
-        src = _proj_source(w13, w2, dims.intermediate_size, proj)  # [E, N, K]
+        src = fmt.proj_source(full, dims.intermediate_size, proj)  # [E, N, K…]
+        for tier in (Tier.HOT, Tier.WARM):
+            ti_ = layer_index.get(proj, tier)
+            if ti_ is not None:
+                fmt.check_index(ti_, f"{where} {tier.value}")
 
         def tier_calib(ti, tier_name, real_rows=None):
             """점수 재료는 weight와 **같은 인덱스·같은 오프셋**으로 모인다."""
@@ -432,7 +443,7 @@ def prepare_layer_weights(
 
         hot_ti = layer_index.get(proj, Tier.HOT)
         hot_shards[proj] = None if hot_ti is None else _build_shard(
-            src, hot_ti, idx_device=idx_device,
+            src, hot_ti, fmt=fmt, idx_device=idx_device,
             place=lambda t: t.to(device, non_blocking=False),
             calib=tier_calib(hot_ti, "hot"),
         )
@@ -452,7 +463,8 @@ def prepare_layer_weights(
                 warm_kt_shards[proj] = None
             else:
                 real = [warm_ti.k_rows(e) for e in range(dims.num_experts)]
-                flat, off, idx, real_t = _cold_flat(src, warm_ti, real, cold_tile_rows)
+                flat, off, idx, real_t = _cold_flat(
+                    fmt.cold_source(src, f"{where} warm-kt"), warm_ti, real, cold_tile_rows)
                 padded = TierIndex(row_off=off, idx=idx, contiguous=warm_ti.contiguous)
                 warm_kt_shards[proj] = ColdShard(
                     w_flat=flat, row_off=off, k_index=idx, real_rows=real_t,
@@ -460,7 +472,7 @@ def prepare_layer_weights(
                 )
         else:
             warm_shards[proj] = None if warm_ti is None else _build_shard(
-                src, warm_ti, idx_device=idx_device, place=place_warm,
+                src, warm_ti, fmt=fmt, idx_device=idx_device, place=place_warm,
                 calib=tier_calib(warm_ti, "warm"),
             )
 
@@ -470,11 +482,13 @@ def prepare_layer_weights(
         else:
             # 타일 올림은 커널 키가 함의하는 값이고(계약 ①), 패딩 열은 0이다.
             real = [cold_ti.k_rows(e) for e in range(dims.num_experts)]
-            flat, off, idx, real_t = _cold_flat(src, cold_ti, real, cold_tile_rows)
+            fmt.check_index(cold_ti, f"{where} cold")
+            flat, s_flat, off, idx, real_t = fmt.cold_flat(src, cold_ti, real, cold_tile_rows)
+            idx = idx.to(IDX_DTYPE)
             padded = TierIndex(row_off=off, idx=idx, contiguous=cold_ti.contiguous)
             cold_shards[proj] = ColdShard(
                 w_flat=flat, row_off=off, k_index=idx, real_rows=real_t,
-                calib=tier_calib(padded, "cold", real_rows=real),
+                calib=tier_calib(padded, "cold", real_rows=real), fmt=fmt, s_flat=s_flat,
             )
 
     return PreparedWeights(

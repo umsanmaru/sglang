@@ -81,6 +81,7 @@ def read_calib(path: str, target_p: float, lam):
 
 
 def main():
+    global ROW_GROUP
     ap = argparse.ArgumentParser()
     ap.add_argument("model_dir")
     ap.add_argument("out")
@@ -93,9 +94,17 @@ def main():
     ap.add_argument("--lam", type=float, default=None,
                     help="gate-dynamic λ (기본: 자산의 lam0)")
     ap.add_argument("--gpu-kernel", default="torch_bmm",
-                    choices=["torch_bmm", "gemv_worklist"],
-                    help="plan kernels.gpu_warm (worklist는 bs>1 graph decode용)")
+                    choices=["torch_bmm", "gemv_worklist", "gemv_worklist_mxfp4"],
+                    help="plan kernels.gpu_warm (worklist는 bs>1 graph decode용; "
+                         "gemv_worklist_mxfp4 = MXFP4 pair-row 스토어, K 정렬 32, cold 불가)")
+    ap.add_argument("--cpu-kernel", default="kt_amx_bf16",
+                    choices=["kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_fp4"])
+    ap.add_argument("--k-align", type=int, default=ROW_GROUP,
+                    help="밴드 경계 정렬 (기본 64; mxfp4는 32 배수여야 한다 — 64는 만족)")
     args = ap.parse_args()
+    if args.gpu_kernel == "gemv_worklist_mxfp4" and args.k_align % 32:
+        raise SystemExit("mxfp4 needs --k-align multiple of 32")
+    ROW_GROUP = args.k_align
 
     raw = json.loads((Path(args.model_dir) / "config.json").read_text())
     # VLM config(Qwen3.5/3.6 계열)는 언어모델 치수를 text_config 아래에 둔다.
@@ -109,6 +118,9 @@ def main():
 
     gu_bands, gu_cold = bands(hidden, args.hot_frac, args.warm_frac)
     dn_bands, dn_cold = bands(inter, args.hot_frac, args.warm_frac)
+    if args.gpu_kernel == "gemv_worklist_mxfp4" and (gu_cold or dn_cold) and args.cpu_kernel != "kt_amx_fp4":
+        raise SystemExit("mxfp4 store needs --cpu-kernel kt_amx_fp4 for its cold tier "
+                         f"(gateup {gu_bands}, down {dn_bands})")
     gate_up = {"bands": gu_bands, "cold_shards": shards(inter, args.numa_nodes) if gu_cold else []}
     down = {"bands": dn_bands, "cold_shards": shards(hidden, args.numa_nodes) if dn_cold else []}
 
@@ -130,7 +142,7 @@ def main():
             "top_k": top_k,
             "dtype": "bfloat16",
         },
-        "kernels": {"gpu_warm": args.gpu_kernel, "cpu_cold": "kt_amx_bf16"},
+        "kernels": {"gpu_warm": args.gpu_kernel, "cpu_cold": args.cpu_kernel},
         "default": {"gate": gate_up, "up": dict(gate_up), "down": down},
     }
     if sparsity:
@@ -145,8 +157,10 @@ def main():
             if t == tier:
                 tot += (en - st)
         return tot
-    per_row = experts * inter * 2                      # gate/up: row 1개 = [E, I] bf16
-    dn_row = experts * hidden * 2                      # down:  row 1개 = [E, H] bf16
+    # row 1개의 바이트: bf16 2 B/원소, mxfp4 0.5 B 코드 + 1/32 B 배율 = 0.53125 B/원소
+    bpe = (0.5 + 1.0 / 32) if args.gpu_kernel == "gemv_worklist_mxfp4" else 2.0
+    per_row = experts * inter * bpe                    # gate/up: row 1개 = [E, I]
+    dn_row = experts * hidden * bpe                    # down:  row 1개 = [E, H]
     for tier in ("hot", "warm"):
         gib = layers * (2 * _bytes(gu_bands, tier) * per_row
                         + _bytes(dn_bands, tier) * dn_row) / 2**30

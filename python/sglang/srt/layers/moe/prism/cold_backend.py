@@ -203,10 +203,12 @@ class KtColdBackend:
             }
 
         kernel_key = self._plan.kernels.cpu_cold
+        # 스토어 포맷이 정하는 추가 인자 (mxfp4: bf16 배율 셋). 포맷↔커널 호환은 startup 검증.
+        cold.gate.fmt.check_cold_kernel(kernel_key)
         wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=kernel_key)
         wrapper.load_weights_from_tensors(
             cold.gate.w_flat, cold.up.w_flat, cold.down.w_flat,
-            sparsity_tables=tables,
+            sparsity_tables=tables, **cold.gate.fmt.cold_load_kwargs(cold),
         )
         self._wrappers[layer_idx] = wrapper
         if self.hybrid_masks is not None:
@@ -219,7 +221,7 @@ class KtColdBackend:
             self._gpu_views[layer_idx] = build_cold_gpu_layer(
                 views, self._plan, layer_idx,
                 {Proj.GATE: cold.gate, Proj.UP: cold.up, Proj.DOWN: cold.down},
-                torch.device(self._gpu_view_device),
+                torch.device(self._gpu_view_device), fmt=cold.gate.fmt,
             )
 
     def gpu_view(self, layer_idx: int):

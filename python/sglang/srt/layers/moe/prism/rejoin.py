@@ -35,8 +35,8 @@ import triton.language as tl
 @triton.jit
 def _rejoin_gateup_kernel(
     p0, p1, p2, p3, p4, act,
-    inter, n_rows,
-    NUM_PARTS: tl.constexpr, BLOCK: tl.constexpr,
+    inter, n_rows, limit,
+    NUM_PARTS: tl.constexpr, BLOCK: tl.constexpr, HAS_LIMIT: tl.constexpr,
 ):
     row = tl.program_id(0)          # pair (m·k + j)
     cb = tl.program_id(1)           # inter 블록
@@ -57,6 +57,10 @@ def _rejoin_gateup_kernel(
     if NUM_PARTS > 4:
         g += tl.load(p4 + base + cols, mask=mask, other=0.0).to(tl.float32)
         u += tl.load(p4 + base + inter + cols, mask=mask, other=0.0).to(tl.float32)
+    if HAS_LIMIT:
+        # DSV4 swiglu_limit (참조 Expert.forward): up ∈ [−L, L], gate ≤ L — fp32에서, silu 전에.
+        u = tl.minimum(tl.maximum(u, -limit), limit)
+        g = tl.minimum(g, limit)
     a = g / (1.0 + tl.exp(-g)) * u   # silu(gate) · up, fp32
     tl.store(act + row * inter + cols, a.to(tl.bfloat16), mask=mask)
 
@@ -103,8 +107,12 @@ def _pad3(parts: Sequence[torch.Tensor]):
     return ps
 
 
-def rejoin_gateup(parts: Sequence[Optional[torch.Tensor]], inter: int) -> torch.Tensor:
-    """parts: bf16 [M, k, 2·inter] (gate 앞 절반, up 뒤 절반). 반환 act bf16 [M, k, inter]."""
+def rejoin_gateup(parts: Sequence[Optional[torch.Tensor]], inter: int,
+                  swiglu_limit: Optional[float] = None) -> torch.Tensor:
+    """parts: bf16 [M, k, 2·inter] (gate 앞 절반, up 뒤 절반). 반환 act bf16 [M, k, inter].
+
+    swiglu_limit(DSV4-Flash 10.0): None이 아니면 fp32 합 뒤 silu 전에 up을 [−L, L], gate를
+    ≤ L로 자른다 (참조 `Expert.forward`와 같은 순서·같은 정밀도)."""
     ps = _pad3(parts)
     m, k, two_i = ps[0].shape
     if two_i != 2 * inter:
@@ -114,7 +122,9 @@ def rejoin_gateup(parts: Sequence[Optional[torch.Tensor]], inter: int) -> torch.
     block = 1024
     grid = (m * k, triton.cdiv(inter, block))
     _rejoin_gateup_kernel[grid](ps[0], ps[1], ps[2], ps[3], ps[4], act, inter, m * k,
-                                NUM_PARTS=n_used, BLOCK=block)
+                                float(swiglu_limit if swiglu_limit is not None else 0.0),
+                                NUM_PARTS=n_used, BLOCK=block,
+                                HAS_LIMIT=swiglu_limit is not None)
     return act
 
 
@@ -134,11 +144,15 @@ def rejoin_down(parts: Sequence[Optional[torch.Tensor]], w32: torch.Tensor) -> t
     return out
 
 
-def warmup(device: torch.device, inter: int, hidden: int, top_k: int) -> None:
-    """NUM_PARTS 1..3 변형을 미리 컴파일한다 (graph 캡처 워밍업과의 얽힘 방지)."""
+def warmup(device: torch.device, inter: int, hidden: int, top_k: int,
+           swiglu_limit: Optional[float] = None) -> None:
+    """NUM_PARTS 1..MAX 변형을 미리 컴파일한다 (graph 캡처 워밍업과의 얽힘 방지).
+    swiglu_limit이 있으면 그 변형(HAS_LIMIT)도 함께."""
     for n in range(1, MAX_PARTS + 1):
         gu = [torch.zeros(1, top_k, 2 * inter, dtype=torch.bfloat16, device=device)] * n
         rejoin_gateup(gu, inter)
+        if swiglu_limit is not None:
+            rejoin_gateup(gu, inter, swiglu_limit)
         dn = [torch.zeros(1, top_k, hidden, dtype=torch.bfloat16, device=device)] * n
         rejoin_down(dn, torch.ones(1, top_k, dtype=torch.float32, device=device))
     torch.cuda.synchronize(device)
