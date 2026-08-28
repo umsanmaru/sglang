@@ -133,6 +133,14 @@ class KtColdBackend:
             dn_off, dn_rows = _shard_tables(ep.down.cold_shards, self._num_nodes, f"{where}.down")
         else:
             (gu_off, gu_rows), (dn_off, dn_rows) = n_shards["gateup"], n_shards["down"]
+        # 커널 키가 요구하는 노드 N shard 정렬 (tile fp4 = 256) — kt init의 runtime_error보다 먼저, 이름으로.
+        from sglang.srt.layers.moe.prism.kernels import cold_n_align
+
+        align = cold_n_align(plan.kernels.cpu_cold)
+        for name, rows in (("gateup", gu_rows), ("down", dn_rows)):
+            if any(int(r) % align for r in rows):
+                raise PlanError(f"{where}: {name} node shard rows {list(rows)} must be multiples of {align} "
+                                f"for cpu_cold '{plan.kernels.cpu_cold}'")
 
         cfg = self._ext.moe.MOEConfig(
             dims.num_experts, dims.top_k, dims.hidden_size, dims.intermediate_size, 0

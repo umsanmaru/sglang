@@ -279,7 +279,9 @@ class Mxfp4Format(StoreFormat):
     k_align = 32
     has_scales = True
     supports_cold = True
-    cold_kernels = ("kt_amx_fp4",)   # dense 전용 (kt AMX_FP4_MOE_TP partial)
+    # kt_amx_fp4: kt 원본 fp4 커널(dense, 행우선 nibble) / kt_tile_k2_mxfp4: cpu-mm tile_k2_mxfp4
+    # 포팅(fp4 타일 레이아웃, 프리페치 커서, sparse plan 경로; N shard 256 배수).
+    cold_kernels = ("kt_amx_fp4", "kt_tile_k2_mxfp4")
     cold_slab_dtype = torch.uint8
     BLOCK_K = 32
 

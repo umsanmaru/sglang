@@ -65,7 +65,12 @@ struct Mx4Slot {
 //             cold weight가 CPU(kt fp4 커널)와 GPU 사이에서 한 벌이다. 행 하나의 64-k 조각
 //             = 32 B 연속 (스레드 2개 × uint4); 128 행이 kr/2 B 간격이라 세그먼트가 짧다
 //             (PCIe 효율은 PAIRROW보다 낮다 — cold prefill의 알려진 비용).
-enum Layout : int { PAIRROW = 0, KT_FP4 = 1 };
+//   KT_TILE4 — kt `GemmKernelTileK2MXFP4::BufferB`(cold slab, cpu-mm tile_k2_mxfp4 포팅): 32k×256n
+//             타일, 64 B 라인 = k-페어 1 × n 64, 배율 E8M0 전치 [K/32][N] (코드 뒤 64 B 정렬).
+//             GPU 타일(64k × 128n) = 타일 컬럼 2 × n-그룹 2 = **1 KB 연속 청크 4개** — PAIRROW
+//             수준의 coalescing. 원소 오프셋(ktm4_off): (k&1) + (n&63)·2 + ((k>>1)&15)·128 +
+//             ((n>>6)&3)·2048 + (k>>5)·8192 + (n>>8)·8192·(K/32); 바이트 = 오프셋/2.
+enum Layout : int { PAIRROW = 0, KT_FP4 = 1, KT_TILE4 = 2 };
 
 template <int LAYOUT>
 __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_mxfp4(
@@ -117,9 +122,18 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_mxfp4(
     const uint8_t* codes_e = s.codes + (o0 >> 1) * n_cols + n0;
     const uint8_t* scales_e = s.scales + (o0 / kBlk) * n_cols + n0;
     // KT_FP4: expert 블록 base, 행 stride kr/2 B, 배율 fp32 테이블은 코드 뒤.
-    const uint8_t* blk = (LAYOUT == KT_FP4) ? s.codes + s.blk_off[e] : nullptr;
+    const uint8_t* blk = (LAYOUT != PAIRROW) ? s.codes + s.blk_off[e] : nullptr;
     const float* blk_d = (LAYOUT == KT_FP4)
         ? reinterpret_cast<const float*>(blk + n_cols * (kr >> 1)) : nullptr;
+    // KT_TILE4: 전치 E8M0 [kr/32][n_cols] — 코드(n_cols·kr/2 B, 64 B 올림) 뒤.
+    const uint8_t* blk_s = (LAYOUT == KT_TILE4)
+        ? blk + (((n_cols * (kr >> 1)) + 63) & ~static_cast<long long>(63)) : nullptr;
+    // KT_TILE4 스레드 배치: cc = tid>>7 (타일 컬럼 0/1), gg = (tid>>6)&1 (n-그룹), p = (tid>>2)&15
+    // (페어), q = tid&3 (16-n 청크) → 연속 tid = 연속 16 B (1 KB 연속/64 스레드).
+    const int t4_cc = tid >> 7, t4_gg = (tid >> 6) & 1, t4_p = (tid >> 2) & 15, t4_q = tid & 3;
+    const long long t4_super = (LAYOUT == KT_TILE4) ? (n0 >> 8) * 4096LL * (kr / kBlk) : 0;
+    const int t4_g = static_cast<int>(((n0 & 255) >> 6) + t4_gg);  // super 내 n-그룹 (0..3)
+    const bool t4_active = (n0 + t4_gg * 64) < n_cols;  // n_cols % 256 == 0 (host 검증)
     // KT_FP4 스레드 배치 (warp-연속 로드): lane l = tid & 7 이 한 행의 256-k 청크 안 16 B 조각
     // (k [l·32, l·32+32))을, 행 r = tid >> 3 (0..31) + 32·i (i=0..3) 네 행을 든다 → load 명령 하나에서
     // 인접 lane 8개가 같은 행의 인접 16 B = **128 B 연속**, warp가 행 4개. (행마다 lane을 갈랐던
@@ -166,6 +180,23 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_mxfp4(
             sreg = make_uint4(0u, 0u, 0u, 0u);
           }
         }
+      } else if constexpr (LAYOUT == KT_TILE4) {
+        const long long c = (kb >> 5) + t4_cc;  // 타일 컬럼
+        if (t4_active && c * kBlk < kr) {
+          breg = *reinterpret_cast<const uint4*>(blk + t4_super + c * 4096 + t4_g * 1024 + t4_p * 64 + t4_q * 16);
+        } else {
+          breg = make_uint4(0u, 0u, 0u, 0u);
+        }
+        if (tid < 16) {  // 배율 2행 × 128 B: 행 g = tid>>3 (컬럼 kb/32+g), 청크 (tid&7)·16
+          const int g = tid >> 3;
+          const int cch = (tid & 7) * 16;
+          const long long cs = (kb >> 5) + g;
+          if ((n0 + cch) < n_cols && cs * kBlk < kr) {
+            sreg = *reinterpret_cast<const uint4*>(blk_s + cs * n_cols + n0 + cch);
+          } else {
+            sreg = make_uint4(0u, 0u, 0u, 0u);
+          }
+        }
       } else {
         // kb는 청크 시작(256 배수)이어야 한다 — 버퍼 (kb>>8)&1 에 넣는다.
         const int buf = static_cast<int>((kb >> 8) & 1);
@@ -186,7 +217,7 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_mxfp4(
     };
     // 배율을 smem에 (16 스레드) — 코드 dequant가 읽기 전에 sync가 필요하므로 두 단계다.
     auto store_s = [&]() {
-      if (LAYOUT == PAIRROW && tid < 16) {
+      if ((LAYOUT == PAIRROW || LAYOUT == KT_TILE4) && tid < 16) {
         const int g = tid >> 3;
         const int c = (tid & 7) * 16;
         *reinterpret_cast<uint4*>(&ss[g][c]) = sreg;
@@ -202,6 +233,19 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_mxfp4(
         for (int j = 0; j < 16; ++j) {
           const uint32_t b = (w[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
           const float sh = prism_mxfp4::e8m0_half(ss[g][bc + j]);
+          lo_row[j] = prism_mxfp4::fp4_to_bf16(b & 0xFu, sh);
+          hi_row[j] = prism_mxfp4::fp4_to_bf16(b >> 4, sh);
+        }
+      } else if constexpr (LAYOUT == KT_TILE4) {
+        // 16 B = 페어 t4_p (k = kb + cc·32 + 2p, +1) × n 16개 (n0 + gg·64 + q·16 + j).
+        const int krow = t4_cc * kBlk + 2 * t4_p;
+        const int ncol = t4_gg * 64 + t4_q * 16;
+        __nv_bfloat16* lo_row = Bs + krow * kBld + ncol;
+        __nv_bfloat16* hi_row = lo_row + kBld;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+          const uint32_t b = (w[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
+          const float sh = prism_mxfp4::e8m0_half(ss[t4_cc][ncol + j]);
           lo_row[j] = prism_mxfp4::fp4_to_bf16(b & 0xFu, sh);
           hi_row[j] = prism_mxfp4::fp4_to_bf16(b >> 4, sh);
         }
@@ -253,7 +297,7 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_mxfp4(
         if (i < cnt && kb + kk < kr) v = x[static_cast<long long>(srow[i]) * x_kx + skid[kk]];
         As[i * kAld + kk] = v;
       }
-      if constexpr (LAYOUT == PAIRROW) {
+      if constexpr (LAYOUT == PAIRROW || LAYOUT == KT_TILE4) {
         if (kb + kBK < kr) load_b(kb + kBK);  // 다음 타일 선인출 (PCIe 지연 은닉)
       } else {
         // 청크 시작 스텝에서 **다음 청크**를 다른 버퍼에 선인출 — 4 스텝의 지연 은닉.
@@ -379,9 +423,11 @@ inline void grouped_mxfp4_impl(
   TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(tile_off);
   TensorMatcher({M, K, W_row}).with_dtype<bf16_t>().with_device(cuda_device).verify(out);
   auto S = SymbolicSize{"slab_bytes"};
-  if (layout == KT_FP4) {
+  if (layout == KT_FP4 || layout == KT_TILE4) {
     // slab은 1-D u8(host-register된 kt 메모리)이고 길이는 expert 블록 합(64 B 올림)이라 N과
     // 무관하다 — n_cols는 인자로 받는다 (노드 N shard 행 수). row_off/kidx는 그대로.
+    RuntimeCheck(layout != KT_TILE4 || cold_n_cols % 256 == 0,
+                 "grouped_mxfp4_cold(tile): n_cols ", cold_n_cols, " must be a multiple of 256");
     TensorMatcher({S}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(codes);
     TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(row_off);
     auto R = SymbolicSize{"total_rows"};
@@ -424,7 +470,7 @@ inline void grouped_mxfp4_impl(
   const bool fused = (codes_up != nullptr);
   if (fused) {
     RuntimeCheck(scales_up && row_off_up && kidx_up, "grouped_mxfp4_gateup: up slot needs all four tensors");
-    if (layout == KT_FP4) {
+    if (layout == KT_FP4 || layout == KT_TILE4) {
       auto S2 = SymbolicSize{"slab_bytes_up"};
       TensorMatcher({S2}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(*codes_up);
       TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(*row_off_up);
@@ -472,6 +518,7 @@ inline void grouped_mxfp4_impl(
         static_cast<long long>(n_cols), static_cast<long long>(out_row), s0, s1);
   };
   if (layout == KT_FP4) launch(prism_grouped_gemm_mxfp4<KT_FP4>);
+  else if (layout == KT_TILE4) launch(prism_grouped_gemm_mxfp4<KT_TILE4>);
   else launch(prism_grouped_gemm_mxfp4<PAIRROW>);
 }
 
@@ -484,10 +531,11 @@ void grouped_mxfp4_cold(
     tvm::ffi::TensorView slab, tvm::ffi::TensorView blk_off,
     tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
     tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
-    int64_t max_blocks, int64_t n_cols) {
+    int64_t max_blocks, int64_t n_cols, int64_t layout) {
+  host::RuntimeCheck(layout == KT_FP4 || layout == KT_TILE4, "grouped_mxfp4_cold: layout must be 1 (kt fp4) or 2 (tile)");
   grouped_mxfp4_impl(x, pair_sorted, pair_off, tile_off, slab, slab, row_off, kidx, out,
                      out_col_offset, x_row_is_pair, false, max_blocks,
-                     nullptr, nullptr, nullptr, nullptr, 0, KT_FP4, &blk_off, nullptr, n_cols);
+                     nullptr, nullptr, nullptr, nullptr, 0, static_cast<int>(layout), &blk_off, nullptr, n_cols);
 }
 
 void grouped_mxfp4_cold_gateup(
@@ -498,11 +546,12 @@ void grouped_mxfp4_cold_gateup(
     tvm::ffi::TensorView slab_u, tvm::ffi::TensorView blk_off_u,
     tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
     tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
-    int64_t x_row_is_pair, int64_t max_blocks, int64_t n_cols) {
+    int64_t x_row_is_pair, int64_t max_blocks, int64_t n_cols, int64_t layout) {
+  host::RuntimeCheck(layout == KT_FP4 || layout == KT_TILE4, "grouped_mxfp4_cold_gateup: layout must be 1 or 2");
   grouped_mxfp4_impl(x, pair_sorted, pair_off, tile_off, slab_g, slab_g, row_off_g, kidx_g, out,
                      out_col_offset_g, x_row_is_pair, false, max_blocks,
                      &slab_u, &slab_u, &row_off_u, &kidx_u, out_col_offset_u,
-                     KT_FP4, &blk_off_g, &blk_off_u, n_cols);
+                     static_cast<int>(layout), &blk_off_g, &blk_off_u, n_cols);
 }
 
 void grouped_mxfp4_indexed(

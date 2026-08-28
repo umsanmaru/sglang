@@ -45,6 +45,6 @@ def test_gpu_kernel_key_implies_store_format():
     assert gpu_store_format("gemv_worklist").name == "bf16"
     assert gpu_store_format("torch_bmm").name == "bf16"
     fmt = gpu_store_format("gemv_worklist_mxfp4")
-    assert fmt.name == "mxfp4" and fmt.k_align == 32 and fmt.cold_kernels == ("kt_amx_fp4",)
+    assert fmt.name == "mxfp4" and fmt.k_align == 32 and fmt.cold_kernels == ("kt_amx_fp4", "kt_tile_k2_mxfp4")
     with pytest.raises(KernelError):
         gpu_store_format("nope")

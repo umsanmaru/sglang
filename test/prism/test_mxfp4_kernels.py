@@ -259,8 +259,49 @@ def test_grouped_mxfp4_cold_slab_matches_pairrow(m):
     row_off = (torch.arange(E + 1, dtype=torch.int32) * k_rows).cuda()
     kidx_t = torch.cat(kidx).to(torch.uint16).cuda()
     cold = SimpleNamespace(slab=slab, blk_off=torch.tensor(offs[:-1], dtype=torch.int64).cuda(),
-                           row_off=row_off, k_index=kidx_t, n=N, n_start=0)
+                           row_off=row_off, k_index=kidx_t, n=N, n_start=0, layout="kt_fp4")
     x, ids = _inputs(m, K, True, False, seed=22 + m)
+    stream = torch.cuda.current_stream()
+    grouping = build_grouping(ids.cuda(), E)
+    ref = torch.zeros(m, TOPK, N, dtype=torch.bfloat16, device="cuda")
+    grouped_mxfp4_indexed(x.cuda(), grouping, codes, scales, row_off, kidx_t, ref, 0, False, stream)
+    out = torch.zeros_like(ref)
+    grouped_mxfp4_cold(x.cuda(), grouping, cold, out, 0, False, stream, 64)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
+@cuda_required
+@pytest.mark.parametrize("m", [8, 200])
+def test_grouped_mxfp4_cold_tile_slab_matches_pairrow(m):
+    """KT_TILE4 로더(kt GemmKernelTileK2MXFP4::BufferB: fp4 32k×256n 타일 + 전치 E8M0)가 pair-row
+    스토어와 같은 값을 곱한다 — 정확표현 입력에서 비트일치."""
+    from types import SimpleNamespace
+
+    from mxfp4_ref import tile_block
+    from sglang.jit_kernel.prism_grouped_mxfp4 import grouped_mxfp4_cold, grouped_mxfp4_indexed
+    from sglang.srt.layers.moe.prism.grouping import build_grouping
+
+    N, K, k_rows = 256, 256, 96          # kr=96: 64 배수 아님 (마지막 GPU 타일 절반 유효)
+    g = torch.Generator().manual_seed(31)
+    cs, ss, kidx, blocks, offs = [], [], [], [], [0]
+    for _ in range(E):
+        c_ck, s_ck = random_expert_ckpt(N, K, g, exact=True)
+        rows = aligned_index(K, k_rows, g)
+        c, s = pairrow_store(c_ck, s_ck, rows)
+        cs.append(c); ss.append(s); kidx.append(rows)
+        blk = tile_block(c_ck, s_ck, rows)
+        pad = (-blk.numel()) % 64
+        blocks.append(torch.cat([blk, torch.zeros(pad, dtype=torch.uint8)]))
+        offs.append(offs[-1] + blocks[-1].numel())
+    slab = torch.cat(blocks)
+    slab = torch.cat([slab, torch.zeros((-slab.numel()) % 4096, dtype=torch.uint8)]).pin_memory()
+    codes = torch.cat(cs).cuda(); scales = torch.cat(ss).cuda()
+    row_off = (torch.arange(E + 1, dtype=torch.int32) * k_rows).cuda()
+    kidx_t = torch.cat(kidx).to(torch.uint16).cuda()
+    cold = SimpleNamespace(slab=slab, blk_off=torch.tensor(offs[:-1], dtype=torch.int64).cuda(),
+                           row_off=row_off, k_index=kidx_t, n=N, n_start=0, layout="kt_tile4")
+    x, ids = _inputs(m, K, True, False, seed=32 + m)
     stream = torch.cuda.current_stream()
     grouping = build_grouping(ids.cuda(), E)
     ref = torch.zeros(m, TOPK, N, dtype=torch.bfloat16, device="cuda")

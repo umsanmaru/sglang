@@ -267,3 +267,119 @@ def test_mxfp4_three_tier_graph_replay_matches_eager():
     g.replay(); torch.cuda.synchronize()
     ex._force_graph_path = False
     assert torch.equal(out, ex.run_layer(0, x, ids, w, swiglu_limit=10.0))
+
+
+# ─── tile_k2_mxfp4 (cpu-mm 포팅) cold 커널 — N shard 256 배수 치수 ───────────────────────
+DIMS_T = {"hidden_size": 512, "intermediate_size": 512, "num_layers": 1,
+          "num_experts": 8, "top_k": 2, "dtype": "bfloat16"}
+
+
+def _plan3_tile(gpu_kernel, cpu_kernel):
+    from sglang.srt.layers.moe.prism.numa import numa_node_count
+    from sglang.srt.layers.moe.prism.plan import parse_plan, validate_static
+
+    nn = numa_node_count()
+    shards = [[0, 0, 256], [1, 256, 512]] if nn >= 2 else [[0, 0, 512]]
+    gu = {"bands": [[0, 64, "hot"], [64, 128, "warm"], [128, 512, "cold"]], "cold_shards": shards}
+    dn = {"bands": [[0, 64, "hot"], [64, 128, "warm"], [128, 512, "cold"]], "cold_shards": shards}
+    raw = {"schema_version": 1, "model_id": "test/tiny-mxfp4-tile", "dims": dict(DIMS_T),
+           "kernels": {"gpu_warm": gpu_kernel, "cpu_cold": cpu_kernel},
+           "default": {"gate": gu, "up": dict(gu), "down": dn}}
+    plan = parse_plan(raw); validate_static(plan)
+    return plan
+
+
+def _fp4_weights_t(seed, exact):
+    g = torch.Generator().manual_seed(seed)
+    E_, H_, I_ = DIMS_T["num_experts"], DIMS_T["hidden_size"], DIMS_T["intermediate_size"]
+    c13, s13, c2, s2 = [], [], [], []
+    for _ in range(E_):
+        c, s = random_expert_ckpt(2 * I_, H_, g, exact=exact); c13.append(c); s13.append(s)
+        c, s = random_expert_ckpt(H_, I_, g, exact=exact); c2.append(c); s2.append(s)
+    s13 = torch.stack(s13); s2 = torch.stack(s2)
+    to_f32 = lambda s: torch.ldexp(torch.ones(s.shape), s.int() - 127)
+    return torch.stack(c13), torch.stack(c2), to_f32(s13), to_f32(s2), s13, s2
+
+
+def _inputs_t(m, seed, exact):
+    g = torch.Generator().manual_seed(seed)
+    H_, E_, K_ = DIMS_T["hidden_size"], DIMS_T["num_experts"], DIMS_T["top_k"]
+    if exact:
+        x = torch.randint(-1, 2, (m, H_), generator=g).to(torch.bfloat16)
+        w = torch.randint(0, 3, (m, K_), generator=g).to(torch.float32)
+    else:
+        x = (torch.randn(m, H_, generator=g) / 4).to(torch.bfloat16)
+        w = torch.rand(m, K_, generator=g)
+    ids = torch.stack([torch.randperm(E_, generator=g)[:K_] for _ in range(m)])
+    return x.cuda(), ids.cuda(), w.cuda()
+
+
+@cuda_required
+@pytest.mark.parametrize("m", [1, 3, 40])
+@pytest.mark.parametrize("exact", [True, False])
+def test_tile_mxfp4_three_tier_matches_bf16(m, exact):
+    """cold = kt_tile_k2_mxfp4 (M=1 plan 경로 / M=3 토큰 루프 / M=40 cold-GPU KT_TILE4) ↔ bf16 dequant 3-tier."""
+    w13, w2, s13, s2, s13_u8, s2_u8 = _fp4_weights_t(seed=61, exact=exact)
+    E_ = DIMS_T["num_experts"]
+    d13 = torch.stack([dequant_ckpt(w13[e].view(torch.uint8), s13_u8[e]) for e in range(E_)]).to(torch.bfloat16)
+    d2 = torch.stack([dequant_ckpt(w2[e].view(torch.uint8), s2_u8[e]) for e in range(E_)]).to(torch.bfloat16)
+    ex4 = _executor3(_plan3_tile("gemv_worklist_mxfp4", "kt_tile_k2_mxfp4"),
+                     dict(w13=w13, w2=w2, w13_scale=s13, w2_scale=s2), cold_gpu_min_m=16)
+    ex16 = _executor3(_plan3_tile("gemv_worklist", "kt_amx_bf16"), dict(w13=d13, w2=d2))
+    x, ids, w = _inputs_t(m, seed=62 + m, exact=exact)
+    out4 = ex4.run_layer(0, x, ids, w, swiglu_limit=10.0)
+    out16 = ex16.run_layer(0, x, ids, w, swiglu_limit=10.0)
+    torch.cuda.synchronize()
+    if exact and m < 16:
+        assert torch.equal(out4, out16)
+    else:
+        # M ≥ 16은 cold를 GPU(tensor core)가 계산한다: K=384·|부분합|>2^8 인 이 치수에서는 wmma의
+        # fp32 누산이 AVX-512와 마지막 비트가 갈려 bf16 wire에서 1 ulp 차이가 난다 (tile/fp4 두 GPU
+        # 로더는 서로 비트일치 — 로더가 아니라 누산기의 차이). 소치수(DIMS)에서는 비트일치가 성립한다.
+        torch.testing.assert_close(out4.float(), out16.float(), rtol=3e-2, atol=3e-2)
+
+
+@cuda_required
+def test_tile_mxfp4_cold_gpu_prefill_matches_cpu():
+    """KT_TILE4 GPU 제자리 읽기 ↔ CPU 토큰 루프. 이 치수(K=384)에서는 tensor-core 누산 1 ulp 차이가
+    있어 tolerance다 (비트일치는 소치수 fp4 테스트와 커널 테스트가 담당)."""
+    w13, w2, s13, s2, _, _ = _fp4_weights_t(seed=71, exact=True)
+    kw = dict(w13=w13, w2=w2, w13_scale=s13, w2_scale=s2)
+    ex_cpu = _executor3(_plan3_tile("gemv_worklist_mxfp4", "kt_tile_k2_mxfp4"), kw, cold_gpu_min_m=None)
+    ex_gpu = _executor3(_plan3_tile("gemv_worklist_mxfp4", "kt_tile_k2_mxfp4"), kw, cold_gpu_min_m=16)
+    x, ids, w = _inputs_t(48, seed=72, exact=True)
+    a = ex_cpu.run_layer(0, x, ids, w, swiglu_limit=10.0)
+    b = ex_gpu.run_layer(0, x, ids, w, swiglu_limit=10.0)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(a.float(), b.float(), rtol=1e-2, atol=8.0)
+
+
+@cuda_required
+def test_tile_mxfp4_graph_replay_matches_eager():
+    w13, w2, s13, s2, _, _ = _fp4_weights_t(seed=81, exact=True)
+    ex = _executor3(_plan3_tile("gemv_worklist_mxfp4", "kt_tile_k2_mxfp4"),
+                    dict(w13=w13, w2=w2, w13_scale=s13, w2_scale=s2))
+    ex._force_graph_path = True
+    x, ids, w = _inputs_t(1, seed=82, exact=True)
+    eager = ex.run_layer(0, x, ids, w, swiglu_limit=10.0).clone()
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            ex.run_layer(0, x, ids, w, swiglu_limit=10.0)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        out = ex.run_layer(0, x, ids, w, swiglu_limit=10.0)
+    for _ in range(3):
+        out.zero_(); g.replay(); torch.cuda.synchronize()
+        assert torch.equal(out, eager)
+
+
+@cuda_required
+def test_tile_mxfp4_rejects_unaligned_shard():
+    from sglang.srt.layers.moe.prism.plan import PlanError
+
+    w13, w2, s13, s2, _, _ = _fp4_weights(seed=91, exact=True)   # DIMS: I=128 → shard 64 (256 미달)
+    with pytest.raises(PlanError, match="multiples of 256"):
+        _executor3(_plan3("gemv_worklist_mxfp4", "kt_tile_k2_mxfp4"),
+                   dict(w13=w13, w2=w2, w13_scale=s13, w2_scale=s2))

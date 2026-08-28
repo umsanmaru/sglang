@@ -46,7 +46,8 @@ class ColdSlab:
     node: int
     proj: Proj
     k_max: int = 0          # expert당 최대 K(타일 올림) — W-resident 커널의 smem 크기
-    fmt: object = None      # StoreFormat — slab 레이아웃(bf16 packed / kt fp4)과 GPU 진입점을 정한다
+    fmt: object = None      # StoreFormat — GPU 진입점을 정한다
+    layout: str = "kt_bf16"  # slab 레이아웃 태그 (kernels.cold_slab_layout) — 로더 변형 선택
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,9 @@ def build_cold_gpu_layer(
         from sglang.srt.layers.moe.prism.formats import BF16
 
         fmt = BF16
+    from sglang.srt.layers.moe.prism.kernels import cold_slab_layout
+
+    layout = cold_slab_layout(plan.kernels.cpu_cold)
     ep = plan.expert(layer_idx, 0)
     E = plan.dims.num_experts
     out: dict = {Proj.GATE: {}, Proj.UP: {}, Proj.DOWN: {}}
@@ -115,8 +119,10 @@ def build_cold_gpu_layer(
             n_start, n_rows = n_shard.n_start, n_shard.n_end - n_shard.n_start
         if int(v["n"]) != n_rows:
             raise PlanError(f"{where}: kt n {v['n']} != shard rows {n_rows}")
-        if int(v["n_step"]) != 32 or int(v["k_step"]) != 32:
-            raise PlanError(f"{where}: unsupported AMX tile {v['n_step']}x{v['k_step']} (kernel assumes 32x32)")
+        if (int(v["n_step"]), int(v["k_step"])) != (32, 32):
+            raise PlanError(f"{where}: unexpected kt tile {v['n_step']}x{v['k_step']} (loaders assume 32x32)")
+        if layout == "kt_tile4" and int(v["n_block"]) != 256:
+            raise PlanError(f"{where}: tile fp4 slab needs n_block 256 (super), got {v['n_block']}")
         expert_off = [int(o) for o in v["expert_off"]]
         if len(expert_off) != E + 1 or any(o % 2 for o in expert_off):
             raise PlanError(f"{where}: bad expert_off table")
@@ -131,7 +137,7 @@ def build_cold_gpu_layer(
             k_index=shard.k_index.to(device),
             n=int(v["n"]), n_start=n_start,
             n_block=int(v["n_block"]), k_block=int(v["k_block"]),
-            node=node, proj=proj, k_max=max(k_pad) if k_pad else 0, fmt=fmt,
+            node=node, proj=proj, k_max=max(k_pad) if k_pad else 0, fmt=fmt, layout=layout,
         )
     for proj in Proj:
         nodes = sorted(out[proj])

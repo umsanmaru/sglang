@@ -98,7 +98,7 @@ def main():
                     help="plan kernels.gpu_warm (worklist는 bs>1 graph decode용; "
                          "gemv_worklist_mxfp4 = MXFP4 pair-row 스토어, K 정렬 32, cold 불가)")
     ap.add_argument("--cpu-kernel", default="kt_amx_bf16",
-                    choices=["kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_fp4"])
+                    choices=["kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_fp4", "kt_tile_k2_mxfp4"])
     ap.add_argument("--k-align", type=int, default=ROW_GROUP,
                     help="밴드 경계 정렬 (기본 64; mxfp4는 32 배수여야 한다 — 64는 만족)")
     args = ap.parse_args()
@@ -118,8 +118,9 @@ def main():
 
     gu_bands, gu_cold = bands(hidden, args.hot_frac, args.warm_frac)
     dn_bands, dn_cold = bands(inter, args.hot_frac, args.warm_frac)
-    if args.gpu_kernel == "gemv_worklist_mxfp4" and (gu_cold or dn_cold) and args.cpu_kernel != "kt_amx_fp4":
-        raise SystemExit("mxfp4 store needs --cpu-kernel kt_amx_fp4 for its cold tier "
+    if args.gpu_kernel == "gemv_worklist_mxfp4" and (gu_cold or dn_cold) and \
+            args.cpu_kernel not in ("kt_amx_fp4", "kt_tile_k2_mxfp4"):
+        raise SystemExit("mxfp4 store needs --cpu-kernel kt_amx_fp4 or kt_tile_k2_mxfp4 for its cold tier "
                          f"(gateup {gu_bands}, down {dn_bands})")
     gate_up = {"bands": gu_bands, "cold_shards": shards(inter, args.numa_nodes) if gu_cold else []}
     down = {"bands": dn_bands, "cold_shards": shards(hidden, args.numa_nodes) if dn_cold else []}

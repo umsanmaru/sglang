@@ -18,6 +18,9 @@ from sglang.jit_kernel.utils import cache_once, load_jit
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
+# cold slab 레이아웃 (C++ enum Layout): kt fp4 원본(행우선 nibble + fp32 d) / fp4 타일 (tile_k2_mxfp4).
+COLD_LAYOUTS = {"kt_fp4": 1, "kt_tile4": 2}
+
 _WRAPPERS = (
     "grouped_mxfp4_indexed",
     "grouped_mxfp4_indexed_pinned",
@@ -86,13 +89,13 @@ def grouped_mxfp4_cold(x2d, grouping, cold, out3d, out_col_offset, x_row_is_pair
             x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
             cold.slab, cold.blk_off, cold.row_off, cold.k_index, out3d,
             int(out_col_offset) + int(cold.n_start), int(bool(x_row_is_pair)),
-            int(max_blocks), int(cold.n))
+            int(max_blocks), int(cold.n), COLD_LAYOUTS[cold.layout])
 
 
 def grouped_mxfp4_cold_gateup(x2d, grouping, gate, up, out3d, out_col_gate, out_col_up,
                               x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
     """cold gate+up 한 launch (같은 노드의 두 slab)."""
-    if (gate.n_start, gate.n) != (up.n_start, up.n):
+    if (gate.n_start, gate.n, gate.layout) != (up.n_start, up.n, up.layout):
         raise ValueError("cold gateup fusion requires gate/up slabs of the same node instance")
     module = _jit_prism_grouped_mxfp4_module()
     with torch.cuda.stream(stream):
@@ -101,4 +104,4 @@ def grouped_mxfp4_cold_gateup(x2d, grouping, gate, up, out3d, out_col_gate, out_
             gate.slab, gate.blk_off, gate.row_off, gate.k_index,
             up.slab, up.blk_off, up.row_off, up.k_index, out3d,
             int(out_col_gate) + int(gate.n_start), int(out_col_up) + int(up.n_start),
-            int(bool(x_row_is_pair)), int(max_blocks), int(gate.n))
+            int(bool(x_row_is_pair)), int(max_blocks), int(gate.n), COLD_LAYOUTS[gate.layout])

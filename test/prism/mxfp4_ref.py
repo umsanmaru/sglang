@@ -62,3 +62,28 @@ def aligned_index(K: int, k_rows: int, g: torch.Generator) -> torch.Tensor:
     nb = K // 32
     pick = torch.randperm(nb, generator=g)[: k_rows // 32].sort().values
     return (pick[:, None] * 32 + torch.arange(32)[None, :]).reshape(-1)
+
+
+def ktm4_off(n, k, K):
+    """cpu-mm/kt fp4 타일 레이아웃의 원소 오프셋 (tile_k2_mxfp4_port.hpp `ktm4_off`)."""
+    return ((k & 1) + (n & 63) * 2 + ((k >> 1) & 15) * 128 + ((n >> 6) & 3) * 2048
+            + (k >> 5) * 8192 + (n >> 8) * 8192 * (K // 32))
+
+
+def tile_block(codes_ckpt: torch.Tensor, scales_ckpt: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    """expert 하나를 kt `GemmKernelTileK2MXFP4::BufferB` 블록(u8 1-D)으로: 타일 코드 N·k/2 B(64 B
+    올림) + 전치 E8M0 [k/32][N]. rows = 32-정렬 k 인덱스 (길이 k). N은 256 배수."""
+    N = codes_ckpt.shape[0]
+    k = int(rows.numel())
+    assert N % 256 == 0 and k % 32 == 0
+    pairs = (rows[0::2] // 2).long()
+    nib = codes_ckpt.view(torch.uint8).index_select(1, pairs)          # [N, k/2] bytes (pair = 2 k)
+    codes = torch.zeros(N * k // 2, dtype=torch.uint8)
+    nn = torch.arange(N).view(N, 1).expand(N, k // 2)
+    kk = (torch.arange(k // 2) * 2).view(1, -1).expand(N, k // 2)   # 페어의 짝수 k
+    off = ktm4_off(nn, kk, k)                                       # 텐서 산술로 벡터화
+    codes[(off // 2).reshape(-1)] = nib.reshape(-1)
+    blocks = (rows[0::32] // 32).long()
+    sc = scales_ckpt.index_select(1, blocks).t().contiguous().reshape(-1)  # [k/32][N] u8
+    pad = (-codes.numel()) % 64
+    return torch.cat([codes, torch.zeros(pad, dtype=torch.uint8), sc])

@@ -18,7 +18,15 @@ from __future__ import annotations
 from typing import Tuple
 
 _GPU_WARM_KERNELS: Tuple[str, ...] = ("gemv_worklist", "torch_bmm", "gemv_worklist_mxfp4")
-_CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_fp4")
+_CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_fp4", "kt_tile_k2_mxfp4")
+
+# cold 커널 키가 함의하는 **slab 레이아웃**(GPU 제자리 읽기 로더가 해석) 과 노드 N shard 정렬.
+#   kt_bf16  — kt BufferBBF16Impl packed 6D (prism_grouped.cuh COLD)
+#   kt_fp4   — kt BufferBInt4KGroupImpl: 행우선 nibble + fp32 d (prism_grouped_mxfp4.cuh KT_FP4)
+#   kt_tile4 — GemmKernelTileK2MXFP4::BufferB: fp4 32k×256n 타일 + 전치 E8M0 (KT_TILE4); N shard 256 배수
+_CPU_COLD_SLAB_LAYOUT: dict = {"kt_amx_bf16": "kt_bf16", "kt_tile_k2_bf16": "kt_bf16",
+                               "kt_amx_fp4": "kt_fp4", "kt_tile_k2_mxfp4": "kt_tile4"}
+_CPU_COLD_N_ALIGN: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_fp4": 32, "kt_tile_k2_mxfp4": 256}
 
 # GPU 커널 키가 함의하는 **스토어 포맷** (formats.py). 키 하나가 스토어 형식·K 정렬·커널
 # 진입점·로더 파라미터 형태를 전부 정한다 (계약 ①) — 이 dict가 그 유일한 대응표다.
@@ -34,7 +42,7 @@ _GPU_STORE_FORMAT: dict = {
 # "cold의 저장 형식(pack)은 커널 키가 함의한다 — 별도 codec 필드 없음").
 # plan/자산이 지키는 정렬은 페어(%2)뿐이므로, 로더가 여기까지 올리고 0 행을
 # 채운다. 새 cold 커널은 자기 타일 크기를 여기 등록한다.
-_CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_fp4": 32}
+_CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_fp4": 32, "kt_tile_k2_mxfp4": 32}
 
 
 class KernelError(ValueError):
@@ -77,6 +85,19 @@ def cold_pack_tile_rows(name: str) -> int:
         raise KernelError(
             f"unknown cpu_cold kernel '{name}' (known: {sorted(_CPU_COLD_KERNELS)})"
         ) from None
+
+
+def cold_slab_layout(name: str) -> str:
+    """cold 커널 키 → slab 레이아웃 태그 (cold_gpu.ColdSlab.layout). 이름 검증 겸."""
+    try:
+        return _CPU_COLD_SLAB_LAYOUT[name]
+    except KeyError:
+        raise KernelError(f"unknown cpu_cold kernel '{name}' (known: {sorted(_CPU_COLD_KERNELS)})") from None
+
+
+def cold_n_align(name: str) -> int:
+    """cold 커널 키가 요구하는 노드 N shard 정렬 (행 수)."""
+    return _CPU_COLD_N_ALIGN[resolve_cpu_kernel(name)]
 
 
 def resolve_cpu_kernel(name: str) -> str:
