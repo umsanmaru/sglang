@@ -9,7 +9,12 @@
 
 #include <cstdint>
 
+#include "prism_sparse_common.cuh"
+
 namespace {
+
+using prism_sparse::SparseArgs;
+using prism_sparse::SparseIn;
 
 // Prism worklist GEMV: pair p=(m,j)가 e=topk[m,j]의 W 밴드를 store에서 직접
 // 읽어 rejoin 레이아웃 out[m, j, off:off+N]에 쓴다. 누산 fp32, 출력 bf16
@@ -56,14 +61,7 @@ namespace {
 // 갈릴 수 있다. 임계에 정확히 걸린 페어 하나가 한쪽에서 뒤집히는 것이 최악인데,
 // **페어는 정확히 한 티어에만 속하므로**(ROW_GROUP % PAIR_GROUP == 0) 이중계산도
 // 누락도 아니고 그 페어 하나의 정확도 차이다 — rejoin 정확성 문제가 아니다.
-struct SparseArgs {
-  const float* a;        // [Σₑ k[e]]      = wn² (weight와 같은 오프셋)
-  const float* c;        // [Σₑ k[e]/2]    = 인접열 내적
-  const float* thr_tab;  // [E, ng]        = sparsity → threshold 곡선
-  const float* topk_w;   // [M, top_k]     = 라우터 가중
-  float p, lam, pmax, grid;
-  int ng, renorm_it;
-};
+// SparseArgs/SparseIn과 임계값·에너지 식은 prism_sparse_common.cuh (mxfp4 커널과 공유).
 
 // 블록 하나가 맡는 출력 열 수. 커널의 `NCOL`, blockDim.x(= kNCol/V),
 // grid.x(= ceil(n_cols/kNCol)) 셋이 **같은 값**이어야 하므로 정의점을 하나로 둔다
@@ -145,34 +143,7 @@ __global__ void prism_gemv_worklist(
   // 이 (m, j)의 임계값. 전 스레드가 중복 계산한다 — top_k(보통 8)짜리 루프라
   // syncthreads 한 번보다 싸고, 공유 상태가 없어 결정적이다.
   float thr2 = 0.f;
-  if constexpr (SPARSE) {
-    constexpr int MAXK = 16;  // host RuntimeCheck가 top_k <= MAXK를 보증
-    float sv[MAXK];
-    const float* wj = sp.topk_w + m * top_k;
-    float sum = 0.f;
-    for (int i = 0; i < top_k; ++i) sum += wj[i];
-    const float inv = 1.f / (sum > 1e-9f ? sum : 1e-9f);
-    float gbar = 0.f;
-    for (int i = 0; i < top_k; ++i) gbar += wj[i] * inv;
-    gbar /= static_cast<float>(top_k);
-    const float pmax = sp.pmax;
-    auto clip = [pmax](float v) { return v < 0.f ? 0.f : (v > pmax ? pmax : v); };
-    for (int i = 0; i < top_k; ++i) sv[i] = clip(sp.p - sp.lam * (wj[i] * inv - gbar));
-    // 재정규화가 s의 평균을 쓰므로 슬롯 하나만 따로 구할 수 없다 (kt와 동일).
-    for (int it = 0; it < sp.renorm_it; ++it) {
-      float mean = 0.f;
-      for (int i = 0; i < top_k; ++i) mean += sv[i];
-      mean /= static_cast<float>(top_k);
-      if (mean < 1e-6f) mean = 1e-6f;
-      const float scale = sp.p / mean;
-      for (int i = 0; i < top_k; ++i) sv[i] = clip(sv[i] * scale);
-    }
-    long long gi = static_cast<long long>(rintf(sv[pair % top_k] / sp.grid));
-    if (gi < 0) gi = 0;
-    if (gi > static_cast<long long>(sp.ng) - 1) gi = static_cast<long long>(sp.ng) - 1;
-    const float thr = sp.thr_tab[e * static_cast<long long>(sp.ng) + gi];
-    thr2 = thr * thr;  // kt도 제곱 비교다 (sqrt를 양쪽 다 생략)
-  }
+  if constexpr (SPARSE) thr2 = prism_sparse::sparse_thr2(sp, m, pair, e, top_k);
 
   // 이 블록이 쓰는 activation 조각을 smem에 한 번 모은다.
   //
@@ -239,9 +210,7 @@ __global__ void prism_gemv_worklist(
           const float x0 = __bfloat162float(xs[2 * i]);
           const float x1 = __bfloat162float(xs[2 * i + 1]);
           const long long ar = o0 + base + 2 * i;
-          float en = sp.a[ar] * x0 * x0 + sp.a[ar + 1] * x1 * x1 +
-                     2.0f * sp.c[ar >> 1] * x0 * x1;
-          if (en < 0.f) en = 0.f;
+          const float en = prism_sparse::pair_energy(sp, ar, x0, x1);
           keep[i] = (en >= thr2) ? uint8_t{1} : uint8_t{0};
         }
         __syncthreads();
@@ -432,11 +401,6 @@ inline void gemv_worklist_impl(
 // sparse 변형은 여기에 4개 텐서(a, c, thr, topk_weights)와 예산 스칼라를 더
 // 얹는다. dense 진입점은 손대지 않는다 — 템플릿 bool로 갈라지므로 dense
 // codegen이 움직이지 않는 것이 이 구조의 요점이다.
-struct SparseIn {
-  tvm::ffi::TensorView a, c, thr, topk_w;
-  double p, lam, pmax, grid;
-  int64_t ng, renorm_it;
-};
 
 inline void gemv_worklist_indexed_impl(
     tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
