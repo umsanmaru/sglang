@@ -2,10 +2,22 @@
 
 세 가지를 잰다. 전부 **prism이 실제로 부르는 그 커널**이고, 대체 구현이 아니다:
 
-  hot_dense_gemv       `gemv_worklist_indexed` (device 상주 W, tiers.ResidentTier)
-  WarmColdProfiler     warm = `gemv_worklist_indexed_pinned_sparse` (pinned W, UVA)
-                       cold = kt `forward_{gateup,down}_partial` (tile_k2 / AMX)
+  hot_dense_gemv       indexed worklist GEMV (device 상주 W, tiers.ResidentTier)
+  WarmColdProfiler     warm = 그 pinned sparse 쌍둥이 (UVA 제자리 읽기)
+                       cold = kt `forward_{gateup,down}_partial`
   ColdCpuProfiler      cold만, CUDA 미사용 (GPU가 점유돼 있어도 돌고 perf 가능)
+
+**어느 커널이냐는 `dtype`이 정한다** (`Store`, common.py). 이름 하나가 GPU 진입점
+(formats.StoreFormat)·cold 백엔드(kt 커널 키)·K 정렬·스토어 모양을 함께 고른다:
+
+  dtype    GPU 진입점            cold(kt) 기본        K 정렬   스토어
+  bf16     gemv_worklist_*       kt_tile_k2_bf16      2        w [Σk, N] bf16
+  mxfp4    gemv_mxfp4_*          kt_tile_k2_mxfp4     32       codes [Σk/2, N] + E8M0 [Σk/32, N]
+  fp8      gemv_fp8_*            kt_tile_k2_fp8b128   128      codes [Σk, N] + fp32 [Σk/128, N/128]
+
+정렬이 dtype마다 다른 것은 배율 블록이 원본 행 블록에 걸려 있기 때문이다 (계약 ①) —
+티어가 그 블록을 쪼개면 "블록당 배율 1"이 깨진다. `hot_frac`/`warm_frac`의 행 반올림도
+그 값을 따른다.
 
 ## 쓰는 법
 
@@ -16,7 +28,7 @@
     shape = Shape(experts=128, topk=8, hidden=2048, inter=768)
 
     # ① hot dense GEMV
-    r = hot_dense_gemv(shape, hot_frac=0.375, device=1)
+    r = hot_dense_gemv(shape, hot_frac=0.375, device=1)          # dtype="bf16" 기본
     r.us("gate")            # 17.78
     r.layer_gemv_us         # 47.1  (gate*2 + down)
     r.as_dict()             # JSON 그대로
@@ -31,6 +43,10 @@
 
     # ③ cold만 (GPU 불필요)
     cold_cpu(shape, sparsity=0.9).us      # 103.5
+
+    # ④ 같은 질문을 다른 dtype으로 (커널·스토어·정렬이 함께 바뀐다)
+    hot_dense_gemv(shape, hot_frac=0.375, device=1, dtype="fp8").layer_gemv_us
+    cold_cpu(shape, sparsity=0.9, dtype="mxfp4").us
 
 ## 규약
 
@@ -75,8 +91,10 @@ from sglang.srt.layers.moe.prism.profile.common import (
     SPARSITY_LAM,
     SPARSITY_P,
     THR_CONST,
+    STORES,
     Shape,
     SparseGemv,
+    Store,
     Timing,
     default_cpuinfer_threads,
     emit,
@@ -89,6 +107,7 @@ from sglang.srt.layers.moe.prism.profile.common import (
     select_device,
     sparse_tables,
     split_rows,
+    store_of,
     tier_index,
 )
 from sglang.srt.layers.moe.prism.profile.hot import (
@@ -119,7 +138,7 @@ from sglang.srt.layers.moe.prism.profile.warm_cold import (
 __all__ = [
     # shape / 결과 타입
     "Shape", "Timing", "ProjGemv", "HotGemvReport", "GroupReport", "Split",
-    "ColdCpuReport", "SparseGemv",
+    "ColdCpuReport", "SparseGemv", "Store",
     # 측정 진입점
     "hot_dense_gemv", "measure_proj", "measure_gateup", "dense_gemv",
     "WarmColdProfiler", "warm_cold_sparse", "single_expert_warm_cold",
@@ -132,6 +151,7 @@ __all__ = [
     # 헬퍼 / 상수
     "emit", "env_stamp", "gbps", "select_device", "numa_nodes",
     "default_cpuinfer_threads",
+    "store_of", "STORES",
     "GROUPS", "VARIANTS", "N_ALIGN", "PROJS", "K_STEP",
     "NG", "GRID", "PMAX", "RENORM_IT", "THR_CONST",
     "SPARSITY_P", "SPARSITY_LAM",

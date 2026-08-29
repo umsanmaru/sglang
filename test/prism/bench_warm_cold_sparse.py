@@ -82,8 +82,12 @@ def main() -> None:
     p.add_argument("--only", default=None,
                    help=f"이 변형만 측정 (쉼표 구분: {','.join(VARIANTS)})")
     p.add_argument("--mask-pattern", default="random", choices=("random", "block"))
-    p.add_argument("--cpu-kernel", default="kt_tile_k2_bf16",
-                   choices=("kt_tile_k2_bf16", "kt_amx_bf16"))
+    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8"),
+                   help="스토어 dtype = warm GPU 커널 + cold kt 백엔드를 함께 고른다")
+    p.add_argument("--cpu-kernel", default=None,
+                   choices=("kt_tile_k2_bf16", "kt_amx_bf16", "kt_amx_fp4",
+                            "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128"),
+                   help="기본값은 dtype이 정한다")
     p.add_argument("--threads", type=int, default=None,
                    help="CPUInfer 스레드 (기본 cpu_count//2-2, method.py와 같은 관례)")
     p.add_argument("--dense", action="store_true",
@@ -111,17 +115,19 @@ def main() -> None:
     try:
         if a.dry_run:
             splits = {proj: make_split(shape, proj, a.warm_frac, cold_frac,
-                                       shuffle=a.shuffle_index, seed=a.seed)
+                                       shuffle=a.shuffle_index, seed=a.seed,
+                                       dtype=a.dtype)
                       for proj in PROJS}
             emit({"bench": "warm_cold_sparse", "shape": shape.as_dict(),
+                  "dtype": a.dtype,
                   "splits": {k: v.as_dict() for k, v in splits.items()},
-                  "footprint": footprint(shape, splits)}, a.out)
+                  "footprint": footprint(shape, splits, a.dtype)}, a.out)
             return
 
         with WarmColdProfiler(
             shape, warm_frac=a.warm_frac, cold_frac=a.cold_frac,
             sparsity=a.sparsity, numa_split=a.numa_split,
-            mask_pattern=a.mask_pattern, cpu_kernel=a.cpu_kernel,
+            mask_pattern=a.mask_pattern, cpu_kernel=a.cpu_kernel, dtype=a.dtype,
             threads=a.threads, device=a.device, masking=not a.dense,
             warm_node=a.warm_node, shuffle_index=a.shuffle_index, seed=a.seed,
             numa_map=[int(x) for x in a.numa_map.split(',') if x.strip()] or None,

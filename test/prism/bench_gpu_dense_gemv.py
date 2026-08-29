@@ -17,6 +17,9 @@
 
     # 치수만 직접 주는 경우 (weight shape = [k, n])
     python test/prism/bench_gpu_dense_gemv.py --device 1 --k 768 --n 512
+
+    # dtype으로 백엔드를 고른다 (bf16 / mxfp4 / fp8) — 커널·스토어·정렬이 함께 바뀐다
+    python test/prism/bench_gpu_dense_gemv.py --device 1 --dtype fp8
 """
 
 from __future__ import annotations
@@ -42,7 +45,10 @@ def main() -> None:
     p.add_argument("--n", type=int, help="raw 모드: weight 열 수")
     p.add_argument("--m", type=int, default=1, help="토큰 수 (decode=1)")
     p.add_argument("--vec", type=int, default=0, choices=(0, 1, 4, 8),
-                   help="W 로드 폭 (0=자동)")
+                   help="W 로드 폭 (0=자동, bf16 커널 전용)")
+    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8"),
+                   help="스토어 dtype = 커널 백엔드 (bf16 / mxfp4 g32 / fp8 e4m3 b128). "
+                        "K 행 정렬도 따라 바뀐다: 2 / 32 / 128")
     p.add_argument("--reps", type=int, default=100,
                    help="그래프 하나에 담을 launch 수")
     p.add_argument("--replays", type=int, default=20)
@@ -60,7 +66,7 @@ def main() -> None:
             projs=[s.strip() for s in a.projs.split(",") if s.strip()],
             k_rows=a.k, n_cols=a.n, m=a.m, vec=a.vec, reps=a.reps,
             replays=a.replays, device=a.device,
-            shuffle_index=a.shuffle_index, seed=a.seed)
+            shuffle_index=a.shuffle_index, seed=a.seed, dtype=a.dtype)
     except ValueError as e:
         raise SystemExit(str(e))
     emit(report.as_dict(), a.out)

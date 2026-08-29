@@ -37,6 +37,7 @@ from sglang.srt.layers.moe.prism.profile.common import (
     GRID,
     SparseGemv,
     K_STEP,
+    store_of,
     NG,
     PAIR_GROUP,
     PMAX,
@@ -72,7 +73,9 @@ VARIANTS = ("warm_only", "cold_only", "combined", "combined_eager",
 #
 # AMX(kt_amx_bf16)의 mat_mul/amx_kernel은 부분 N_BLOCK을 처리하므로 N_STEP(32)만
 # 지키면 된다. 노드 하나가 받는 shard는 kt가 rows > 0을 요구한다.
-N_ALIGN = {"kt_tile_k2_bf16": 256, "kt_amx_bf16": 32}
+N_ALIGN = {"kt_tile_k2_bf16": 256, "kt_amx_bf16": 32,
+           "kt_amx_fp4": 32, "kt_tile_k2_mxfp4": 256,
+           "kt_tile_k2_fp8b128": 256}
 
 
 # ─── 행 분할 ───────────────────────────────────────────────────────────────
@@ -101,18 +104,22 @@ class Split:
 
 
 def make_split(shape: Shape, proj: str, warm_frac: float, cold_frac: float,
-               *, shuffle: bool = False, seed: int = 0) -> Split:
+               *, shuffle: bool = False, seed: int = 0, dtype: str = "bf16") -> Split:
+    store = store_of(dtype)
+    step = store.rows_step()
     axis = shape.k_axis(proj)
-    kw = split_rows(axis, warm_frac)
-    kc = split_rows(axis, cold_frac)
+    kw = split_rows(axis, warm_frac, step=step)
+    kc = split_rows(axis, cold_frac, step=step)
     if kw + kc > axis:
         raise ValueError(
             f"{proj}: warm {kw} + cold {kc} rows exceed axis {axis} "
-            f"(K_STEP={K_STEP} 반올림 후)")
-    if kc % K_STEP or kw % PAIR_GROUP:
+            f"(step={step} 반올림 후)")
+    # 정렬은 dtype이 정한다 (계약 ①): bf16은 페어, mxfp4는 32(E8M0 블록), fp8은
+    # 128(블록 배율) — 티어가 배율 블록을 쪼개면 "블록당 배율 1"이 깨진다.
+    if kc % step or kw % max(PAIR_GROUP, store.k_align):
         raise ValueError(
-            f"{proj}: cold rows must be a K_STEP({K_STEP}) multiple and warm "
-            f"rows even — got cold={kc} warm={kw}")
+            f"{proj}: {store.name} needs cold rows a multiple of {step} and warm rows "
+            f"a multiple of {max(PAIR_GROUP, store.k_align)} — got cold={kc} warm={kw}")
     # 같은 시드의 같은 순열에서 앞을 warm, 그 다음을 cold가 갖는다 → 서로소.
     return Split(
         proj=proj, axis=axis, n_cols=shape.n_cols(proj),
@@ -121,10 +128,11 @@ def make_split(shape: Shape, proj: str, warm_frac: float, cold_frac: float,
     )
 
 
-def footprint(shape: Shape, splits: Mapping[str, Split]) -> dict:
+def footprint(shape: Shape, splits: Mapping[str, Split], dtype: str = "bf16") -> dict:
+    store = store_of(dtype)
     E = shape.experts
-    warm = sum(E * splits[p].k_warm * splits[p].n_cols * 2 for p in PROJS)
-    cold = sum(E * splits[p].k_cold * splits[p].n_cols * 2 for p in PROJS)
+    warm = sum(store.store_bytes(E, splits[p].k_warm, splits[p].n_cols) for p in PROJS)
+    cold = sum(store.store_bytes(E, splits[p].k_cold, splits[p].n_cols) for p in PROJS)
     return {"warm_pinned_mb": round(warm / 1e6, 1),
             "cold_mb": round(cold / 1e6, 1),
             "note": "cold는 주입 텐서와 kt packed 사본이 동시에 사는 순간이 load "
@@ -137,17 +145,18 @@ class WarmTier:
     w_flat [Σₑ k(e), N] pinned, row_off/k_index는 device 상주."""
 
     def __init__(self, shape: Shape, sp: Split, *, sparsity: float, pattern: str,
-                 seed: int, device, node: Optional[int]):
-        from sglang.srt.layers.moe.prism.numa import alloc_pinned_on_node
+                 seed: int, device, node: Optional[int], dtype: str = "bf16"):
         from sglang.srt.layers.moe.prism.profile.common import sparse_tables
         from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
         E = shape.experts
         kw = sp.k_warm
         self.split = sp
-        self.w_flat = alloc_pinned_on_node(
-            (E * kw, sp.n_cols), torch.bfloat16, node, f"warm {sp.proj} store")
-        self.w_flat.normal_(0, 0.02)
+        self.store = store_of(dtype)
+        # 스토어 인자는 포맷이 정한다 (bf16 (w,), mxfp4/fp8 (codes, scales)) — pinned +
+        # NUMA 바인딩은 warm의 거처 계약이다 (계약 ③).
+        self.parts = self.store.gpu_store(E, kw, sp.n_cols, node=node, seed=seed)
+        self.w_flat = self.parts[0]
         self.row_off = (torch.arange(E + 1, dtype=torch.int32) * kw).to(device)
         self.k_index = sp.warm_rows.to(torch.uint16).repeat(E).contiguous().to(device)
         a, c, thr, self.keep_frac = sparse_tables(
@@ -160,20 +169,15 @@ class WarmTier:
         )
 
     def launch(self, x, ids, topk_w, out, col_off: int, *, masking: bool) -> None:
-        from sglang.jit_kernel.prism_gemv import (
-            gemv_worklist_indexed_pinned,
-            gemv_worklist_indexed_pinned_sparse,
-        )
-
         stream = torch.cuda.current_stream()
+        fn = self.store.fmt.gemv(pinned=True, sparse=masking)
+        pair = self.split.proj == "down"
         if masking:
-            gemv_worklist_indexed_pinned_sparse(
-                x, ids, topk_w, self.w_flat, self.row_off, self.k_index, out,
-                self.spec, col_off, self.split.proj == "down", stream)
+            self.store.call(fn, (x, ids, topk_w, *self.parts, self.row_off,
+                                 self.k_index, out, self.spec, col_off, pair, stream))
         else:
-            gemv_worklist_indexed_pinned(
-                x, ids, self.w_flat, self.row_off, self.k_index, out,
-                col_off, self.split.proj == "down", stream)
+            self.store.call(fn, (x, ids, *self.parts, self.row_off, self.k_index,
+                                 out, col_off, pair, stream))
 
 
 # ─── cold (CPU, kt) ───────────────────────────────────────────────────────
@@ -215,16 +219,22 @@ class ColdTier:
 
     def __init__(self, shape: Shape, splits: Mapping[str, Split], *,
                  sparsity: float, pattern: str, seed: int, numa_split: float,
-                 threads: int, kernel_key: str,
+                 threads: int, kernel_key: str, dtype: str = "bf16",
                  numa_map: Optional[Sequence[int]] = None):
         from kt_kernel import kt_kernel_ext
         from kt_kernel.experts_partial import PartialMoEWrapper
 
         from sglang.srt.layers.moe.prism.profile.common import sparse_tables
 
+        self.store = store_of(dtype)
         if kernel_key not in N_ALIGN:
             raise ValueError(f"unknown cpu kernel {kernel_key!r} "
                              f"(known: {sorted(N_ALIGN)})")
+        # dtype이 소비 가능한 cold 커널만 (formats의 cold_kernels 계약).
+        if kernel_key not in self.store.cpu_kernels:
+            raise ValueError(f"cpu kernel {kernel_key!r} cannot consume a "
+                             f"{self.store.name} cold store "
+                             f"(compatible: {list(self.store.cpu_kernels)})")
         E, topk = shape.experts, shape.topk
         H, I = shape.hidden, shape.inter
         # numa_map이 주어지면 그 노드들만 쓴다 — 실모델의 SGLANG_PRISM_NUMA_MAP과
@@ -276,13 +286,13 @@ class ColdTier:
         cfg.pool = self.cpuinfer.backend_
 
         # cold 스토어: expert 블록이 ckpt 방향 [N, k_cold]인 1-D flat
-        # (weights.py `_cold_flat`과 같은 레이아웃).
-        self.w = {}
+        # (weights.py `cold_flat`과 같은 레이아웃). 양자화 dtype이면 배율이 동행한다.
+        self.w, self.s = {}, {}
         for proj in PROJS:
             sp = splits[proj]
-            t = torch.empty(E * sp.n_cols * sp.k_cold, dtype=torch.bfloat16)
-            t.normal_(0, 0.02)
-            self.w[proj] = t.contiguous()
+            w, sc = self.store.cold_store(E, sp.n_cols, sp.k_cold, seed=seed + hash(proj) % 97)
+            self.w[proj] = w
+            self.s[proj] = sc
 
         tables, self.keep_frac, self.a_host = {}, {}, {}
         for proj in PROJS:
@@ -296,11 +306,33 @@ class ColdTier:
             self.a_host[proj] = a.reshape(E, sp.k_cold)
 
         self.wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=kernel_key)
+        scale_kw = ({} if self.s["gate"] is None else
+                    dict(gate_scale=self.s["gate"], up_scale=self.s["up"],
+                         down_scale=self.s["down"]))
         self.wrapper.load_weights_from_tensors(
-            self.w["gate"], self.w["up"], self.w["down"], sparsity_tables=tables)
+            self.w["gate"], self.w["up"], self.w["down"], sparsity_tables=tables,
+            **scale_kw)
 
     def rows_of(self, proj: str) -> int:
         return int(self.a_host[proj].shape[1])
+
+    def dequant_blocks(self, proj: str, n: int, k: int) -> torch.Tensor:
+        """cold 주입 스토어 → fp32 [E, N, k] (check의 레퍼런스가 열을 더한다).
+
+        이 프로파일의 합성 배율은 전부 1.0이라 dequant는 코드 값 그 자체다 — 배율을
+        섞으면 여기도 dtype별 블록 재구성이 필요해진다."""
+        E = int(self.a_host[proj].shape[0])
+        w = self.w[proj]
+        if self.store.name == "bf16":
+            return w.float().reshape(E, n, k)
+        from sglang.srt.layers.moe.prism.profile.common import _FP4_TABLE, _e4m3_table
+
+        if self.store.name == "mxfp4":
+            b = w.reshape(E * n, k // 2)
+            low, high = (b & 0xF).long(), (b >> 4).long()
+            vals = torch.stack([_FP4_TABLE[low], _FP4_TABLE[high]], dim=2).reshape(E * n, k)
+            return vals.reshape(E, n, k)
+        return _e4m3_table()[w.long()].reshape(E, n, k)
 
 
 # ─── 리포트 ────────────────────────────────────────────────────────────────
@@ -334,11 +366,10 @@ class WarmColdProfiler:
     def __init__(self, shape: Shape, *, warm_frac: float,
                  cold_frac: Optional[float] = None, sparsity: float = 0.9,
                  numa_split: float = 0.5, mask_pattern: str = "random",
-                 cpu_kernel: str = "kt_tile_k2_bf16",
+                 cpu_kernel: Optional[str] = None, dtype: str = "bf16",
                  threads: Optional[int] = None, device=0, masking: bool = True,
                  warm_node: Optional[int] = None, shuffle_index: bool = False,
                  seed: int = 0, numa_map: Optional[Sequence[int]] = None):
-        from sglang.jit_kernel.prism_gemv import warmup_jit
         from sglang.srt.layers.moe.prism.numa import gpu_numa_node
         from sglang.srt.layers.moe.prism.resources import (
             ExecutionResources,
@@ -349,33 +380,37 @@ class WarmColdProfiler:
         self.device = select_device(device)
         self.masking = masking
         self.sparsity = sparsity
+        self.store = store_of(dtype)
+        cpu_kernel = cpu_kernel or self.store.cpu_kernel
         cold_frac = 1.0 - warm_frac if cold_frac is None else cold_frac
         self.splits = {
             proj: make_split(shape, proj, warm_frac, cold_frac,
-                             shuffle=shuffle_index, seed=seed)
+                             shuffle=shuffle_index, seed=seed, dtype=self.store)
             for proj in PROJS
         }
         self.threads = threads or default_cpuinfer_threads()
         self.warm_node = (warm_node if warm_node is not None
                           else gpu_numa_node(self.device.index or 0))
-        warmup_jit()   # JIT 컴파일을 캡처 밖으로
+        self.store.fmt.warmup()   # JIT 컴파일을 캡처 밖으로
 
         self.warm = {
             proj: WarmTier(shape, self.splits[proj], sparsity=sparsity,
                            pattern=mask_pattern, seed=seed, device=self.device,
-                           node=self.warm_node)
+                           node=self.warm_node, dtype=self.store)
             for proj in PROJS
         }
         self.cold = ColdTier(shape, self.splits, sparsity=sparsity,
                              pattern=mask_pattern, seed=seed,
                              numa_split=numa_split, threads=self.threads,
-                             kernel_key=cpu_kernel, numa_map=numa_map)
+                             kernel_key=cpu_kernel, dtype=self.store,
+                             numa_map=numa_map)
         self.res = ExecutionResources(ResourceSpec(
             max_tokens=1, top_k=shape.topk, hidden_size=shape.hidden,
             intermediate_size=shape.inter, device=self.device))
         # cold task가 역참조하는 qlen — 주소 고정 (계약 ④의 포인터 경유)
         self._qlen = torch.ones(1, dtype=torch.int32).pin_memory()
         self.params = {
+            "dtype": self.store.name,
             "sparsity": sparsity, "warm_frac": warm_frac,
             "cold_frac": cold_frac, "numa_split": numa_split,
             "mask_pattern": mask_pattern, "masking": masking, "m": 1,
@@ -401,7 +436,7 @@ class WarmColdProfiler:
 
     @property
     def footprint(self) -> dict:
-        return footprint(self.shape, self.splits)
+        return footprint(self.shape, self.splits, self.store)
 
     # ── 측정 ─────────────────────────────────────────────────────────────
     def _ids(self, reps: int, seed: int = 1234) -> tuple:
@@ -466,22 +501,21 @@ class WarmColdProfiler:
         # 시스템보다 비싼 값이 나온다 — 실측 31.7 vs 22.8 µs. `fused=False`로
         # 옛 경로를 재서 그 차이를 볼 수 있다. 융합 진입점이 (pinned, sparse)
         # 조합에만 있으므로 dense(prefill) 경로는 자동으로 2 launch다.
-        fuse_now = fused and group == "gateup" and masking
-        fused_fn = None
-        if fuse_now:
-            from sglang.jit_kernel.prism_gemv import (
-                gemv_worklist_indexed_pinned_sparse_gateup,
-            )
-            fused_fn = gemv_worklist_indexed_pinned_sparse_gateup
+        fuse_now = fused and group == "gateup"
+        fused_fn = (self.store.fmt.gemv_gateup(pinned=True, sparse=masking)
+                    if fuse_now else None)
 
         def warm_launch(i: int) -> None:
             if fused_fn is not None:
                 wg, wu = warm["gate"], warm["up"]
-                fused_fn(x, ids_dev[i], topk_w_dev,
-                         wg.w_flat, wg.row_off, wg.k_index,
-                         wu.w_flat, wu.row_off, wu.k_index,
-                         out, wg.spec, wu.spec, 0, shape.inter, False,
-                         torch.cuda.current_stream())
+                args = ((x, ids_dev[i], topk_w_dev, *wg.parts, wg.row_off, wg.k_index,
+                         *wu.parts, wu.row_off, wu.k_index, out, wg.spec, wu.spec,
+                         0, shape.inter, False, torch.cuda.current_stream())
+                        if masking else
+                        (x, ids_dev[i], *wg.parts, wg.row_off, wg.k_index,
+                         *wu.parts, wu.row_off, wu.k_index, out,
+                         0, shape.inter, False, torch.cuda.current_stream()))
+                self.store.call(fused_fn, args)
                 return
             for proj in projs:
                 warm[proj].launch(x, ids_dev[i], topk_w_dev, out, cols[proj],
@@ -633,11 +667,14 @@ class WarmColdProfiler:
         for proj in projs:
             tier = warm[proj]
             kw = tier.split.k_warm
+            # 양자화 스토어는 dequant해서 비교한다 — 레퍼런스는 "살아있는 행의 W 합"이고
+            # W는 dtype에 따라 코드×배율이다.
+            w_ref = tier.store.dequant(tier.parts, kw, tier.split.n_cols)
             errs = []
             for j in range(topk):
                 e = int(ids[0, j])
                 keep = tier.a_host[e] > 0
-                block = tier.w_flat[e * kw:(e + 1) * kw].float()
+                block = w_ref[e * kw:(e + 1) * kw]
                 ref = block[keep].sum(0)
                 got = out[0, j, cols[proj]:cols[proj] + width].float().cpu()
                 errs.append(float((got - ref).abs().max()
@@ -659,7 +696,7 @@ class WarmColdProfiler:
         for pi, proj in enumerate(projs):
             kc = cold.rows_of(proj)
             n = shape.n_cols(proj)
-            blocks = cold.w[proj].float().reshape(shape.experts, n, kc)
+            blocks = cold.dequant_blocks(proj, n, kc)
             errs = []
             for j in range(topk):
                 e = int(ids[0, j])
@@ -684,8 +721,7 @@ class WarmColdProfiler:
             if do_check:
                 d["check"] = self.check(group)
             results[group] = d
-        warm_kernel = ("gemv_worklist_indexed_pinned_sparse" if self.masking
-                       else "gemv_worklist_indexed_pinned")
+        warm_kernel = self.store.fmt.gemv(pinned=True, sparse=self.masking).__name__
         return {
             "bench": "warm_cold_sparse",
             "kernels": {"warm": warm_kernel,
@@ -746,7 +782,8 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
                      reps: int = 100, replays: int = 20, device=0,
                      mask_pattern: str = "random", seed: int = 0,
                      warm_node: Optional[int] = None,
-                     x_row_is_pair: bool = False) -> SparseGemv:
+                     x_row_is_pair: bool = False,
+                     dtype: str = "bf16") -> SparseGemv:
     """[k, n] weight 하나의 warm sparse GEMV — shape과 sparsity만 받는다.
 
         warm_sparse_gemv(1792, 768, 0.9, device=1).us
@@ -762,23 +799,19 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
     계산이 1회로 줄어 ~17% 낙관적이다. 티어 비용은 `WarmColdProfiler`로 잰다.
     바이트를 보존해 비교하려면 top_k를 줄인 만큼 `n`을 키우면 된다.
     """
-    from sglang.jit_kernel.prism_gemv import (
-        gemv_worklist_indexed_pinned_sparse,
-        warmup_jit,
-    )
-
-    from sglang.srt.layers.moe.prism.numa import alloc_pinned_on_node, gpu_numa_node
+    from sglang.srt.layers.moe.prism.numa import gpu_numa_node
     from sglang.srt.layers.moe.prism.profile.common import sparse_tables
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
+    store = store_of(dtype)
     dev = select_device(device)
-    warmup_jit()
-    if k % PAIR_GROUP:
-        raise ValueError(f"k must be even (pair group), got {k}")
+    store.fmt.warmup()
+    if k % max(PAIR_GROUP, store.k_align):
+        raise ValueError(f"{store.name}: k must be a multiple of "
+                         f"{max(PAIR_GROUP, store.k_align)}, got {k}")
     node = warm_node if warm_node is not None else gpu_numa_node(dev.index or 0)
 
-    w = alloc_pinned_on_node((k, n), torch.bfloat16, node, "warm_sparse_gemv store")
-    w.normal_(0, 0.02)
+    parts = store.gpu_store(1, k, n, node=node, seed=seed)
     row_off = torch.tensor([0, k], dtype=torch.int32, device=dev)
     kidx = torch.arange(k, dtype=torch.int32).to(torch.uint16).to(dev)
     a, c, thr, keep = sparse_tables(1, k, sparsity, pattern=mask_pattern, seed=seed)
@@ -791,17 +824,19 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
     tw = torch.ones(m, 1, dtype=torch.float32, device=dev)
     out = torch.zeros(m, 1, n, dtype=torch.bfloat16, device=dev)
 
+    fn = store.fmt.gemv(pinned=True, sparse=True)
+
     def launch(i: int) -> None:
-        gemv_worklist_indexed_pinned_sparse(
-            x, ids, tw, w, row_off, kidx, out, spec, 0, x_row_is_pair,
-            torch.cuda.current_stream())
+        store.call(fn, (x, ids, tw, *parts, row_off, kidx, out, spec, 0,
+                        x_row_is_pair, torch.cuda.current_stream()))
 
     try:
         with nvtx("warm/sparse_gemv"):
             timing = graph_timing(launch, reps, replays=replays)
     finally:
-        del w, x, out
+        del parts, x, out
         torch.cuda.empty_cache()
 
     return SparseGemv(where="warm", k_rows=k, n_cols=n, sparsity=sparsity,
-                      keep_frac=keep, dense_bytes=m * k * n * 2, timing=timing)
+                      keep_frac=keep, dense_bytes=store.store_bytes(m, k, n),
+                      timing=timing)

@@ -62,8 +62,13 @@ def main() -> None:
     p.add_argument("--sweep-experts", default=None,
                    help="쉼표로 구분한 E 목록 — A 고정, E만 훑는다")
     p.add_argument("--mask-pattern", default="random", choices=("random", "block"))
-    p.add_argument("--cpu-kernel", default="kt_tile_k2_bf16",
-                   choices=("kt_tile_k2_bf16", "kt_amx_bf16"))
+    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8"),
+                   help="cold 스토어 dtype = kt 백엔드 (bf16 → TileK2BF16, mxfp4 → "
+                        "TileK2MXFP4, fp8 → TileK2FP8B128). --cpu-kernel은 그 안에서만 고른다")
+    p.add_argument("--cpu-kernel", default=None,
+                   choices=("kt_tile_k2_bf16", "kt_amx_bf16", "kt_amx_fp4",
+                            "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128"),
+                   help="기본값은 dtype이 정한다")
     p.add_argument("--numa-map", default="",
                    help="쉼표로 구분한 NUMA 노드 목록 (예: 0 / 1 / 0,1). "
                         "실모델의 SGLANG_PRISM_NUMA_MAP과 같은 의미. 비우면 "
@@ -86,7 +91,7 @@ def main() -> None:
             fixed_ids=a.fixed_ids, cold_frac=a.cold_frac, sparsity=a.sparsity,
             proj=a.proj, band=a.band, split_index=a.split_index,
             mask_pattern=a.mask_pattern, numa_split=a.numa_split,
-            threads=a.threads, cpu_kernel=a.cpu_kernel, seed=a.seed,
+            threads=a.threads, cpu_kernel=a.cpu_kernel, dtype=a.dtype, seed=a.seed,
             numa_map=numa_map)
     except ValueError as e:
         raise SystemExit(str(e))

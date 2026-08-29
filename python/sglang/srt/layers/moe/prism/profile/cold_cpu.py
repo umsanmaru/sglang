@@ -56,6 +56,7 @@ from sglang.srt.layers.moe.prism.profile.common import (
     split_rows,
     tier_index,
 )
+from sglang.srt.layers.moe.prism.profile.common import store_of
 from sglang.srt.layers.moe.prism.profile.warm_cold import N_ALIGN, node_table
 
 
@@ -96,15 +97,23 @@ class ColdCpuProfiler:
                  band: bool = False, split_index: bool = False,
                  mask_pattern: str = "random", numa_split: float = 0.5,
                  threads: Optional[int] = None,
-                 cpu_kernel: str = "kt_tile_k2_bf16", seed: int = 0,
-                 numa_map: Optional[Sequence[int]] = None):
+                 cpu_kernel: Optional[str] = None, dtype: str = "bf16",
+                 seed: int = 0, numa_map: Optional[Sequence[int]] = None):
         from kt_kernel import kt_kernel_ext
         from kt_kernel.experts_partial import PartialMoEWrapper
 
         if proj not in ("gateup", "down"):
             raise ValueError(f"proj must be gateup|down, got {proj!r}")
+        # dtype이 백엔드(kt 커널 키)와 K 정렬을 정한다 — cpu_kernel은 그 안에서만 고른다.
+        self.store = store_of(dtype)
+        cpu_kernel = cpu_kernel or self.store.cpu_kernel
         if cpu_kernel not in N_ALIGN:
             raise ValueError(f"unknown cpu kernel {cpu_kernel!r}")
+        if cpu_kernel not in self.store.cpu_kernels:
+            raise ValueError(f"cpu kernel {cpu_kernel!r} cannot consume a "
+                             f"{self.store.name} cold store "
+                             f"(compatible: {list(self.store.cpu_kernels)})")
+        self.cpu_kernel = cpu_kernel
         self.shape = shape
         self.proj = proj
         self.band = band
@@ -119,10 +128,12 @@ class ColdCpuProfiler:
         E, topk = shape.experts, shape.topk
         H, I = shape.hidden, shape.inter
         self.k_cold = {}
+        step = self.store.rows_step()
         for p in PROJS:
-            kc = split_rows(shape.k_axis(p), cold_frac)
-            if kc % K_STEP:
-                raise ValueError(f"{p}: cold rows {kc} not a K_STEP multiple")
+            kc = split_rows(shape.k_axis(p), cold_frac, step=step)
+            if kc % step:
+                raise ValueError(f"{p}: cold rows {kc} not a multiple of {step} "
+                                 f"({self.store.name} 배율 블록)")
             self.k_cold[p] = kc
 
         if self.numa_map:
@@ -175,12 +186,11 @@ class ColdCpuProfiler:
         sp.p_down, sp.lam_down = SPARSITY_P, SPARSITY_LAM
         cfg.pool = self.cpuinfer.backend_
 
-        weights, tables, keep = {}, {}, {}
+        weights, scales, tables, keep = {}, {}, {}, {}
         for p in PROJS:
             n = shape.n_cols(p)
-            t = torch.empty(E * n * self.k_cold[p], dtype=torch.bfloat16)
-            t.normal_(0, 0.02)
-            weights[p] = t.contiguous()
+            weights[p], scales[p] = self.store.cold_store(
+                E, n, self.k_cold[p], seed=seed + hash(p) % 97)
             a, c, thr, frac = sparse_tables(E, self.k_cold[p], sparsity,
                                             pattern=mask_pattern, seed=seed)
             tables[f"{p}_wn_sq"] = a
@@ -190,9 +200,12 @@ class ColdCpuProfiler:
         self.keep_frac = keep
 
         self.wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=cpu_kernel)
+        scale_kw = ({} if scales["gate"] is None else
+                    dict(gate_scale=scales["gate"], up_scale=scales["up"],
+                         down_scale=scales["down"]))
         self.wrapper.load_weights_from_tensors(
             weights["gate"], weights["up"], weights["down"],
-            sparsity_tables=tables)
+            sparsity_tables=tables, **scale_kw)
 
     def close(self) -> None:
         self.wrapper = None
@@ -267,7 +280,7 @@ def cold_cpu_sweep(shape: Shape, experts: Sequence[int], *, iters: int = 100,
         results.append(rep.as_dict())
     return {
         "bench": "cold_cpu",
-        "kernel": kw.get("cpu_kernel", "kt_tile_k2_bf16"),
+        "kernel": kw.get("cpu_kernel") or store_of(kw.get("dtype", "bf16")).cpu_kernel,
         "shape": shape.as_dict(),
         "params": {
             "cold_frac": kw.get("cold_frac", 0.875),
@@ -290,7 +303,7 @@ def cold_cpu_sweep(shape: Shape, experts: Sequence[int], *, iters: int = 100,
 def cold_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, iters: int = 100,
                      replays: int = 8, mask_pattern: str = "random",
                      numa_split: float = 0.5, threads: Optional[int] = None,
-                     cpu_kernel: str = "kt_tile_k2_bf16", seed: int = 0,
+                     cpu_kernel: Optional[str] = None, dtype: str = "bf16", seed: int = 0,
                      numa_map: Optional[Sequence[int]] = None) -> SparseGemv:
     """[k, n] weight 하나의 cold sparse GEMV — shape과 sparsity만 받는다. CUDA 불필요.
 
@@ -309,16 +322,18 @@ def cold_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, iters: int = 100,
     `n`은 커널의 N 정렬을 지켜야 한다 — tile_k2는 노드당 256의 배수를 요구하므로
     작은 `n`은 `cpu_kernel="kt_amx_bf16"`(32) 또는 `numa_map=[0]`을 쓴다.
     """
-    if k % K_STEP:
-        raise ValueError(f"k must be a K_STEP({K_STEP}) multiple, got {k}")
+    store = store_of(dtype)
+    if k % store.rows_step():
+        raise ValueError(f"{store.name}: k must be a multiple of {store.rows_step()}, got {k}")
     shape = Shape(experts=1, topk=1, hidden=k, inter=n)
     with ColdCpuProfiler(shape, cold_frac=1.0, sparsity=sparsity, proj="gateup",
                          mask_pattern=mask_pattern, numa_split=numa_split,
-                         threads=threads, cpu_kernel=cpu_kernel, seed=seed,
-                         numa_map=numa_map) as prof:
+                         threads=threads, cpu_kernel=cpu_kernel, dtype=store,
+                         seed=seed, numa_map=numa_map) as prof:
         rep = prof.measure(iters=iters, replays=replays)
         rows = prof.node_gateup_rows   # proj="gateup" 고정
     return SparseGemv(where="cold", k_rows=k, n_cols=n, sparsity=sparsity,
-                      keep_frac=rep.keep_frac, dense_bytes=k * n * 2,
+                      keep_frac=rep.keep_frac,
+                      dense_bytes=store.store_bytes(1, k, n),
                       timing=rep.timing, numa_split=numa_split,
                       node_rows=rows)

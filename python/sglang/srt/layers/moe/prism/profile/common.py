@@ -95,6 +95,186 @@ class Shape:
                 "hidden": self.hidden, "inter": self.inter}
 
 
+# ─── 스토어 dtype (= 백엔드 선택) ──────────────────────────────────────────
+@dataclass(frozen=True)
+class Store:
+    """프로파일이 재는 **스토어 dtype**. 이름 하나가 백엔드 전부를 정한다 (계약 ①의
+    "커널 키가 함의한다"를 프로파일 쪽에서 그대로 쓴 것):
+
+      fmt         GPU 진입점 (formats.StoreFormat — hot/warm의 dense·sparse·융합)
+      cpu_kernel  cold 백엔드 (kt 클래스 키; 이 dtype의 cold 스토어를 소비할 수 있는 것)
+      k_align     티어 K 행 정렬 (bf16 2 / mxfp4 32 / fp8 128)
+      has_vec     bf16 커널만 `vec`(W 로드 폭) 인자를 받는다
+
+    합성 스토어도 여기서 만든다 — 프로파일은 실제 체크포인트를 읽지 않고 커널이
+    받아들이는 **형태**만 흉내내면 되고, 그 형태가 dtype마다 다르기 때문이다.
+    """
+
+    name: str
+    cpu_kernel: str
+    k_align: int
+    elem_bytes: float          # weight 원소 하나의 바이트 (배율 제외)
+    has_vec: bool = False
+
+    @property
+    def fmt(self):
+        from sglang.srt.layers.moe.prism.formats import FORMATS
+
+        return FORMATS[self.name]
+
+    @property
+    def cpu_kernels(self) -> tuple:
+        return self.fmt.cold_kernels
+
+    def rows_step(self, base: int = K_STEP) -> int:
+        """티어 행 수를 반올림할 단위 — 커널 정렬과 K_STEP 중 큰 쪽."""
+        return max(base, self.k_align)
+
+    # ── 합성 스토어 ──────────────────────────────────────────────────────
+    def _codes_scales(self, rows: int, n: int, seed: int):
+        """(codes, scales) CPU 텐서. rows = 이 스토어의 총 k 행 수."""
+        g = torch.Generator().manual_seed(seed)
+        if self.name == "mxfp4":
+            nib = torch.randint(0, 16, (rows, n), generator=g, dtype=torch.int64)
+            codes = (nib[0::2] | (nib[1::2] << 4)).to(torch.uint8)      # 행 = k-페어
+            scales = torch.full((rows // 32, n), 127, dtype=torch.uint8)  # 2^0
+            return codes.contiguous(), scales.contiguous()
+        if self.name == "fp8":
+            # 지수 1..13, 가수·부호 임의 — denormal(e=0)·NaN(0x7F/0xFF)은 만들지 않는다
+            # (커널·CPU 포팅이 공유하는 인코더 전제).
+            e = torch.randint(1, 14, (rows, n), generator=g)
+            m = torch.randint(0, 8, (rows, n), generator=g)
+            sg = torch.randint(0, 2, (rows, n), generator=g)
+            codes = ((sg << 7) | (e << 3) | m).to(torch.uint8)
+            scales = torch.ones(rows // 128, max(1, n // 128), dtype=torch.float32)
+            return codes.contiguous(), scales.contiguous()
+        w = torch.empty(rows, n, dtype=torch.bfloat16)
+        w.normal_(0, 0.02, generator=g)
+        return (w, None)
+
+    def gpu_store(self, experts: int, k_rows: int, n: int, *, device=None,
+                  node: Optional[int] = None, seed: int = 0) -> tuple:
+        """hot(device) 또는 warm(pinned) 스토어 인자 — `fmt.store_args`와 같은 순서.
+
+        `node`를 주면 pinned + NUMA 바인딩(warm), 아니면 device 상주(hot)다."""
+        self.check_geometry(k_rows, n)
+        parts = self._codes_scales(experts * k_rows, n, seed)
+        out = []
+        for t in parts:
+            if t is None:
+                continue
+            if node is not None:
+                from sglang.srt.layers.moe.prism.numa import alloc_pinned_on_node
+
+                dst = alloc_pinned_on_node(tuple(t.shape), t.dtype, node,
+                                           f"{self.name} warm store")
+                dst.copy_(t)
+                out.append(dst)
+            else:
+                out.append(t.to(device) if device is not None else t)
+        return tuple(out)
+
+    def cold_store(self, experts: int, n: int, k: int, *, seed: int = 0) -> tuple:
+        """kt 주입용 (w_flat, scale_flat|None) — expert 블록이 ckpt 방향 [N, k]인 1-D flat
+        (weights.py `cold_flat`과 같은 레이아웃)."""
+        self.check_geometry(k, n)
+        g = torch.Generator().manual_seed(seed)
+        if self.name == "bf16":
+            t = torch.empty(experts * n * k, dtype=torch.bfloat16)
+            t.normal_(0, 0.02, generator=g)
+            return t.contiguous(), None
+        if self.name == "mxfp4":
+            nib = torch.randint(0, 16, (experts * n, k), generator=g, dtype=torch.int64)
+            codes = (nib[:, 0::2] | (nib[:, 1::2] << 4)).to(torch.uint8)
+            # kt는 bf16 배율(2^e)을 받아 자기 형식으로 바꾼다 — 1.0으로 채운다.
+            scales = torch.ones(experts * n * (k // 32), dtype=torch.bfloat16)
+            return codes.reshape(-1).contiguous(), scales
+        if self.name == "fp8":
+            e = torch.randint(1, 14, (experts * n, k), generator=g)
+            m = torch.randint(0, 8, (experts * n, k), generator=g)
+            sg = torch.randint(0, 2, (experts * n, k), generator=g)
+            codes = ((sg << 7) | (e << 3) | m).to(torch.uint8)
+            scales = torch.ones(experts * (n // 128) * (k // 128), dtype=torch.float32)
+            return codes.reshape(-1).contiguous(), scales
+        raise ValueError(f"unknown store dtype {self.name!r}")
+
+    # ── 검증 / 회계 ──────────────────────────────────────────────────────
+    def check_geometry(self, k_rows: int, n: int) -> None:
+        if k_rows % self.k_align:
+            raise ValueError(f"{self.name}: k rows {k_rows} must be a multiple of "
+                             f"{self.k_align} (배율 블록이 원본 행 블록에 걸려 있다)")
+        if self.name == "fp8" and n % 128:
+            raise ValueError(f"fp8: n {n} must be a multiple of 128 (배율 블록의 N축)")
+
+    def store_bytes(self, experts: int, k_rows: int, n: int) -> int:
+        """스토어 전체 바이트 (코드 + 배율)."""
+        base = experts * k_rows * n * self.elem_bytes
+        if self.name == "mxfp4":
+            base += experts * (k_rows // 32) * n
+        elif self.name == "fp8":
+            base += experts * (k_rows // 128) * max(1, n // 128) * 4
+        return int(base)
+
+    def call(self, fn, args: tuple, *, vec: int = 0) -> None:
+        """진입점 호출 — bf16 커널만 받는 `vec` 인자를 여기서 흡수한다."""
+        if self.has_vec:
+            fn(*args, vec)
+        else:
+            fn(*args)
+
+    # ── 참조값 (check용 dequant) ─────────────────────────────────────────
+    def dequant(self, parts: Sequence[torch.Tensor], k_rows: int, n: int) -> torch.Tensor:
+        """스토어 인자 → fp32 [rows, n] (x ≡ 1 레퍼런스가 행을 더할 수 있게)."""
+        if self.name == "bf16":
+            return parts[0].float().cpu()
+        codes, scales = parts[0].cpu(), parts[1].cpu()
+        if self.name == "mxfp4":
+            from sglang.srt.layers.moe.prism.profile.common import _FP4_TABLE
+
+            low = (codes & 0xF).long()
+            high = (codes >> 4).long()
+            vals = torch.stack([_FP4_TABLE[low], _FP4_TABLE[high]], dim=1).reshape(-1, n)
+            sc = torch.ldexp(torch.ones_like(scales, dtype=torch.float32),
+                             scales.int() - 127).repeat_interleave(32, dim=0)
+            return vals * sc
+        vals = _e4m3_table()[codes.long()]
+        sc = scales.float().repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+        return vals * sc[: vals.shape[0], : vals.shape[1]]
+
+
+_FP4_TABLE = torch.tensor(
+    [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+)
+
+
+def _e4m3_table() -> torch.Tensor:
+    """e4m3 바이트 256개 → fp32 (커널 `prism_fp8.cuh`와 같은 비트 산술)."""
+    b = torch.arange(256, dtype=torch.int32)
+    mag = (b & 0x7F) << 4
+    bits = ((b & 0x80) << 8) | torch.where(mag != 0, mag + 0x3C00, torch.zeros_like(mag))
+    return (bits << 16).view(torch.float32).clone()
+
+
+STORES = {
+    "bf16": Store(name="bf16", cpu_kernel="kt_tile_k2_bf16", k_align=2,
+                  elem_bytes=2.0, has_vec=True),
+    "mxfp4": Store(name="mxfp4", cpu_kernel="kt_tile_k2_mxfp4", k_align=32,
+                   elem_bytes=0.5),
+    "fp8": Store(name="fp8", cpu_kernel="kt_tile_k2_fp8b128", k_align=128,
+                 elem_bytes=1.0),
+}
+
+
+def store_of(dtype) -> Store:
+    """dtype 이름 → Store. 이미 Store면 그대로 (호출부가 둘 다 받게)."""
+    if isinstance(dtype, Store):
+        return dtype
+    try:
+        return STORES[dtype]
+    except KeyError:
+        raise ValueError(f"unknown store dtype {dtype!r} (known: {sorted(STORES)})") from None
+
+
 def split_rows(k_axis: int, frac: float, *, step: int = K_STEP) -> int:
     """K축에서 비율 `frac`에 해당하는 행 수를 `step` 배수로 만든다.
 
