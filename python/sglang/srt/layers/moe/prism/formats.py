@@ -571,6 +571,42 @@ class Fp8Format(StoreFormat):
     def cold_source(self, src, where):
         raise PlanError(f"{where}: fp8 has no warm-kt (bf16 slab) mode")
 
+    def cold_flat(self, src, ti, real_rows, tile):
+        """cold 블록 = e4m3 행 [N, k_pad] u8 + 배율 fp32 [N/128, k_pad/128] (kt `scale_inv`의
+        n-major 방향 그대로). 패딩 행은 코드 0x00(= +0.0), 패딩 배율은 1.0 — weight가 0이라
+        무해하고, sparse는 마스크가 tail 비트를 꺼서 읽지도 않는다."""
+        codes, off, idx, real_t = _cold_flat_rows(src.w, ti, real_rows, tile, pad_value=0)
+        scales, _, _, _ = _cold_flat_rows(src.scales, _half_index(ti, self.BLOCK, None, None),
+                                          real_rows, tile, pad_value=1.0, div=self.BLOCK)
+        return codes, scales, off, idx, real_t
+
+    def cold_load_kwargs(self, cold):
+        return dict(gate_scale=cold.gate.s_flat, up_scale=cold.up.s_flat, down_scale=cold.down.s_flat)
+
+    def cold_slab(self, ptr, nbytes, expert_off, device):
+        slab = _tensor_view(ptr, nbytes, torch.uint8)
+        return slab, torch.tensor(list(expert_off[:-1]), dtype=torch.int64, device=device)
+
+    def grouped_cold(self):
+        from sglang.jit_kernel import prism_grouped_fp8 as k
+
+        return k.grouped_fp8_cold
+
+    def grouped_cold_gateup(self):
+        from sglang.jit_kernel import prism_grouped_fp8 as k
+
+        return k.grouped_fp8_cold_gateup
+
+    def grouped(self, *, pinned):
+        from sglang.jit_kernel import prism_grouped_fp8 as k
+
+        return k.grouped_fp8_indexed_pinned if pinned else k.grouped_fp8_indexed
+
+    def grouped_gateup(self, *, pinned):
+        from sglang.jit_kernel import prism_grouped_fp8 as k
+
+        return k.grouped_fp8_indexed_pinned_gateup if pinned else k.grouped_fp8_indexed_gateup
+
     def gemv(self, *, pinned, sparse):
         from sglang.jit_kernel import prism_gemv_fp8 as k
 
@@ -595,8 +631,10 @@ class Fp8Format(StoreFormat):
 
     def warmup(self) -> None:
         from sglang.jit_kernel.prism_gemv_fp8 import warmup_jit
+        from sglang.jit_kernel.prism_grouped_fp8 import warmup_jit as warmup_grouped
 
         warmup_jit()
+        warmup_grouped()
 
 
 BF16 = Bf16Format()

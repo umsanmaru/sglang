@@ -211,3 +211,109 @@ def test_gemv_fp8_sparse_gateup_fused_bitwise():
               0, N, False, stream)
         torch.cuda.synchronize()
         assert torch.equal(out, ref)
+
+
+# ─── grouped GEMM (prefill 형태) ───────────────────────────────────────────────
+@cuda_required
+@pytest.mark.parametrize("pair", [False, True])
+@pytest.mark.parametrize("exact", [False, True])
+@pytest.mark.parametrize("m", [8, 300])
+def test_grouped_fp8_matches_gemv(pair, exact, m):
+    """grouped ↔ GEMV: 배율이 2의 거듭제곱이라 `bf16(code·scale)`이 정확 →
+    정확표현 입력에서는 비트일치, 랜덤 입력에서는 누산 순서만큼의 tolerance."""
+    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed
+    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_indexed, grouped_fp8_indexed_pinned
+    from sglang.srt.layers.moe.prism.grouping import build_grouping
+
+    N, K, k_rows = 256, 512, 256
+    codes, scales, row_off, kidx, wref = _store(N, K, k_rows, exact, seed=21)
+    x, ids = _inputs(m, K, exact, pair, seed=22 + m)
+    if m >= 64:
+        ids[:, 0] = 3          # expert 3에 pair 몰기 → 타일 여러 개
+        ids[ids == 5] = 6      # expert 5는 pair 0개
+    stream = torch.cuda.current_stream()
+    ref = torch.zeros(m, TOPK, N, dtype=torch.bfloat16, device="cuda")
+    gemv_fp8_indexed(x.cuda(), ids.cuda(), codes, scales, row_off, kidx, ref, 0, pair, stream)
+    grouping = build_grouping(ids.cuda(), E)
+    out = torch.zeros_like(ref)
+    grouped_fp8_indexed(x.cuda(), grouping, codes, scales, row_off, kidx, out, 0, pair, stream)
+    outp = torch.zeros_like(ref)
+    grouped_fp8_indexed_pinned(x.cuda(), grouping, codes.cpu().pin_memory(),
+                               scales.cpu().pin_memory(), row_off, kidx, outp, 0, pair, stream, 64)
+    torch.cuda.synchronize()
+    assert torch.equal(out, outp)
+    if exact:
+        assert torch.equal(out, ref)
+    else:
+        torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+        fref = _ref(x, ids, wref, kidx.cpu(), row_off.cpu(), pair)
+        torch.testing.assert_close(out.float().cpu(), fref, rtol=2e-2, atol=2e-2)
+
+
+@cuda_required
+def test_grouped_fp8_gateup_fused():
+    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_indexed, grouped_fp8_indexed_gateup
+    from sglang.srt.layers.moe.prism.grouping import build_grouping
+
+    N, K, k_rows, m = 128, 256, 128, 40
+    c1, s1, ro1, ki1, _ = _store(N, K, k_rows, True, seed=23)
+    c2, s2, ro2, ki2, _ = _store(N, K, k_rows, True, seed=24)
+    x, ids = _inputs(m, K, True, False, seed=25)
+    stream = torch.cuda.current_stream()
+    grouping = build_grouping(ids.cuda(), E)
+    ref = torch.zeros(m, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
+    grouped_fp8_indexed(x.cuda(), grouping, c1, s1, ro1, ki1, ref, 0, False, stream)
+    grouped_fp8_indexed(x.cuda(), grouping, c2, s2, ro2, ki2, ref, N, False, stream)
+    out = torch.zeros_like(ref)
+    grouped_fp8_indexed_gateup(x.cuda(), grouping, c1, s1, ro1, ki1, c2, s2, ro2, ki2, out,
+                               0, N, False, stream)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)
+
+
+@cuda_required
+@pytest.mark.parametrize("exact", [True, False])
+def test_grouped_fp8_cold_tile_matches_gemv(exact):
+    """KT_TILE8 로더: kt `GemmKernelTileK2FP8B128::BufferB` slab을 제자리 읽어 GEMV와 일치."""
+    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed
+    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_cold
+    from sglang.srt.layers.moe.prism.grouping import build_grouping
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    from fp8_ref import tile_block  # noqa: E402
+
+    N, K, k_rows, m = 256, 512, 256, 40
+    g = torch.Generator().manual_seed(31)
+    blocks, cs, ss, kidx, wref = [], [], [], [], []
+    for _ in range(E):
+        c_ck, s_ck = random_expert_ckpt(N, K, g, exact=exact)
+        rows = aligned_index(K, k_rows, g)
+        blocks.append(tile_block(c_ck, s_ck, rows))
+        c, s = row_store(c_ck, s_ck, rows)
+        cs.append(c); ss.append(s); kidx.append(rows)
+        wref.append(dequant_ckpt(c_ck, s_ck))
+    slab = torch.cat(blocks).pin_memory()
+    blk_off = torch.tensor([0] + list(torch.cumsum(torch.tensor([b.numel() for b in blocks]), 0)[:-1]),
+                           dtype=torch.int64).cuda()
+    row_off = (torch.arange(E + 1, dtype=torch.int32) * k_rows).cuda()
+    kidx_t = torch.cat(kidx).to(torch.uint16).cuda()
+    codes, scales = torch.cat(cs).cuda(), torch.cat(ss).cuda()
+
+    x, ids = _inputs(m, K, exact, False, seed=32)
+    stream = torch.cuda.current_stream()
+    ref = torch.zeros(m, TOPK, N, dtype=torch.bfloat16, device="cuda")
+    gemv_fp8_indexed(x.cuda(), ids.cuda(), codes, scales, row_off, kidx_t, ref, 0, False, stream)
+
+    class _Slab:  # ColdSlab의 최소 형태 (cold_gpu.ColdSlab과 같은 필드 이름)
+        pass
+
+    cold = _Slab()
+    cold.slab, cold.blk_off, cold.row_off, cold.k_index = slab, blk_off, row_off, kidx_t
+    cold.n, cold.n_start, cold.layout = N, 0, "kt_tile8"
+    out = torch.zeros_like(ref)
+    grouped_fp8_cold(x.cuda(), build_grouping(ids.cuda(), E), cold, out, 0, False, stream)
+    torch.cuda.synchronize()
+    if exact:
+        assert torch.equal(out, ref)
+    else:
+        torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)

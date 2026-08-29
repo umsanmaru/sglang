@@ -80,7 +80,7 @@ def _cold_gpu_min_m():
 
     raw = os.environ.get(_ENV_COLD_GPU_MIN_M)
     if raw is None:
-        # 기본값은 스토어 포맷이 정한다 (bf16: 실측 교차점, mxfp4: grouped 경계 = CPU prefill 없음).
+        # 기본값은 스토어 포맷이 정한다 (bf16: 실측 교차점, mxfp4/fp8: grouped 경계 = CPU prefill 없음).
         gmin = os.environ.get(_ENV_GROUPED_MIN_M)
         return _get_runtime().fmt.default_cold_gpu_min_m(
             PrismExecutor.COLD_GPU_MIN_M,

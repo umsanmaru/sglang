@@ -94,16 +94,22 @@ def main():
     ap.add_argument("--lam", type=float, default=None,
                     help="gate-dynamic λ (기본: 자산의 lam0)")
     ap.add_argument("--gpu-kernel", default="torch_bmm",
-                    choices=["torch_bmm", "gemv_worklist", "gemv_worklist_mxfp4"],
+                    choices=["torch_bmm", "gemv_worklist", "gemv_worklist_mxfp4", "gemv_worklist_fp8"],
                     help="plan kernels.gpu_warm (worklist는 bs>1 graph decode용; "
-                         "gemv_worklist_mxfp4 = MXFP4 pair-row 스토어, K 정렬 32, cold 불가)")
+                         "gemv_worklist_mxfp4 = MXFP4 pair-row 스토어(K 정렬 32), "
+                         "gemv_worklist_fp8 = e4m3 + 128×128 블록 배율(K 정렬 128))")
     ap.add_argument("--cpu-kernel", default="kt_amx_bf16",
-                    choices=["kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_fp4", "kt_tile_k2_mxfp4"])
+                    choices=["kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_fp4", "kt_tile_k2_mxfp4",
+                             "kt_tile_k2_fp8b128"])
     ap.add_argument("--k-align", type=int, default=ROW_GROUP,
-                    help="밴드 경계 정렬 (기본 64; mxfp4는 32 배수여야 한다 — 64는 만족)")
+                    help="밴드 경계 정렬 (기본 64; mxfp4는 32, fp8은 128 배수여야 한다)")
     args = ap.parse_args()
-    if args.gpu_kernel == "gemv_worklist_mxfp4" and args.k_align % 32:
-        raise SystemExit("mxfp4 needs --k-align multiple of 32")
+    # 정렬은 커널 키가 함의한다 (계약 ①) — 포맷에 직접 묻는다.
+    from sglang.srt.layers.moe.prism.kernels import gpu_store_format
+
+    need = gpu_store_format(args.gpu_kernel).k_align
+    if args.k_align % need:
+        raise SystemExit(f"{args.gpu_kernel} needs --k-align multiple of {need}")
     ROW_GROUP = args.k_align
 
     raw = json.loads((Path(args.model_dir) / "config.json").read_text())
@@ -118,10 +124,11 @@ def main():
 
     gu_bands, gu_cold = bands(hidden, args.hot_frac, args.warm_frac)
     dn_bands, dn_cold = bands(inter, args.hot_frac, args.warm_frac)
-    if args.gpu_kernel == "gemv_worklist_mxfp4" and (gu_cold or dn_cold) and \
-            args.cpu_kernel not in ("kt_amx_fp4", "kt_tile_k2_mxfp4"):
-        raise SystemExit("mxfp4 store needs --cpu-kernel kt_amx_fp4 or kt_tile_k2_mxfp4 for its cold tier "
-                         f"(gateup {gu_bands}, down {dn_bands})")
+    if gu_cold or dn_cold:
+        fmt = gpu_store_format(args.gpu_kernel)
+        if args.cpu_kernel not in fmt.cold_kernels:
+            raise SystemExit(f"{fmt.name} store needs --cpu-kernel in {list(fmt.cold_kernels)} for its "
+                             f"cold tier (gateup {gu_bands}, down {dn_bands})")
     gate_up = {"bands": gu_bands, "cold_shards": shards(inter, args.numa_nodes) if gu_cold else []}
     down = {"bands": dn_bands, "cold_shards": shards(hidden, args.numa_nodes) if dn_cold else []}
 
