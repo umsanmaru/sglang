@@ -254,6 +254,42 @@ def test_indexed_zero_rows_writes_zero():
 
 
 @cuda_required
+def test_indexed_wide_tile_bitwise():
+    """타일 heuristic이 갈리는 치수 — pinned/device와 융합/2회 launch가 여전히 비트일치.
+
+    2026-08-29에 들어온 행 슬롯 선택(NY = 4V 또는 16V)의 회귀 방어선. **NY는 스레드가 맡는
+    행 집합(r ≡ ty mod NY)을 정하므로 fp32 부분합의 묶음, 즉 누산 순서를 바꾼다** —
+    hot(device)/warm(pinned)이나 융합/단일 launch가 서로 다른 NY를 고르면 일반 입력에서
+    여기서 비트가 갈린다. 위 테스트들은 expert당 행이 작아(≤ 96) 넓은 NY 분기를 타지 않는다.
+    """
+    from sglang.jit_kernel.prism_gemv import (
+        gemv_worklist_indexed, gemv_worklist_indexed_gateup, gemv_worklist_indexed_pinned,
+    )
+
+    N, KR = 128, 2048  # expert당 행 >= 2048 이 넓은 NY의 조건
+    x, wg, ro, ki, ids = _mk_indexed([KR] * 4, N=N, Kx=KR, M=1, k=4, exact=False, seed=51)
+    _, wu, _, _, _ = _mk_indexed([KR] * 4, N=N, Kx=KR, M=1, k=4, exact=False, seed=52)
+    xd, idsd, s = x.cuda(), ids.int().cuda(), torch.cuda.current_stream()
+    rod, kid = ro.cuda(), ki.cuda()
+
+    dev = torch.zeros(1, 4, N, dtype=torch.bfloat16, device="cuda")
+    pin = torch.zeros_like(dev)
+    gemv_worklist_indexed(xd, idsd, wg.cuda(), rod, kid, dev, 0, False, s)
+    gemv_worklist_indexed_pinned(xd, idsd, wg.pin_memory(), rod, kid, pin, 0, False, s)
+    torch.cuda.synchronize()
+    assert torch.equal(dev, pin), "pinned가 device와 다른 NY를 골랐다"
+
+    ref = torch.zeros(1, 4, 2 * N, dtype=torch.bfloat16, device="cuda")
+    gemv_worklist_indexed(xd, idsd, wg.cuda(), rod, kid, ref, 0, False, s)
+    gemv_worklist_indexed(xd, idsd, wu.cuda(), rod, kid, ref, N, False, s)
+    fused = torch.zeros_like(ref)
+    gemv_worklist_indexed_gateup(xd, idsd, wg.cuda(), rod, kid, wu.cuda(), rod, kid,
+                                 fused, 0, N, False, s)
+    torch.cuda.synchronize()
+    assert torch.equal(fused, ref), "융합(grid.z=2)이 단일 launch와 다른 NY를 골랐다"
+
+
+@cuda_required
 def test_indexed_pinned_matches_device():
     """W가 pinned여도 device 변형과 비트 동일 — warm 티어의 제자리 UVA 읽기."""
     from sglang.jit_kernel.prism_gemv import (

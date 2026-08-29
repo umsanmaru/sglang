@@ -119,6 +119,43 @@ def test_gemv_mxfp4_gateup_fused_bitwise():
 
 
 @cuda_required
+def test_gemv_mxfp4_wide_tile_bitwise():
+    """타일 heuristic이 갈리는 치수 — pinned/device와 융합/2회 launch가 여전히 비트일치.
+
+    2026-08-29에 들어온 타일 선택(열 타일 kV·행 슬롯 kNY를 치수에서 고른다)의 회귀 방어선.
+    **kNY는 ty 트리의 누산 순서를 정하므로 수치 계약의 일부다** — hot(device)/warm(pinned)이나
+    융합/단일 launch가 서로 다른 kNY를 고르면 일반 입력에서 여기서 비트가 갈린다.
+    위 테스트들은 k_rows가 작아(≤ 512) 넓은 분기(kNY=64)를 한 번도 타지 않는다.
+    """
+    from sglang.jit_kernel.prism_gemv_mxfp4 import (
+        gemv_mxfp4_indexed, gemv_mxfp4_indexed_gateup, gemv_mxfp4_indexed_pinned,
+    )
+
+    N, K, k_rows, M = 128, 2048, 2048, 1  # k_rows >= 2048 이 넓은 kNY의 조건
+    c1, s1, ro1, ki1, _ = _store(N, K, k_rows, False, seed=41)
+    c2, s2, ro2, ki2, _ = _store(N, K, k_rows, False, seed=42)
+    x, ids = _inputs(M, K, False, False, seed=43)
+    xd, idsd, stream = x.cuda(), ids.int().cuda(), torch.cuda.current_stream()
+
+    dev = torch.zeros(M, TOPK, N, dtype=torch.bfloat16, device="cuda")
+    pin = torch.zeros_like(dev)
+    gemv_mxfp4_indexed(xd, idsd, c1, s1, ro1, ki1, dev, 0, False, stream)
+    gemv_mxfp4_indexed_pinned(xd, idsd, c1.cpu().pin_memory(), s1.cpu().pin_memory(),
+                              ro1, ki1, pin, 0, False, stream)
+    torch.cuda.synchronize()
+    assert torch.equal(dev, pin), "pinned가 device와 다른 kNY를 골랐다"
+
+    ref = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
+    gemv_mxfp4_indexed(xd, idsd, c1, s1, ro1, ki1, ref, 0, False, stream)
+    gemv_mxfp4_indexed(xd, idsd, c2, s2, ro2, ki2, ref, N, False, stream)
+    fused = torch.zeros_like(ref)
+    gemv_mxfp4_indexed_gateup(xd, idsd, c1, s1, ro1, ki1, c2, s2, ro2, ki2, fused, 0, N,
+                              False, stream)
+    torch.cuda.synchronize()
+    assert torch.equal(fused, ref), "융합(grid.z=2)이 단일 launch와 다른 타일을 골랐다"
+
+
+@cuda_required
 def test_gemv_mxfp4_sparse_thr0_bitwise_and_masked():
     """thr=0(전부 keep) ↔ dense 비트일치; thr>0 ↔ 마스크 적용 참조."""
     from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_sparse

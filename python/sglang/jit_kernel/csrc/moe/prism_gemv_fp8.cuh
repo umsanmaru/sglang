@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <cuda_bf16.h>
@@ -27,25 +28,50 @@ using prism_sparse::SparseIn;
 // row_off는 bf16 스토어와 같은 **k 단위**다 (로더가 k[e]·row_off[e]를 128 배수로 굽는다 —
 // 배율이 원본 128행 블록에 걸려 있어 티어 K-인덱스가 블록을 쪼개면 "블록당 배율 1"이 깨진다).
 //
-// 스레드 배치 (block 256 = (8, 32), 열 타일 128):
-//   tx(0..7) → 열 16개 (uint4 = 16 B = k 행의 16 열), 8 스레드가 한 행 128 B를 덮는다
-//   ty(0..31) → 32-k 청크 c ≡ ty (mod 32) 를 통째로 (16 페어)
-// **열 타일 128 = 배율 블록 하나**다. 그래서 배율 조회가 블록당 스칼라 하나(`blockIdx.x` 열)
-// 이고 벡터 로드도, 배율 스트림도 없다 — mxfp4(32-k마다 E8M0 16 B)와 갈리는 유일한 지점이다.
+// 스레드 배치 — mxfp4 커널과 같은 (kV, kNX, kNY) 파라미터화 (2026-08-29):
+//   tx(0..kNX-1) → 열 kV개 (kV B = k 행의 kV 열), ty(0..kNY-1) → 32-k 청크 c ≡ ty (mod kNY)
+//   블록 = kNX·kNY 스레드, 열 타일 kNCol = kNX·kV, grid.x = ceil(N/kNCol)
 //
-// 누산: 청크의 부분합 accb[16] = Σ_{16 페어} (x0·v_even + x1·v_odd) (fp32, 정확한 곱) →
-// acc[16] += accb · s(그 청크의 128-k 블록). ty 32개의 부분합을 smem 트리로 합친다 (순서 고정
-// → 결정적). 정확표현 입력(작은 정수 x, 2의 거듭제곱 배율)에서 grouped 커널과 비트일치한다.
+// 타일을 고르는 근거는 `prism_gemv_mxfp4.cuh`의 주석과 같다 — m=1 decode에서 열 타일 128은
+// 블록을 SM 수 아래로 떨어뜨려 GPU를 놀린다. 다만 **fp8은 원소가 1 B라 같은 치수에서 mxfp4의
+// 2배를 읽어** 더 일찍 대역폭 영역에 들어가므로 kV를 4까지 내리지 않는 구간이 있다 (launcher
+// 주석). 실측 (µs, 옛→새, RTX 5090, rotating id): q36 gate 26.9→10.1, q36 down 15.5→9.7,
+// q3 gate 27.0→12.7, q3 down 16.5→10.5, dsv4 gate 49.8→37.5.
+//
+// 누산 순서: kV는 어느 열이 어느 스레드로 가느냐만 바꾸므로 비트가 그대로고, kNY는 어느 32-k
+// 청크가 어느 ty로 가느냐를 바꾸므로 fp32 묶음이 갈린다 — kNY를 경로·슬롯과 무관하게 고르는
+// 이유다 (launcher 주석).
+//
+// **배율 조회가 mxfp4와 갈리는 지점**: 배율 블록이 128×128이라 옛 타일에서는 열 타일이
+// 배율 블록 하나와 정확히 겹쳐 `blockIdx.x`가 곧 배율 열 인덱스였다. 타일이 좁아지면 여러
+// 블록이 한 배율 블록을 나눠 쓰므로 열 인덱스를 n0에서 다시 만든다 (`n0 / kBlk`). 타일이
+// 128을 넘지 않고 128에 정렬돼 있으므로 블록 안에서는 여전히 값이 하나다 — 벡터 로드도,
+// 배율 스트림도 없는 것은 그대로다.
+//
+// 누산: 청크의 부분합 accb[kV] = Σ_{16 페어} (x0·v_even + x1·v_odd) (fp32, 정확한 곱) →
+// acc[kV] += accb · s(그 청크의 128-k 블록). ty의 부분합을 smem 트리로 합친다 (순서 고정
+// → 결정적). 정확표현 입력(작은 정수 x, 2의 거듭제곱 배율)에서는 곱도 합도 정확하므로
+// 어느 타일이든 같은 값이고, grouped 커널과 비트일치한다는 계약 ⑤가 그대로 성립한다.
 //
 // SPARSE: 페어 마스크(k2wl2)는 bf16/mxfp4 커널과 **같은 함수**(prism_sparse_common.cuh)로
-// 만들고, 죽은 페어의 두 행(각 128 B) 로드를 발행하지 않는다.
-constexpr int kNCol = 128;       // 블록 열 타일 = 배율 블록 = 128 B/행
-constexpr int kV = 16;           // 스레드당 열 (uint4)
-constexpr int kNX = kNCol / kV;  // 8
-constexpr int kNY = 32;          // 청크 슬롯
+// 만들고, 죽은 페어의 두 행 로드를 발행하지 않는다.
 constexpr int kKTile = 2048;     // x 스테이징 폭 (k)
 constexpr int kChunk = 32;       // ty 하나가 맡는 k 행 수 (16 페어)
 constexpr int kBlk = prism_fp8::kBlk;  // 128
+
+// kV 바이트를 한 번에 읽는 로드 타입 (mxfp4 커널의 mx_load와 같은 것).
+template <int B> struct F8Load;
+template <> struct F8Load<4>  { using T = uint32_t; };
+template <> struct F8Load<8>  { using T = uint2; };
+template <> struct F8Load<16> { using T = uint4; };
+
+template <int B>
+__device__ __forceinline__ void f8_load(const uint8_t* p, uint32_t (&w)[B / 4]) {
+  union { typename F8Load<B>::T v; uint32_t w[B / 4]; } u;
+  u.v = *reinterpret_cast<const typename F8Load<B>::T*>(p);
+#pragma unroll
+  for (int t = 0; t < B / 4; ++t) w[t] = u.w[t];
+}
 
 struct F8Slot {
   const uint8_t* codes;
@@ -55,13 +81,15 @@ struct F8Slot {
   long long out_off;
 };
 
-template <typename IdxT, bool SPARSE>
+template <typename IdxT, bool SPARSE, int kV, int kNX, int kNY>
 __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
     const __nv_bfloat16* __restrict__ x,
     const IdxT* __restrict__ topk,
     __nv_bfloat16* __restrict__ out,
     long long x_kx, long long n_cols, long long out_row, long long top_k,
     int x_row_is_pair, F8Slot s0, F8Slot s1, SparseArgs sp0, SparseArgs sp1) {
+  constexpr int kNCol = kNX * kV;  // 블록 열 타일 (≤ kBlk, kBlk에 정렬)
+  static_assert(kNCol <= kBlk && kBlk % kNCol == 0, "열 타일은 배율 블록을 쪼개면 안 된다");
   const bool slot1 = (blockIdx.z != 0);
   const F8Slot& s = slot1 ? s1 : s0;
   const SparseArgs& sp = slot1 ? sp1 : sp0;
@@ -71,8 +99,8 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
   const long long e = static_cast<long long>(topk[pair]);
   const long long row = x_row_is_pair ? pair : m;
   const int tx = threadIdx.x, ty = threadIdx.y;
-  const long long nblock = blockIdx.x;                       // 배율 열 블록
-  const long long n0 = nblock * kNCol + static_cast<long long>(tx) * kV;
+  const long long n0 = static_cast<long long>(blockIdx.x) * kNCol + static_cast<long long>(tx) * kV;
+  const long long nblock = (static_cast<long long>(blockIdx.x) * kNCol) / kBlk;  // 배율 열 블록
   const bool active = n0 < n_cols;
 
   const long long o0 = static_cast<long long>(s.row_off[e]);
@@ -119,7 +147,7 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
       const long long krow = base + static_cast<long long>(g) * kChunk;
       const uint8_t* cp = codes_e + krow * n_cols + n0;
       bool any = false;
-#pragma unroll 4
+#pragma unroll
       for (int q = 0; q < kChunk / 2; ++q) {
         if constexpr (SPARSE) {
           if (!keep[(g * kChunk) / 2 + q]) continue;
@@ -127,10 +155,9 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
         any = true;
         const float x0 = __bfloat162float(xs[g * kChunk + 2 * q]);
         const float x1 = __bfloat162float(xs[g * kChunk + 2 * q + 1]);
-        const uint4 c0 = *reinterpret_cast<const uint4*>(cp + static_cast<long long>(2 * q) * n_cols);
-        const uint4 c1 = *reinterpret_cast<const uint4*>(cp + static_cast<long long>(2 * q + 1) * n_cols);
-        const uint32_t w0[4] = {c0.x, c0.y, c0.z, c0.w};
-        const uint32_t w1[4] = {c1.x, c1.y, c1.z, c1.w};
+        uint32_t w0[kV / 4], w1[kV / 4];
+        f8_load<kV>(cp + static_cast<long long>(2 * q) * n_cols, w0);
+        f8_load<kV>(cp + static_cast<long long>(2 * q + 1) * n_cols, w1);
 #pragma unroll
         for (int j = 0; j < kV; ++j) {
           const uint32_t b0 = (w0[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
@@ -158,37 +185,90 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
     __syncthreads();
   }
   if (ty == 0 && active) {
-    // 16열 bf16 = 32 B → uint4 두 개로 쓴다 (out_off·n0가 16 배수 — host 검증).
-    uint4 pk[2];
-    __nv_bfloat162* h = reinterpret_cast<__nv_bfloat162*>(pk);
+    // kV열 bf16 = 2·kV B (out_off 8 배수, n0 kV 배수 — host 검증).
+    __nv_bfloat162 h[kV / 2];
 #pragma unroll
     for (int j = 0; j < kV / 2; ++j)
       h[j] = __floats2bfloat162_rn(red[0][tx * kV + 2 * j], red[0][tx * kV + 2 * j + 1]);
     __nv_bfloat16* op = out + pair * out_row + s.out_off + n0;
-    *reinterpret_cast<uint4*>(op) = pk[0];
-    *reinterpret_cast<uint4*>(op + 8) = pk[1];
+    if constexpr (kV == 4) {
+      *reinterpret_cast<uint2*>(op) = *reinterpret_cast<const uint2*>(h);
+    } else if constexpr (kV == 8) {
+      *reinterpret_cast<uint4*>(op) = *reinterpret_cast<const uint4*>(h);
+    } else {
+      *reinterpret_cast<uint4*>(op) = reinterpret_cast<const uint4*>(h)[0];
+      *reinterpret_cast<uint4*>(op + 8) = reinterpret_cast<const uint4*>(h)[1];
+    }
   }
 }
 
+// SM 수는 device당 한 번만 물어본다 (launch마다면 graph 캡처 중에도 host 시간이 든다).
+inline uint32_t sm_count_of(int device_id) {
+  constexpr int kMaxDev = 16;
+  static uint32_t cache[kMaxDev] = {};
+  if (device_id < 0 || device_id >= kMaxDev) return host::runtime::get_sm_count(device_id);
+  if (cache[device_id] == 0) cache[device_id] = host::runtime::get_sm_count(device_id);
+  return cache[device_id];
+}
+
+#define PRISM_F8_LAUNCH(V, NX, NY)                                                         \
+  do {                                                                                     \
+    const dim3 block((NX), (NY));                                                          \
+    const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>((NX) * (V)))), \
+                    static_cast<unsigned int>(pairs), static_cast<unsigned int>(slots));    \
+    if (is_type<int32_t>(topk.dtype())) {                                                   \
+      LaunchKernel(grid, block, device)(                                                    \
+          prism_gemv_fp8<int32_t, SPARSE, (V), (NX), (NY)>, x,                              \
+          static_cast<const int32_t*>(topk.data_ptr()), out, x_kx, n_cols, out_row, top_k,  \
+          x_row_is_pair, s0, s1, sp0, sp1);                                                 \
+    } else {                                                                                \
+      LaunchKernel(grid, block, device)(                                                    \
+          prism_gemv_fp8<int64_t, SPARSE, (V), (NX), (NY)>, x,                              \
+          static_cast<const int64_t*>(topk.data_ptr()), out, x_kx, n_cols, out_row, top_k,  \
+          x_row_is_pair, s0, s1, sp0, sp1);                                                 \
+    }                                                                                       \
+  } while (0)
+
+// 타일 선택 — mxfp4와 같은 규칙. 어느 타일을 골라도 결과는 비트 동일하다.
 template <bool SPARSE>
-inline void launch_gemv_fp8(const dim3& grid, const DLDevice& device,
-                            tvm::ffi::TensorView topk,
+inline void launch_gemv_fp8(const DLDevice& device, tvm::ffi::TensorView topk,
                             const __nv_bfloat16* x, __nv_bfloat16* out,
                             int64_t x_kx, int64_t n_cols, int64_t out_row, int64_t top_k,
                             int x_row_is_pair, const F8Slot& s0, const F8Slot& s1,
-                            const SparseArgs& sp0, const SparseArgs& sp1) {
+                            const SparseArgs& sp0, const SparseArgs& sp1,
+                            int64_t pairs, int64_t slots, bool w_on_device, int64_t avg_rows) {
   using namespace host;
-  const dim3 block(kNX, kNY);
-  if (is_type<int32_t>(topk.dtype())) {
-    LaunchKernel(grid, block, device)(
-        prism_gemv_fp8<int32_t, SPARSE>, x, static_cast<const int32_t*>(topk.data_ptr()),
-        out, x_kx, n_cols, out_row, top_k, x_row_is_pair, s0, s1, sp0, sp1);
+  // ── 타일 선택 ────────────────────────────────────────────────────────────
+  // **kNY는 수치 계약의 일부고 kV는 아니다.** 한 열은 언제나 한 스레드가 갖고, 그 스레드는
+  // 자기 32-k 청크를 순서대로 누산한 뒤 청크 부분합을 ty 트리로 합친다. 어느 청크가 어느
+  // ty로 가는지는 kNY만 정하므로 — kV를 바꿔도 더하는 항의 순서가 같지만 kNY를 바꾸면
+  // 갈린다. 그래서 kNY는 **w_on_device·슬롯 수와 무관한 순수 함수**로 고른다:
+  // 그래야 (a) pinned와 device가 비트 동일하고 (test_indexed_pinned_matches_device),
+  // (b) gate+up 융합이 2회 launch와 비트 동일하다 (test_gemv_gateup_fusion_all_four_bitwise).
+  // 둘 다 **일반 입력** 기준의 계약이라 "정확표현이면 순서 무관"으로는 못 넘어간다.
+  //
+  // **kV가 mxfp4와 갈리는 이유**: fp8은 원소가 1 B라 같은 치수에서 mxfp4의 2배를 읽는다.
+  // 그만큼 먼저 대역폭 영역에 들어가고, 거기서는 스레드를 늘리는 것(kV↓)보다 요청을 넓게
+  // 쓰는 것(kV↑)이 이긴다 — kV=4를 그대로 쓰면 dsv4 down이 오히려 느려진다 (37.8→41.6 µs).
+  // SM당 읽는 바이트로 가른다 (실측: 49/74 KB/SM → kV=4, 296 KB/SM → kV=8).
+  const int64_t sm = static_cast<int64_t>(sm_count_of(device.device_id));
+  const int64_t bytes_per_sm = pairs * avg_rows * n_cols / sm;  // 슬롯 수를 세지 않는다
+  const int64_t kv_dev = (bytes_per_sm >= (128 << 10)) ? 8 : 4;
+  // 블록 수 추정도 같은 이유로 device 타일 기준 · 슬롯 무관이다 (pinned도 이 kNY를 쓴다).
+  const int64_t blocks = div_ceil(n_cols, 8 * kv_dev) * pairs;
+  const bool wide_ny = blocks < 2 * sm && avg_rows >= 2048;
+  if (!w_on_device) {  // warm(pinned): 행 세그먼트 128 B 유지 — kV만 갈리므로 비트는 같다
+    if (wide_ny) PRISM_F8_LAUNCH(16, 8, 64);
+    else PRISM_F8_LAUNCH(16, 8, 32);
+  } else if (kv_dev == 8) {
+    if (wide_ny) PRISM_F8_LAUNCH(8, 8, 64);
+    else PRISM_F8_LAUNCH(8, 8, 32);
   } else {
-    LaunchKernel(grid, block, device)(
-        prism_gemv_fp8<int64_t, SPARSE>, x, static_cast<const int64_t*>(topk.data_ptr()),
-        out, x_kx, n_cols, out_row, top_k, x_row_is_pair, s0, s1, sp0, sp1);
+    if (wide_ny) PRISM_F8_LAUNCH(4, 8, 64);
+    else PRISM_F8_LAUNCH(4, 8, 32);
   }
 }
+
 
 inline bool aligned16(const void* p) {
   return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
@@ -335,16 +415,18 @@ inline void gemv_fp8_impl(
   }
 
   const DLDevice device = cuda_device.unwrap();
-  const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(kNCol))),
-                  static_cast<unsigned int>(m * top_k), fused ? 2u : 1u);
+  const int64_t pairs = m * top_k, slots = fused ? 2 : 1;
+  const int64_t avg_rows = rows0 / (E1.unwrap() - 1);  // expert당 평균 k 행 (타일 heuristic)
   const __nv_bfloat16* xp = static_cast<const __nv_bfloat16*>(x.data_ptr());
   __nv_bfloat16* op = static_cast<__nv_bfloat16*>(out.data_ptr());
   if (sin != nullptr) {
-    launch_gemv_fp8<true>(grid, device, topk, xp, op, x_kx, n_cols, out_row, top_k,
-                          static_cast<int>(x_row_is_pair), s0, s1, sp0, sp1);
+    launch_gemv_fp8<true>(device, topk, xp, op, x_kx, n_cols, out_row, top_k,
+                          static_cast<int>(x_row_is_pair), s0, s1, sp0, sp1,
+                           pairs, slots, w_on_device, avg_rows);
   } else {
-    launch_gemv_fp8<false>(grid, device, topk, xp, op, x_kx, n_cols, out_row, top_k,
-                           static_cast<int>(x_row_is_pair), s0, s1, sp0, sp1);
+    launch_gemv_fp8<false>(device, topk, xp, op, x_kx, n_cols, out_row, top_k,
+                           static_cast<int>(x_row_is_pair), s0, s1, sp0, sp1,
+                           pairs, slots, w_on_device, avg_rows);
   }
 }
 

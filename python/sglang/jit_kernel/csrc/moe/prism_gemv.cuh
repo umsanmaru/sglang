@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <cuda_bf16.h>
@@ -18,8 +19,14 @@ using prism_sparse::SparseIn;
 
 // Prism worklist GEMV: pair p=(m,j)가 e=topk[m,j]의 W 밴드를 store에서 직접
 // 읽어 rejoin 레이아웃 out[m, j, off:off+N]에 쓴다. 누산 fp32, 출력 bf16
-// (계약 ⑤). 리덕션 순서는 (ty-strided 루프 → smem 4-way 합) 고정 —
+// (계약 ⑤). 리덕션 순서는 (ty-strided 루프 → smem NY-way 트리) 고정 —
 // 정확표현 입력에서 결정적/비트재현.
+//
+// **NY(블록당 행 슬롯)는 launch에서 고른다** (2026-08-29, 아래 launcher 주석). NY는 스레드가
+// 맡는 행 집합(r ≡ ty mod NY)을 정하므로 fp32 부분합의 묶음, 즉 누산 순서를 바꾼다 —
+// 그래서 hot/warm(w_on_device)과 융합/단일(grid.z)이 **같은 NY를 골라야** 하고, 실제로
+// heuristic이 그 둘과 무관한 순수 함수다. 일반 입력에서의 "pinned == device"와
+// "융합 == 2회 launch"가 그 위에 서 있다.
 //
 // grid = (ceil_div(N, 64), M×top_k), block = (64, 4).
 // thread(tx, ty): col n = bx*64+tx, r ∈ {ty, ty+4, ...} 부분합 → smem 합산.
@@ -80,7 +87,7 @@ using prism_sparse::SparseIn;
 // 라인 크기에 맞춰 다시 정해야 한다.
 constexpr int kNCol = 64;
 
-template <typename IdxT, bool INDEXED, int V, bool SPARSE>
+template <typename IdxT, bool INDEXED, int V, bool SPARSE, int NCOL_, int NYMUL>
 __global__ void prism_gemv_worklist(
     const __nv_bfloat16* __restrict__ x,
     const IdxT* __restrict__ topk,
@@ -122,8 +129,8 @@ __global__ void prism_gemv_worklist(
   // 블록의 열 타일은 V와 무관하게 64로 고정한다. V를 키우면 blockDim이
   // (64/V, 4V)로 재배치되므로 **블록 수와 타일 기하가 불변**이다 — 단순히
   // 열을 V배 맡게 하면 grid.x가 1/V로 붕괴한다 (gate는 N=512, V=8에서 8블록).
-  constexpr int NCOL = kNCol;
-  constexpr int NY = 4 * V;  // = blockDim.y
+  constexpr int NCOL = NCOL_;
+  constexpr int NY = 4 * V * NYMUL;  // = blockDim.y
   const long long n0 = static_cast<long long>(blockIdx.x) * NCOL +
                        static_cast<long long>(threadIdx.x) * V;
   const bool active = n0 < n_cols;
@@ -276,7 +283,7 @@ __global__ void prism_gemv_worklist(
 
 // topk dtype 디스패치. 나머지 인자는 두 경로가 공유한다 (비인덱스는
 // row_off/kidx가 nullptr, 인덱스는 k_offset/k_rows가 무시된다).
-template <bool INDEXED, int V, bool SPARSE>
+template <bool INDEXED, int V, bool SPARSE, int NCOL_ = kNCol, int NYMUL = 1>
 inline void launch_gemv_worklist(
     const dim3& grid, const DLDevice& device,
     tvm::ffi::TensorView topk,
@@ -290,10 +297,10 @@ inline void launch_gemv_worklist(
     const uint16_t* kidx1 = nullptr, int64_t out_col_offset1 = 0,
     const SparseArgs* sp1 = nullptr) {
   using namespace host;
-  const dim3 block(kNCol / V, 4 * V);  // 열 타일은 kNCol (커널 주석 참조)
+  const dim3 block(NCOL_ / V, 4 * V * NYMUL);  // 열 타일은 NCOL_ (커널 주석 참조)
   if (is_type<int32_t>(topk.dtype())) {
     LaunchKernel(grid, block, device)(
-        prism_gemv_worklist<int32_t, INDEXED, V, SPARSE>, x,
+        prism_gemv_worklist<int32_t, INDEXED, V, SPARSE, NCOL_, NYMUL>, x,
         static_cast<const int32_t*>(topk.data_ptr()), w, out, row_off, kidx,
         x_kx, k_offset, k_rows, n_cols, out_row, out_col_offset, top_k,
         x_row_is_pair, w1 ? w1 : w, row_off1 ? row_off1 : row_off,
@@ -301,13 +308,22 @@ inline void launch_gemv_worklist(
         sp, sp1 ? *sp1 : sp);
   } else {
     LaunchKernel(grid, block, device)(
-        prism_gemv_worklist<int64_t, INDEXED, V, SPARSE>, x,
+        prism_gemv_worklist<int64_t, INDEXED, V, SPARSE, NCOL_, NYMUL>, x,
         static_cast<const int64_t*>(topk.data_ptr()), w, out, row_off, kidx,
         x_kx, k_offset, k_rows, n_cols, out_row, out_col_offset, top_k,
         x_row_is_pair, w1 ? w1 : w, row_off1 ? row_off1 : row_off,
         kidx1 ? kidx1 : kidx, w1 ? out_col_offset1 : out_col_offset,
         sp, sp1 ? *sp1 : sp);
   }
+}
+
+// SM 수는 device당 한 번만 물어본다 (launch마다면 graph 캡처 중에도 host 시간이 든다).
+inline uint32_t sm_count_bf16(int device_id) {
+  constexpr int kMaxDev = 16;
+  static uint32_t cache[kMaxDev] = {};
+  if (device_id < 0 || device_id >= kMaxDev) return host::runtime::get_sm_count(device_id);
+  if (cache[device_id] == 0) cache[device_id] = host::runtime::get_sm_count(device_id);
+  return cache[device_id];
 }
 
 // W 로드 폭 선택. uint2/uint4 정렬 조건은 (a) n_cols가 V의 배수, (b) 스토어
@@ -548,12 +564,40 @@ inline void gemv_worklist_indexed_impl(
   }
 
   const DLDevice device = cuda_device.unwrap();
-  const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(kNCol))),
-                  static_cast<unsigned int>(m * top_k),
-                  fused ? 2u : 1u);
+  const int64_t pairs = m * top_k, slots = fused ? 2 : 1;
 
-#define PRISM_LAUNCH_INDEXED(V, SP)                                          \
-  launch_gemv_worklist<true, V, SP>(                                         \
+  // 블록당 행 슬롯(NY) 선택 (2026-08-29 실측, RTX 5090 170 SM, rotating id).
+  //
+  // m=1 decode에서 이 커널이 띄우는 스레드는 pair당 4·N개뿐이다 — 블록 수(N/NCOL)와 블록
+  // 크기(4·NCOL)가 NCOL과 정확히 상쇄되므로 **열 타일을 어떻게 잡아도 총량이 안 변한다**.
+  // 좁은 N에서는 그 4·N이 SM을 채우지 못한다 (q36 gate N=512 → pair당 2048 스레드).
+  // 상한 자체를 올리는 축은 행 슬롯 NY 하나뿐이라 (스레드당 행 수가 kr/NY로 줄어든다)
+  // 블록이 SM의 2배에 못 미치고 K 행이 NY보다 충분히 많을 때 NY를 4배(4V→16V)로 키운다.
+  // 실측 (µs, 옛→새): q36 gate 24.1→13.7, q3 gate 25.6→17.1. 큰 치수는 이미 대역폭
+  // 벽(dsv4 down 1494 GB/s = 피크의 83%)이라 heuristic이 발동해도 변화가 없다.
+  //
+  // **w_on_device로 갈리지 않는다** — mxfp4/fp8과 달리 여기서 바뀌는 것은 NY뿐이고 열
+  // 타일(=행 세그먼트 128 B)은 그대로다. PCIe 요청 크기가 안 변하므로 warm에 손해가 없고,
+  // 무엇보다 hot/warm이 같은 타일이어야 "pinned와 device가 비트 동일"(계약, 아래 테스트
+  // test_indexed_pinned_matches_device)이 유지된다.
+  //
+  // 누산 순서 주의: NY는 스레드가 맡는 행 집합(r ≡ ty mod NY)을 정하므로 NY를 바꾸면
+  // fp32 부분합의 묶음이 바뀐다. **정확표현 입력에서는 곱도 합도 정확해 순서와 무관하므로
+  // 계약 ⑤와 밴드 경로 비트일치(둘 다 정확표현 입력 기준)는 그대로다** — 실측 확인.
+  // 일반 입력에서는 옛 NY와 마지막 비트가 갈릴 수 있다 (같은 build 안에서는 결정적).
+  // **슬롯 수를 세지 않는다**: gate+up 융합은 grid.z=2라 블록이 2배지만, 그것을 heuristic에
+  // 넣으면 융합 launch와 단일 launch가 서로 다른 NY를 골라 누산 순서가 갈린다 — 융합이
+  // 2회 launch와 비트일치여야 한다는 계약(test_gemv_gateup_fusion_all_four_bitwise, 일반
+  // 입력 기준)이 깨진다. 슬롯 하나 기준으로 고르면 두 경로가 언제나 같은 타일이다.
+  const uint32_t sm = sm_count_bf16(device.device_id);
+  const int64_t blocks_per_slot = div_ceil(n_cols, static_cast<int64_t>(kNCol)) * pairs;
+  const int64_t avg_rows = R.unwrap() / (E1.unwrap() - 1);
+  const bool wide_ny = blocks_per_slot < 2 * static_cast<int64_t>(sm) && avg_rows >= 2048;
+  const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(kNCol))),
+                  static_cast<unsigned int>(pairs), static_cast<unsigned int>(slots));
+
+#define PRISM_LAUNCH_INDEXED_NY(V, SP, NYM)                                  \
+  launch_gemv_worklist<true, V, SP, kNCol, NYM>(                             \
       grid, device, topk,                                                    \
       static_cast<const __nv_bfloat16*>(x.data_ptr()),                       \
       static_cast<const __nv_bfloat16*>(w.data_ptr()),                       \
@@ -564,6 +608,11 @@ inline void gemv_worklist_indexed_impl(
       static_cast<int>(x_row_is_pair), sp,                                   \
       w1p, row_off1p, kidx1p, out_col_offset_up,                          \
       (sin_up != nullptr) ? &sp_up : nullptr)
+#define PRISM_LAUNCH_INDEXED(V, SP)                                          \
+  do {                                                                       \
+    if (wide_ny) PRISM_LAUNCH_INDEXED_NY(V, SP, 4);                          \
+    else PRISM_LAUNCH_INDEXED_NY(V, SP, 1);                                   \
+  } while (0)
 #define PRISM_LAUNCH_INDEXED_V(V)                                            \
   do {                                                                       \
     if (sin != nullptr) PRISM_LAUNCH_INDEXED(V, true);                        \
@@ -577,6 +626,7 @@ inline void gemv_worklist_indexed_impl(
   }
 #undef PRISM_LAUNCH_INDEXED_V
 #undef PRISM_LAUNCH_INDEXED
+#undef PRISM_LAUNCH_INDEXED_NY
 }
 
 void gemv_worklist(
