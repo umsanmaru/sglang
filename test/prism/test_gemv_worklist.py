@@ -311,3 +311,51 @@ def test_indexed_guards(broken):
     with pytest.raises(Exception):
         gemv_worklist_indexed(xd, idsd, wd, ro, ki, out, 0, False,
                               torch.cuda.current_stream())
+
+
+@cuda_required
+@pytest.mark.parametrize("pinned", [False, True])
+@pytest.mark.parametrize("sparse", [False, True])
+def test_gemv_gateup_fusion_all_four_bitwise(pinned, sparse):
+    """융합 진입점 네 조합({device, pinned} × {dense, sparse})이 2회 launch와 비트일치.
+
+    warm dense와 hot sparse는 2026-08-29에 채운 조합이다 — 그 전에는 `gemv_gateup`이
+    None을 돌려주어 같은 스텝이 조용히 2회 launch로 떨어졌다 (mxfp4/fp8은 네 개 다 있었다).
+    """
+    from sglang.jit_kernel import prism_gemv as k
+    from sglang.srt.layers.moe.prism.formats import BF16
+    from sglang.srt.layers.moe.prism.tiers import SparseSpec
+
+    I = 96
+    xg, wg, og, kg, ids = _mk_indexed([64] * 8, N=I, exact=False, seed=21)
+    _, wu, ou, ku, _ = _mk_indexed([64] * 8, N=I, exact=False, seed=22)
+    x, ids_d, s = xg.cuda(), ids.int().cuda(), torch.cuda.current_stream()
+    store = (lambda t: t.cpu().pin_memory()) if pinned else (lambda t: t.cuda())
+    wgd, wud = store(wg), store(wu)
+    ogd, kgd, oud, kud = og.cuda(), kg.cuda(), ou.cuda(), ku.cuda()
+
+    def spec(seed):
+        g = torch.Generator().manual_seed(seed)
+        total = 8 * 64
+        return SparseSpec(a=torch.rand(total, generator=g).cuda(),
+                          c=(torch.rand(total // 2, generator=g) * 0.1).cuda(),
+                          thr=torch.full((8, 4), 0.3, device="cuda"),
+                          p=0.5, lam=0.0, pmax=0.9, grid=0.1, ng=4, renorm_it=1)
+
+    w = torch.rand(2, 4, generator=torch.Generator().manual_seed(23)).cuda()
+    sg, su = spec(24), spec(25)
+    single = BF16.gemv(pinned=pinned, sparse=sparse)
+    fused = BF16.gemv_gateup(pinned=pinned, sparse=sparse)
+    assert fused is not None
+    ref = torch.zeros(2, 4, 2 * I, dtype=torch.bfloat16, device="cuda")
+    out = torch.zeros_like(ref)
+    if sparse:
+        single(x, ids_d, w, wgd, ogd, kgd, ref, sg, 0, False, s)
+        single(x, ids_d, w, wud, oud, kud, ref, su, I, False, s)
+        fused(x, ids_d, w, wgd, ogd, kgd, wud, oud, kud, out, sg, su, 0, I, False, s)
+    else:
+        single(x, ids_d, wgd, ogd, kgd, ref, 0, False, s)
+        single(x, ids_d, wud, oud, kud, ref, I, False, s)
+        fused(x, ids_d, wgd, ogd, kgd, wud, oud, kud, out, 0, I, False, s)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref)

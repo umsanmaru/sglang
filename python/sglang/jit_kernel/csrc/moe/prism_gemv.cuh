@@ -630,6 +630,22 @@ void gemv_worklist_indexed_pinned(
                              x_row_is_pair, vec, false, nullptr);
 }
 
+// warm의 dense 융합 (pinned W). masking이 꺼진 스텝(prefill 소배치, dense plan)에서
+// warm 티어가 타는 경로다 — 이것이 없으면 같은 스텝이 2회 launch로 떨어진다.
+void gemv_worklist_indexed_pinned_gateup(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
+    tvm::ffi::TensorView kidx_gate,
+    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
+    tvm::ffi::TensorView kidx_up,
+    tvm::ffi::TensorView out, int64_t out_col_offset_gate,
+    int64_t out_col_offset_up, int64_t x_row_is_pair, int64_t vec) {
+  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                             out_col_offset_gate, x_row_is_pair, vec, false,
+                             nullptr, &w_up, &row_off_up, &kidx_up,
+                             out_col_offset_up);
+}
+
 // sparse 쌍둥이. 인자가 넷 늘고(a, c, thr, topk_weights) 예산 스칼라가 붙는
 // 것 외에 dense와 같다. 별도 진입점으로 둔 이유: optional 텐서로 하나에
 // 합치면 dense 경로가 매 호출 nullable 검사를 지나고, 무엇보다 "sparse인지"가
@@ -669,6 +685,33 @@ void gemv_worklist_indexed_pinned_sparse_gateup(
                         pmax, grid, ng, renorm_it};
   gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
                              out_col_offset_gate, x_row_is_pair, vec, false,
+                             &sin, &w_up, &row_off_up, &kidx_up,
+                             out_col_offset_up, &sin_up);
+}
+
+// hot의 sparse 융합 (device 상주 W). `SPARSE_TIERS`에 HOT을 더하는 순간 warm과
+// 같은 융합 경로가 필요하다 — 커널은 이미 양쪽을 지원하므로 진입점만 채운다.
+void gemv_worklist_indexed_sparse_gateup(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
+    tvm::ffi::TensorView kidx_gate,
+    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
+    tvm::ffi::TensorView kidx_up,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView a_gate, tvm::ffi::TensorView c_gate,
+    tvm::ffi::TensorView thr_gate,
+    tvm::ffi::TensorView a_up, tvm::ffi::TensorView c_up,
+    tvm::ffi::TensorView thr_up, tvm::ffi::TensorView topk_w,
+    int64_t out_col_offset_gate, int64_t out_col_offset_up,
+    int64_t x_row_is_pair, int64_t vec,
+    double p_gate, double lam_gate, double p_up, double lam_up,
+    double pmax, double grid, int64_t ng, int64_t renorm_it) {
+  const SparseIn sin{a_gate, c_gate, thr_gate, topk_w, p_gate, lam_gate,
+                     pmax, grid, ng, renorm_it};
+  const SparseIn sin_up{a_up, c_up, thr_up, topk_w, p_up, lam_up,
+                        pmax, grid, ng, renorm_it};
+  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                             out_col_offset_gate, x_row_is_pair, vec, true,
                              &sin, &w_up, &row_off_up, &kidx_up,
                              out_col_offset_up, &sin_up);
 }

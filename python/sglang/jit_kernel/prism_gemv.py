@@ -20,6 +20,10 @@ def _jit_prism_gemv_module() -> Module:
             ("gemv_worklist_pinned", "gemv_worklist_pinned"),
             ("gemv_worklist_indexed", "gemv_worklist_indexed"),
             ("gemv_worklist_indexed_gateup", "gemv_worklist_indexed_gateup"),
+            ("gemv_worklist_indexed_pinned_gateup",
+             "gemv_worklist_indexed_pinned_gateup"),
+            ("gemv_worklist_indexed_sparse_gateup",
+             "gemv_worklist_indexed_sparse_gateup"),
             ("gemv_worklist_indexed_pinned_sparse_gateup",
              "gemv_worklist_indexed_pinned_sparse_gateup"),
             ("gemv_worklist_indexed_pinned", "gemv_worklist_indexed_pinned"),
@@ -162,6 +166,43 @@ def gemv_worklist_indexed_gateup(x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
             w_up, row_off_up, kidx_up, out3d,
             int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
             int(vec))
+
+
+def gemv_worklist_indexed_pinned_gateup(x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
+                                        w_up, row_off_up, kidx_up, out3d,
+                                        out_col_gate, out_col_up, x_row_is_pair,
+                                        stream, vec=0) -> None:
+    """warm의 dense 융합 (pinned W). masking이 꺼진 스텝에서 warm이 타는 짝이다 —
+    device 쌍둥이와 같은 커널이고 host 검증만 갈린다 (계약 ①)."""
+    module = _jit_prism_gemv_module()
+    with torch.cuda.stream(stream):
+        module.gemv_worklist_indexed_pinned_gateup(
+            x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
+            w_up, row_off_up, kidx_up, out3d,
+            int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
+            int(vec))
+
+
+def gemv_worklist_indexed_sparse_gateup(
+        x2d, topk_ids, topk_weights, w_gate, row_off_gate, kidx_gate,
+        w_up, row_off_up, kidx_up, out3d, sp_gate, sp_up,
+        out_col_gate, out_col_up, x_row_is_pair, stream, vec=0) -> None:
+    """hot의 gate+up 융합 (device 상주 W, sparse). pinned 짝과 같은 커널이다."""
+    for f in ("pmax", "grid", "ng", "renorm_it"):
+        if getattr(sp_gate, f) != getattr(sp_up, f):
+            raise ValueError(f"gateup fusion requires a shared sparsity budget; "
+                             f"{f} differs ({getattr(sp_gate, f)} vs {getattr(sp_up, f)})")
+    module = _jit_prism_gemv_module()
+    with torch.cuda.stream(stream):
+        module.gemv_worklist_indexed_sparse_gateup(
+            x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
+            w_up, row_off_up, kidx_up, out3d,
+            sp_gate.a, sp_gate.c, sp_gate.thr,
+            sp_up.a, sp_up.c, sp_up.thr, topk_weights,
+            int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), int(vec),
+            float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
+            float(sp_gate.pmax), float(sp_gate.grid),
+            int(sp_gate.ng), int(sp_gate.renorm_it))
 
 
 def gemv_worklist_indexed_pinned_sparse_gateup(
