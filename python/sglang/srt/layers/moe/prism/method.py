@@ -62,6 +62,18 @@ _ENV_WARM_KT = "SGLANG_PRISM_WARM_KT"
 _ENV_WARM_CPU_MIN_M = "SGLANG_PRISM_WARM_CPU_MIN_M"
 # cold를 전용 stream + 플래그 wait로 (블로킹 콜백 없음). eager 전용. hybrid와 동시 불가.
 _ENV_COLD_ASYNC = "SGLANG_PRISM_COLD_ASYNC"
+# 로딩 훅(process_weights_after_loading)의 torch intra-op 스레드 수. model_runner가
+# load_model 진입부에서 전역 1로 고정하는데(평범한 로딩의 memcpy 스레드 경합 방지),
+# prism의 훅은 memcpy가 아니라 층당 3.4 GB를 훑는 K-슬라이스 repack이라 그 값이
+# 그대로 병목이 된다 (실측 1스레드 4.0 s vs 16스레드 0.87 s = 4.7×).
+# 미설정 = 물리 코어 수(HT 제외). cold_load 시점의 kt 워커들은 50 ms 뒤 condvar에서
+# 잠들므로(worker_pool.cpp) prepare 구간에 코어를 다 써도 경합하지 않는다.
+_ENV_LOAD_THREADS = "SGLANG_PRISM_LOAD_THREADS"
+
+
+def _load_threads() -> int:
+    default = max(1, (os.cpu_count() or 4) // 2)
+    return max(1, int(os.environ.get(_ENV_LOAD_THREADS, str(default))))
 
 
 def _hybrid_local_node(device) -> int:
@@ -258,6 +270,12 @@ def _get_runtime() -> _PrismRuntime:
 class PrismMoEMethod(FusedMoEMethodBase):
     """FusedMoE의 quant_method 자리에 들어가는 Prism 실행기."""
 
+    # loader.device_loading_context에게 "내 파라미터는 CPU가 제자리다"를 알린다 —
+    # 없으면 로더가 CPU 파라미터를 offload로 오해해 층당 full weight를 GPU로 올렸다
+    # 내리고 버린다 (계약 ③: full expert weight는 host 상주). 클래스 속성이라
+    # __getattr__(gpu_method 위임)을 타지 않는다.
+    keeps_params_on_host = True
+
     def __init__(self, gpu_method, layer_id: int):
         self.gpu_method = gpu_method  # create_moe_runner 등 미지 속성의 위임처
         self.layer_id = layer_id
@@ -314,18 +332,31 @@ class PrismMoEMethod(FusedMoEMethodBase):
                                   extra_weight_attrs)
 
     def process_weights_after_loading(self, layer) -> None:
+        runtime = _get_runtime()
+        # 파라미터는 CPU에 그대로 있다: `keeps_params_on_host`가 loader.py의
+        # device_loading_context에게 왕복을 건너뛰게 한다. cold 주입은 C++가 host
+        # memcpy로 읽으므로 CUDA 텐서의 data_ptr()를 넘기면 device 주소를
+        # memcpy하다 segfault한다 (2026-08-20 스모크에서 실제 발생) — 그 왕복이
+        # 있던 시절 take_full의 `_host()`가 방어선이었고, 지금은 왕복 자체가 없다.
+        import time as _time
+        # 로딩 훅만 torch 스레드를 되돌린다 (model_runner.load_model이 전역 1로 고정).
+        # 원복은 finally에서 — 추론 경로는 다시 1스레드여야 한다 (kt가 자기 풀을 쓴다).
+        _threads_want = _load_threads()
+        _threads_saved = torch.get_num_threads()
+        if _threads_want != _threads_saved:
+            torch.set_num_threads(_threads_want)
+        try:
+            self._register_layer(layer, runtime, _time)
+        finally:
+            if _threads_want != _threads_saved:
+                torch.set_num_threads(_threads_saved)
+
+    def _register_layer(self, layer, runtime, _time) -> None:
         from sglang.srt.layers.moe.prism.kernels import cold_pack_tile_rows
         from sglang.srt.layers.moe.prism.numa import gpu_numa_node
         from sglang.srt.layers.moe.prism.plan import Proj, Tier
         from sglang.srt.layers.moe.prism.weights import prepare_layer_weights
 
-        runtime = _get_runtime()
-        # 주의: loader.py의 device_loading_context가 이 훅 직전에 파라미터를
-        # CUDA로 옮겨둔다 (훅 종료 후 원복). cold 주입은 C++가 host memcpy로
-        # 읽으므로 반드시 CPU 사본에서 슬라이스해야 한다 — CUDA 텐서의
-        # data_ptr()를 넘기면 device 주소를 memcpy하다 segfault (2026-08-20
-        # 스모크에서 실제 발생). TODO: 컨텍스트 왕복(H2D+D2H ~2.4GB/층) 회피.
-        import time as _time
         _t0 = _time.perf_counter()
         full = runtime.fmt.take_full(layer)
         _t1 = _time.perf_counter()
@@ -361,10 +392,11 @@ class PrismMoEMethod(FusedMoEMethodBase):
         # full 텐서 소멸 (계약 ③) — host RAM 회수
         runtime.fmt.release(layer)
         self._registered = True
-        logger.info("[prism] layer %d registered (hot=%s cold=%s) take_full %.1fs prepare %.1fs cold_load %.1fs register %.1fs",
-                    self.layer_id,
+        logger.info("[prism] layer %d registered (hot=%s cold=%s thr=%d) take_full %.1fs prepare %.1fs cold_load %.1fs register %.1fs",
+                    self.layer_id, 
                     any(ep.proj(p).has_tier(Tier.HOT) for p in Proj),
                     any(ep.proj(p).has_tier(Tier.COLD) for p in Proj),
+                    torch.get_num_threads(),
                     _t1 - _t0, _t2 - _t1, _t3 - _t2, _time.perf_counter() - _t3)
 
     # ── step-time ────────────────────────────────────────────────────────
