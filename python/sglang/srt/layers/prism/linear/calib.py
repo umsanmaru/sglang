@@ -163,7 +163,7 @@ class LinearCalibTables:
                 if not part.sparse or part.calib is None:
                     continue
                 sub = f"layer {layer} proj '{name}'" + (
-                    "" if part.half is None else f" [{part.half}]")
+                    "" if part.name is None else f" [{part.name}]")
                 self.check(layer, part.calib, pp.k, sub)
 
     # ── 조회 ─────────────────────────────────────────────────────────────

@@ -196,3 +196,46 @@ def test_digest_mismatch_dies():
                         pmax=0.9, grid=0.005, ng=201, renorm_it=3)
     with pytest.raises(PlanError, match="digest mismatch"):
         LinearCalibTables.load(spec)
+
+# ── check_plan: plan이 마스킹하겠다고 한 자리를 전부 대조한다 ──────────────
+
+
+def _plan_with_sparsity(calib_key="g", sparse=True, k=K):
+    """조각 이름이 있는 plan — 오류 메시지가 그 이름을 쓴다 (회귀: part.half)."""
+    return parse_plan({
+        "schema_version": 1, "model_id": "t",
+        "dims": {"num_layers": L, "dtype": "bfloat16"},
+        "kernels": {"gpu_warm": "gemv_worklist", "cpu_cold": "kt_amx_bf16"},
+        "sparsity": {"score": "k2wl2",
+                     "calib": {"path": "/x", "sha256": "0" * 64},
+                     "pmax": 0.9, "grid": 0.005, "ng": NG, "renorm_it": 3},
+        "projs": {"mlp.gate_up_proj": {
+            "k": k, "n": 2 * k,
+            "parts": [{"name": "gate", "n": k, "bands": [[0, k, "warm"]],
+                       "calib": calib_key, "p": 0.5, "lambda": 0.0,
+                       "sparse": sparse},
+                      {"name": "up", "n": k, "bands": [[0, k, "warm"]],
+                       "calib": "u", "p": 0.5, "lambda": 0.0,
+                       "sparse": sparse}]}},
+    })
+
+
+def test_check_plan_passes_on_calibrated_plan(cal):
+    cal.check_plan(_plan_with_sparsity())
+
+
+def test_check_plan_names_the_part_in_the_error():
+    """조각 이름이 메시지에 들어가야 한다 — 어느 절반이 문제인지가 진단의 전부다.
+
+    회귀: 이 경로가 `part.half`(존재하지 않는 속성)를 읽어 AttributeError로
+    죽었다. 아무도 `check_plan`을 부르지 않아 드러나지 않았다.
+    """
+    cal = LinearCalibTables(_tables(dead_layers=(2,)), "k2wl2", NG)
+    with pytest.raises(PlanError, match=r"\[gate\]"):
+        cal.check_plan(_plan_with_sparsity())
+
+
+def test_check_plan_skips_parts_that_opt_out():
+    """`sparse: false`인 조각은 대조하지 않는다 — calib이 안 덮는 자리를 빼는 길이다."""
+    cal = LinearCalibTables(_tables(dead_layers=tuple(range(L))), "k2wl2", NG)
+    cal.check_plan(_plan_with_sparsity(sparse=False))
