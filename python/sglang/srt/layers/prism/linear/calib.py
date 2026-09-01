@@ -38,7 +38,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import List, Mapping, Optional
 
 import torch
 
@@ -156,15 +156,33 @@ class LinearCalibTables:
                     f"(마스킹이 조용히 사라지고 성능만 달라진다)"
                 )
 
-    def check_plan(self, plan: LinearPlan) -> None:
-        """plan이 마스킹하겠다고 한 모든 (layer, proj, 조각)을 대조한다 (startup 1회)."""
+    def check_plan(self, plan: LinearPlan, *, strict: bool = True) -> List[str]:
+        """plan이 마스킹하겠다고 한 모든 (layer, proj, 조각)을 대조한다 (startup 1회).
+
+        **plan은 실행 트리가 어느 층에 어느 모듈을 실제로 만드는지 모른다.**
+        `make_plan`은 `self_attn.*`를 64층 전부에 선언하는데 Qwen3.8-27B에서 그
+        모듈은 full_attention 16층에만 있고, calib이 나머지 48층을 0으로 둔 것은
+        정확한 사실이다. 그래서 `strict=True`로 전수 대조하면 **존재하지 않을
+        좌표**가 런을 죽인다 — 진짜 게이트는 prepare(그 모듈이 실재할 때)에 있다.
+
+        `strict=False`면 죽이지 않고 문제 목록을 돌려준다. 호출자가 그것을 로그로
+        내보내면 "이 자산이 안 덮는 자리"가 기동 로그에 남아, 나중에 sparsity가
+        기대만큼 안 나올 때 찾을 자리가 생긴다.
+        """
+        bad: List[str] = []
         for (layer, name), pp in plan.projs.items():
             for part in pp.parts:
                 if not part.sparse or part.calib is None:
                     continue
                 sub = f"layer {layer} proj '{name}'" + (
                     "" if part.name is None else f" [{part.name}]")
-                self.check(layer, part.calib, pp.k, sub)
+                try:
+                    self.check(layer, part.calib, pp.k, sub)
+                except PlanError as e:
+                    if strict:
+                        raise
+                    bad.append(str(e).split(" — ")[0])
+        return bad
 
     # ── 조회 ─────────────────────────────────────────────────────────────
     def thr(self, layer_idx: int, key: str) -> torch.Tensor:

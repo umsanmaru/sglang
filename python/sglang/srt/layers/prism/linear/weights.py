@@ -441,6 +441,10 @@ def _prepare_part(part: ProjPart, weight, scale, fmt: LinearStoreFormat, where: 
 
     thr = None
     if masking:
+        # **진짜 게이트.** 이 조각은 실재하는 모듈의 것이므로 여기서 0 테이블은
+        # 무증상 실패다 (마스킹이 사라지고 성능만 달라진다). plan 전수 대조와
+        # 달리 존재하지 않을 좌표를 잡지 않는다.
+        calib.check(layer_idx, part.calib, int(weight.shape[1]), sub)
         thr = calib.thr(layer_idx, part.calib)
         if part.sparsity_p is None or part.sparsity_lambda is None:
             raise PlanError(

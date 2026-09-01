@@ -211,26 +211,35 @@ def test_mismatched_shards_split_into_two_groups():
     assert all(g.num_experts == 1 for g in groups)
 
 
-def _sparse_plan_dict(p_budget=0.5, calib_key="g"):
+# calib 키 ↔ projection: 테이블 K가 그 proj의 K와 **정확히** 같아야 한다
+# (`calib.check`). gate_up은 K=H, down은 K=I라 한 키로 둘을 덮을 수 없다.
+_CALIB_K = {"g": H, "u": H, "d": I}
+
+
+def _sparse_plan_dict(p_budget=0.5):
     d = _plan_dict(0.0, 0.0)
     d["sparsity"] = {"score": "k2wl2", "calib": {"path": "/x", "sha256": "0" * 64},
                      "pmax": 0.9, "grid": 0.005, "ng": 201, "renorm_it": 3}
-    for proj in d["projs"].values():
-        for part in proj.get("parts", [proj]):
-            part.update({"calib": calib_key, "p": p_budget, "lambda": 0.0})
+    keys = {"mlp.gate_up_proj": ("g", "u"), "mlp.down_proj": ("d",)}
+    for name, proj in d["projs"].items():
+        for part, key in zip(proj.get("parts", [proj]), keys[name]):
+            part.update({"calib": key, "p": p_budget, "lambda": 0.0})
     return d
 
 
-def _sparse_calib(k_max):
-    """합성 calib — 실물 자산 없이 같은 불변식을 본다 (test_linear_calib과 같은 형태)."""
+def _sparse_calib():
+    """합성 calib — 실물 자산 없이 같은 불변식을 본다 (test_linear_calib과 같은 형태).
+
+    키마다 K가 다르다: 자산은 projection의 K를 그대로 따르고 `check`가 그것을 본다.
+    """
     from sglang.srt.layers.prism.geometry import PAIR_GROUP
     from sglang.srt.layers.prism.linear.calib import LinearCalibTables
 
     torch.manual_seed(0)
     t = {}
-    for key in ("g", "u", "d"):
-        t[f"wn_{key}"] = torch.rand(LAYERS, 1, k_max) + 0.5
-        t[f"c{key}"] = torch.randn(LAYERS, 1, k_max // PAIR_GROUP)
+    for key, k in _CALIB_K.items():
+        t[f"wn_{key}"] = torch.rand(LAYERS, 1, k) + 0.5
+        t[f"c{key}"] = torch.randn(LAYERS, 1, k // PAIR_GROUP)
         t[f"t{key}2l"] = torch.rand(LAYERS, 1, 201)
     return LinearCalibTables(t, "k2wl2", 201)
 
@@ -281,14 +290,14 @@ def test_prepare_without_calib_dies():
 def test_cold_shard_carries_scores_in_store_order():
     """cold 점수 재료는 **패딩된** k_index 순서 — packed 타일의 행 순서가 그것이다."""
     plan = parse_plan(_sparse_plan_dict())
-    cal = _sparse_calib(max(H, I))
+    cal = _sparse_calib()
     w = torch.zeros(H, I, dtype=torch.bfloat16)
     pr = prepare_linear_weights(0, "mlp.down_proj", w, plan, pin_memory=False, calib=cal)
     part = pr.parts[0]
     assert part.cold is not None and part.cold.calib is not None
     assert part.cold.calib.wn.numel() == part.cold.k_pad
     assert part.thr is not None and part.thr.numel() == 201
-    want = cal.gather(0, "g", part.cold.k_index, real_rows=part.cold.real_rows)
+    want = cal.gather(0, "d", part.cold.k_index, real_rows=part.cold.real_rows)
     assert torch.equal(part.cold.calib.wn, want.wn)
 
 
@@ -302,7 +311,7 @@ def test_dummy_slot_budget_is_zero():
     validate_static(plan)
     cold = KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES,
                                cpuinfer_threads=8)
-    caught = _capture_configs(cold, plan, _sparse_calib(max(H, I)))
+    caught = _capture_configs(cold, plan, _sparse_calib())
     seen = 0
     for g, cfg, _tables in caught:
         sp = cfg.partial.sparsity
@@ -324,7 +333,7 @@ def test_sparsity_tables_have_all_nine_keys_and_sizes():
     plan = parse_plan(_sparse_plan_dict(0.5))
     cold = KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES,
                                cpuinfer_threads=8)
-    for g, cfg, tables in _capture_configs(cold, plan, _sparse_calib(max(H, I))):
+    for g, cfg, tables in _capture_configs(cold, plan, _sparse_calib()):
         assert set(tables) == {
             f"{s}_{w}" for s in ("gate", "up", "down")
             for w in ("wn_sq", "pair_dot")} | {f"thr_{s}" for s in ("gate", "up", "down")}

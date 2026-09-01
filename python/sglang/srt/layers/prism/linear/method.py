@@ -90,9 +90,16 @@ class _LinearRuntime:
             from sglang.srt.layers.prism.linear.calib import LinearCalibTables
 
             self._calib = LinearCalibTables.load(self.plan.sparsity)
-            self._calib.check_plan(self.plan)
             logger.info("[prism-linear] calib loaded: %s (score=%s)",
                         self.plan.sparsity.calib.path, self.plan.sparsity.score)
+            # 죽이지 않는 프리스캔: plan은 어느 층에 어느 모듈이 실재하는지 모른다
+            # (`check_plan` docstring). 실재하는 좌표의 게이트는 prepare에 있다.
+            uncal = self._calib.check_plan(self.plan, strict=False)
+            if uncal:
+                logger.warning(
+                    "[prism-linear] calib이 안 덮는 plan 좌표 %d개 — 그 모듈이 "
+                    "실재하면 prepare에서 즉사한다. 예: %s",
+                    len(uncal), "; ".join(uncal[:3]))
         return self._calib
 
     def executor(self, device: torch.device):

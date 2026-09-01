@@ -235,6 +235,23 @@ def test_check_plan_names_the_part_in_the_error():
         cal.check_plan(_plan_with_sparsity())
 
 
+def test_check_plan_non_strict_reports_instead_of_dying():
+    """plan은 어느 층에 어느 모듈이 실재하는지 모른다 — 전수 대조로 죽이면 안 된다.
+
+    Qwen3.8-27B에서 `make_plan`이 `self_attn.*`를 64층 전부에 선언하지만 그 모듈은
+    full_attention 16층에만 있고, calib이 나머지 48층을 0으로 둔 것은 **정확한
+    사실**이다. strict로 죽이면 존재하지 않을 좌표가 런을 막는다.
+    """
+    cal = LinearCalibTables(_tables(dead_layers=(2,)), "k2wl2", NG)
+    bad = cal.check_plan(_plan_with_sparsity(), strict=False)
+    assert bad and any("[gate]" in b for b in bad), bad
+    assert all("layer 2" in b for b in bad), f"죽은 층만 보고해야 한다: {bad}"
+
+
+def test_check_plan_non_strict_is_empty_when_covered(cal):
+    assert cal.check_plan(_plan_with_sparsity(), strict=False) == []
+
+
 def test_check_plan_skips_parts_that_opt_out():
     """`sparse: false`인 조각은 대조하지 않는다 — calib이 안 덮는 자리를 빼는 길이다."""
     cal = LinearCalibTables(_tables(dead_layers=tuple(range(L))), "k2wl2", NG)
