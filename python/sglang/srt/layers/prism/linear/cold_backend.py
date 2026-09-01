@@ -38,6 +38,7 @@ sparsity와 양자화 스토어(fp8/mxfp4)는 아직 배선하지 않는다 — 
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -52,6 +53,8 @@ from sglang.srt.layers.prism.linear.weights import LinearColdShard, PreparedLine
 # `n_total`이라 unit을 묶으려면 x를 그만큼 **복제**해야 하고(계약 ②-3), 그
 # 복제가 prefill에서 M×K×2 B다. 묶음은 최적화이지 계약이 아니다.
 TOP_K = 1
+
+logger = logging.getLogger(__name__)
 
 # 이 백엔드가 아는 cold 커널. 양자화 키는 배율 셋과 `cold_load_kwargs`가 필요한데
 # dense formats에 아직 그 훅이 없다 (TODO). 조용히 빠지면 pack이 쓰레기를 읽는다.
@@ -297,6 +300,26 @@ class KtLinearColdBackend:
         self._build_calls()
         for group in self._groups.values():
             self._load_group(group)
+        self._log_summary()
+
+    def _log_summary(self) -> None:
+        """그룹 구성과 **패딩 낭비**를 로드 타임에 보이게 한다.
+
+        유령 밴드는 게이트가 죽이지만 "타일을 조금 넘긴" 밴드는 정상이면서도
+        낭비다 (33행 → k_pad 64, 절반이 0). 그건 planner가 고칠 일이라 죽이지 않고
+        숫자로 보여준다 — 안 보이면 아무도 안 고친다.
+        """
+        for g in sorted(self._groups.values(), key=lambda g: -g.num_experts):
+            real = pad = 0
+            for u in g.units:
+                for c in u.colds:
+                    real += c.real_rows
+                    pad += c.k_pad
+            waste = 100.0 * (pad - real) / pad if pad else 0.0
+            logger.info(
+                "[prism-linear] cold %s: E=%d out_cols=%d rows=%d(+%d 패딩 %.1f%%)",
+                g.key.label, g.num_experts, g.out_cols, real, pad - real, waste,
+            )
 
     def _check_group(self, group: ColdGroup) -> None:
         """계약 ②-4 중 **그룹 키가 보장하지 않는 것**만 검사한다.
@@ -333,6 +356,23 @@ class KtLinearColdBackend:
                     raise PlanError(
                         f"{where}: {unit.label} k_pad={c.k_pad} is not a multiple of "
                         f"tile {tile} for '{key.kernel}'"
+                    )
+                # **유령 밴드 게이트.** pack 타일 하나도 못 채우는 cold 밴드는
+                # plan 생성기의 반올림이 만든 것이지 의도가 아니다 (2026-09-01 이전에
+                # 실제로 2행짜리가 나왔고, 그때는 `executor.register()`의 cold 거부가
+                # 잡았다 — cold를 배선하면서 그 게이트가 사라졌으므로 여기가 대신한다).
+                #
+                # 안 잡으면 **값은 맞고 느리기만 하다**: 그 밴드가 계산에 기여하는
+                # 것은 real_rows/K인데, 대가로 x D2H · submit/sync 왕복 · [M, N] H2D ·
+                # rejoin 커널을 통째로 지불한다. 2행이면 30행이 패딩이라 CPU가 하는
+                # 일의 94%가 0을 곱하는 것이다. 어떤 정확도 테스트도 이걸 못 잡는다.
+                if c.real_rows < tile:
+                    raise PlanError(
+                        f"{where}: {unit.label}의 cold 밴드가 {c.real_rows}행뿐이라 "
+                        f"pack 타일({tile}행) 하나도 못 채운다 — plan 생성기의 반올림이 "
+                        f"만든 유령 밴드일 가능성이 높다. 이 밴드는 결과를 바꾸지 않지만 "
+                        f"submit/sync 왕복과 H2D, rejoin을 통째로 지불한다. 밴드를 "
+                        f"키우거나 그 행들을 GPU 티어로 넘겨라"
                     )
 
         # 노드 테이블: 노드 수만큼 있고 [0, N)을 구멍 없이 덮는다 (②-4-4).

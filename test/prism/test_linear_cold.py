@@ -220,7 +220,7 @@ def test_sparse_plan_is_rejected():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("hot_rows", [2, 34, 254])
+@pytest.mark.parametrize("hot_rows", [2, 34, 190])
 def test_unaligned_cold_rows_are_padded(hot_rows):
     """cold 행 수가 타일(32)의 배수가 아니어도 **비트일치**.
 
@@ -267,3 +267,50 @@ def test_unaligned_node_shard_is_rejected():
     bad = _plan_dict(0.0, 0.0, shards=lambda n: [[0, 0, 40], [1, 40, n]])
     with pytest.raises(PlanError, match="COL_GROUP"):
         _vs(parse_plan(bad))
+
+
+def test_ghost_cold_band_is_rejected():
+    """pack 타일 하나도 못 채우는 cold 밴드는 즉사 (유령 밴드 게이트).
+
+    plan 생성기의 반올림이 실제로 2행짜리 cold 밴드를 만든 적이 있고, 그때는
+    `executor.register()`의 cold 거부가 잡았다 — cold를 배선하면서 그 게이트가
+    사라졌으므로 `_check_group`이 대신한다.
+
+    안 잡으면 **값은 맞고 느리기만 하다**: 2행이 계산에 기여하는 것은 K의 0.8%인데
+    대가로 x D2H · submit/sync 왕복 · [M, N] H2D · rejoin 커널을 통째로 낸다. 게다가
+    30행이 패딩이라 CPU가 하는 일의 94%가 0을 곱하는 것이다.
+    """
+    def bands(k):
+        return [[0, k - 2, "hot"], [k - 2, k, "cold"]]
+
+    plan = parse_plan(_plan_dict(0, 0, raw_bands=bands))
+    validate_static(plan)
+    cold = KtLinearColdBackend(plan, max_tokens=8, num_numa_nodes=NODES,
+                               cpuinfer_threads=8)
+    w = torch.zeros(H, I, dtype=torch.bfloat16)
+    cold.register(0, "mlp.down_proj",
+                  prepare_linear_weights(0, "mlp.down_proj", w, plan,
+                                         device=torch.device("cuda"), pin_memory=False))
+    with pytest.raises(PlanError, match="유령 밴드"):
+        cold.finalize()
+
+
+def test_all_hot_proj_costs_nothing():
+    """cold 행이 없는 proj는 unit도 호출도 만들지 않는다.
+
+    안 잡으면: 100% hot인 layer가 빈 cold 호출을 내면 submit/sync 왕복과 [M, N]
+    H2D, rejoin 커널을 전부 공짜로 잃는다 (값은 맞는다).
+    """
+    plan = parse_plan(_plan_dict(1.0, 0.0))          # 전부 hot
+    validate_static(plan)
+    cold = KtLinearColdBackend(plan, max_tokens=8, num_numa_nodes=NODES,
+                               cpuinfer_threads=8)
+    dev = torch.device("cuda")
+    for name, k, n in (("mlp.gate_up_proj", H, 2 * I), ("mlp.down_proj", I, H)):
+        pr = prepare_linear_weights(0, name, torch.zeros(n, k, dtype=torch.bfloat16),
+                                    plan, device=dev, pin_memory=True)
+        assert all(p.cold is None for p in pr.parts)
+        cold.register(0, name, pr)
+    cold.finalize()
+    assert cold.groups() == (), "cold 행이 없는데 그룹이 생겼다"
+    assert cold.calls(0, "mlp.down_proj") == ()
