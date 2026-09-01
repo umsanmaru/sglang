@@ -3,8 +3,9 @@
 계약 전문은 CONTRACTS.md ① 참조. 이 모듈은 Plan의 스키마·파서·검증기만
 소유한다 — Plan 생성기는 이 코드베이스 밖이다.
 
-이 모듈은 의도적으로 sglang의 다른 어떤 모듈에도 의존하지 않는다
-(순수 stdlib). Plan abstraction이 runtime을 알게 되는 순간 경계가 무너진다.
+이 모듈은 의도적으로 runtime을 모른다: stdlib과 `layers/prism/geometry`(그 자체가
+순수 stdlib인 기하 정의) 외에 아무것도 import하지 않는다. Plan abstraction이
+runtime을 알게 되는 순간 경계가 무너진다.
 
 Plan 파일(JSON) 형식::
 
@@ -54,25 +55,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence, Union
 
-# K-축 경계 정렬 단위 = **페어** (계약 ① 2026-08-25).
-#
-# 초판의 `ROW_GROUP = 64`는 폐기됐다. 그것은 요구가 아니라 "AMX K_STEP(32)의
-# 배수라 안전"이라는 보수적 선택이었고, 그 K_STEP은 cold **커널의 packed 저장**
-# 성질이지 plan의 성질이 아니다 — 타일 경계까지의 올림은 로더가 하고 커널 안에서
-# 끝난다 (`kernels.cold_pack_tile_rows`). plan/자산이 지켜야 하는 것은 페어뿐이다.
-#
-# 값어치는 planner 해상도다: down은 K=512라 %32면 per-expert 크기 선택지가 16개
-# 뿐인데, 가변 per-expert 예산 배분이 이 스키마의 존재 이유다.
-ROW_GROUP = 2
-# N-축 shard 경계 정렬 단위 (AMX pack N-타일; 값은 pack 확인 후 조정 가능)
-COL_GROUP = 32
-# 인접 입력채널 페어 마스킹 단위 (= ROW_GROUP). k2wl2 점수가 페어 단위이므로
-# (calib pairimp: sqrt(a0*x0^2 + a1*x1^2 + 2c*x0*x1)) 마스크 길이는
-# K/PAIR_GROUP이다. 밴드 경계가 페어를 쪼개면 두 티어가 같은 페어의 반쪽씩
-# 갖게 되어 어느 쪽도 점수를 재구성할 수 없다 — ROW_GROUP이 PAIR_GROUP의
-# 배수라는 사실이 그것을 막는다 (import 시 확인).
-PAIR_GROUP = 2
-assert ROW_GROUP % PAIR_GROUP == 0, "band 경계가 마스킹 페어를 쪼갤 수 있다"
+# 축 무관한 기하는 공유 코어가 소유한다 (2026-08-31 승격). 여기서 re-export하는
+# 것은 기존 import 경로(`moe.prism.plan.Tier` 등)를 살리기 위해서다 — 이 모듈의
+# 나머지(Proj, ModelDims, ExpertPlan, 파서)는 expert 축에 묶여 있어 안 올라갔다.
+from sglang.srt.layers.prism.geometry import (  # noqa: F401
+    COL_GROUP,
+    PAIR_GROUP,
+    ROW_GROUP,
+    BandSpec,
+    KernelSpec,
+    NumaShard,
+    PlanError,
+    Tier,
+)
 
 SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 # sparsity 블록이 등장할 수 있는 최소 schema_version
@@ -81,16 +76,6 @@ SPARSITY_SCHEMA_VERSION = 2
 # k2wl2 = 인접 페어의 실제 에너지(교차항 포함)이므로 wn(열 노름)과
 # pair_dot(인접열 내적)을 모두 요구한다.
 KNOWN_SPARSITY_SCORES = ("k2wl2",)
-
-
-class PlanError(ValueError):
-    """Plan 파싱/검증 실패. 전부 startup hard error다."""
-
-
-class Tier(str, Enum):
-    HOT = "hot"    # VRAM 상주, GPU 계산
-    WARM = "warm"  # pinned host 상주, step마다 선택 밴드만 GPU 전송, GPU 계산
-    COLD = "cold"  # pageable host(NUMA-local) 상주, CPU 계산
 
 
 class Proj(str, Enum):
@@ -165,24 +150,6 @@ class SparsitySpec:
 
 
 @dataclass(frozen=True)
-class BandSpec:
-    """K-축 반개구간 [start, end)와 그 티어. 경계는 페어(ROW_GROUP) 배수."""
-
-    start: int
-    end: int
-    tier: Tier
-
-
-@dataclass(frozen=True)
-class NumaShard:
-    """cold 출력의 N-축 반개구간 [n_start, n_end)를 담당하는 NUMA node."""
-
-    node: int
-    n_start: int
-    n_end: int
-
-
-@dataclass(frozen=True)
 class ExpertProjPlan:
     """한 (expert, proj)의 분할 기하. bands는 start 오름차순."""
 
@@ -210,17 +177,6 @@ class ExpertPlan:
 
     def proj(self, p: Proj) -> ExpertProjPlan:
         return {Proj.GATE: self.gate, Proj.UP: self.up, Proj.DOWN: self.down}[p]
-
-
-@dataclass(frozen=True)
-class KernelSpec:
-    """model-global 커널 선택. startup에 구현체로 resolve된 뒤 문자열은 소멸.
-
-    cold의 저장 형식(pack)은 cpu_cold 키가 함의한다 (별도 codec 없음).
-    """
-
-    gpu_warm: str
-    cpu_cold: str
 
 
 @dataclass(frozen=True)

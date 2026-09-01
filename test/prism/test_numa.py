@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from sglang.srt.layers.moe.prism.numa import (
+from sglang.srt.layers.prism.numa import (
     gpu_numa_node,
     numa_node_count,
     other_numa_node,
@@ -40,7 +40,7 @@ def test_other_numa_node():
 
 # ── 메모리 바인딩 ────────────────────────────────────────────────────────────
 
-from sglang.srt.layers.moe.prism.numa import (  # noqa: E402
+from sglang.srt.layers.prism.numa import (  # noqa: E402
     _libnuma,
     _MAXNODE,
     _MPOL_DEFAULT,

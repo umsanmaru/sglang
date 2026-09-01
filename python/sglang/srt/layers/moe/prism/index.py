@@ -43,13 +43,15 @@ from sglang.srt.layers.moe.prism.plan import (
     Tier,
 )
 
-# uint16 인덱스의 상한. K가 이보다 크면 dtype을 올려야 한다 — 조용히 wrap되면
-# 전혀 다른 행을 읽는 무증상 오답이므로 로드 시 즉사한다.
-MAX_K = (1 << 16) - 1
-
-# 인덱스는 uint16 (VRAM·L2 트래픽이 int32의 절반), 오프셋은 int32.
-IDX_DTYPE = torch.uint16
-OFF_DTYPE = torch.int32
+# 인덱스 dtype·상한·run 판정은 공유 코어가 소유한다 (2026-08-31 승격) — dense가
+# 같은 표현을 쓰므로 두 곳에 두면 드리프트가 곧 무증상 오답이다. 여기서 re-export
+# 하는 것은 기존 import 경로(`moe.prism.index.IDX_DTYPE`)를 살리기 위해서다.
+from sglang.srt.layers.prism.store import (  # noqa: F401
+    IDX_DTYPE,
+    MAX_K,
+    OFF_DTYPE,
+)
+from sglang.srt.layers.prism.store import is_row_run as _is_run  # noqa: F401
 
 
 @dataclass(frozen=True)
@@ -129,13 +131,6 @@ class TierIndex:
             idx=flat.to(IDX_DTYPE),
             contiguous=all(_is_run(r) for r in rows),
         )
-
-
-def _is_run(rows: torch.Tensor) -> bool:
-    """단위 stride 오름차순 구간인가 (길이 0/1은 참)."""
-    if int(rows.numel()) <= 1:
-        return True
-    return bool(torch.equal(rows[1:] - rows[:-1], torch.ones_like(rows[:-1])))
 
 
 @dataclass(frozen=True)
