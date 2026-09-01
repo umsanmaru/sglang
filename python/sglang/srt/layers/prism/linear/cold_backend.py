@@ -420,6 +420,25 @@ class KtLinearColdBackend:
             gu_rows = [align] * self._nodes
             dn_off, dn_rows = shard_off, shard_rows
 
+        # 더미의 하한 셋 (2026-09-01 실측 — 각각을 실제로 눌러봤다):
+        #
+        #   행 0 (슬롯 소멸)  → `no weight source`. 0원소 텐서의 `data_ptr()`가 0이라
+        #                       `moe.hpp:465`의 `config.gate_proj != nullptr` 분기가
+        #                       빠지고 throw로 떨어진다. **더미는 존재해야 한다.**
+        #   행 2 (타일 미만)  → `per-expert rows must be a multiple of K_STEP`.
+        #   N 2 (정렬 미만)   → **SEGFAULT.** 이건 예외가 아니라 조용한 죽음이라
+        #                       kt가 잡아주지 않는다 — 그래서 여기서 검사한다.
+        #
+        # 즉 더미를 이보다 줄이는 길은 kt 쪽 "선택적 proj 슬롯"뿐이고, 그 값어치는
+        # 실 형상에서 0.14 GB다 (TODO §3.3).
+        dummy_rows, dummy_n = tile, (dn_rows if key.entry == "gateup" else gu_rows)
+        if dummy_rows <= 0 or min(dummy_n) < align or any(r % align for r in dummy_n):
+            raise PlanError(
+                f"{key.label}: 더미 슬롯이 하한 아래다 (rows={dummy_rows}, "
+                f"node N={dummy_n}, align={align}) — kt는 이 경우 예외가 아니라 "
+                f"segfault로 죽는다"
+            )
+
         cfg = ext.moe.MOEConfig(E, TOP_K, hidden, inter, 0)
         cfg.max_len = self._max_tokens
         cfg.layer_idx = 0        # kt에서 로그 문자열 외에 쓰이지 않는다

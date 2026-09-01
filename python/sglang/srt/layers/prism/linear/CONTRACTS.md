@@ -168,11 +168,26 @@ down 매핑에서 `intermediate_size`는 **dense proj의 K**다. `mlp.down_proj`
 둘, **전부 쓰이지 않는다**. 퇴화 경로의 "+25 GB"는 여기서 나온 것이며 (RSS
 기준; VA 예약은 더 크다) 더미 행 자체는 무해하다.
 
-따라서 요구는 하나다:
+**더미의 하한은 셋이 정한다** (2026-09-01 실측 — 각각을 실제로 눌러봤다):
+
+| 줄이려 한 것 | 결과 |
+|---|---|
+| 행 0 (슬롯 소멸) | `no weight source` — 0원소 텐서의 `data_ptr()`가 0이라 `moe.hpp:465`의 `gate_proj != nullptr` 분기가 빠진다. **더미는 존재해야 한다** |
+| 행 2 (타일 미만) | `per-expert rows must be a multiple of K_STEP` |
+| 노드 N 2 (정렬 미만) | **SEGFAULT** — 예외가 아니라 조용한 죽음이다. kt가 안 잡으므로 `cold_backend._config`가 잡는다 |
+
+그래서 실제로 지불하는 최소는 `2 슬롯 × E × K_STEP 행 × (align × nodes) 열`이고,
+Qwen3.8 전체에서 풀 0.14 GB다. gateup 매핑에서는 더미가 `down`이고 그 N 총합이
+`hidden_size`(= 실제 K)로 고정이라 아예 못 깎는다 — 그쪽이 0.13 GB의 대부분이다.
+
+이보다 줄이는 유일한 길:
 
 > `PartialGeometry`의 각 proj에 **사용 여부**를 두고, 꺼진 proj의
 > 버퍼·slab·pack·weight-source 검사를 전부 건너뛴다. 기본값은 "셋 다 사용"이라
 > 기존 동작은 비트 동일하다 (`partial.enabled`가 이미 쓰는 침습성 상한 방식).
+
+**값어치는 0.14 GB이므로 지금은 안 한다.** 이 항목이 존재하는 이유는 메모리가
+아니라 어휘다 — `hidden`/`intermediate`가 실제와 무관한 값을 갖는 상태가 남는다.
 
 이것이 `DenseConfig` + `AMX_DENSE_TP<K>` 신설을 **대체한다**. 진입점도, 커널도,
 기하도, NUMA 분할도 그대로 쓴다.

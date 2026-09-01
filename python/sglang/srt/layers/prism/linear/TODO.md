@@ -140,9 +140,16 @@ down 매핑에서 `intermediate_size`는 **dense proj의 K**다. `mlp.down_proj`
 `experts_partial.py`의 세 텐서 필수 검사. **5개 지점, 150줄 규모의 가산적 변경**이다.
 1904줄 파일의 expert 축 분리가 아니다.
 
-없어도 갈 수 있다 (형상 그룹 병합만으로 인스턴스가 18개면 더미 풀도 18벌뿐이라
-수 GB VA / 수백 MB RSS다). 그래서 **C1은 블로커가 아니라 최적화**이고, 순서를
-뒤로 뺀다.
+없어도 갈 수 있다. **더미는 이미 하한이다** (2026-09-01 실측):
+
+| 줄이려 한 것 | 결과 |
+|---|---|
+| 행 0 (슬롯 소멸) | `no weight source` — 0원소 텐서의 `data_ptr()`가 0이라 `moe.hpp:465`의 `gate_proj != nullptr` 분기가 빠진다 |
+| 행 2 (타일 미만) | `per-expert rows must be a multiple of K_STEP` |
+| 노드 N 2 (정렬 미만) | **SEGFAULT** — 예외가 아니라 조용한 죽음. `cold_backend._config`가 대신 잡는다 |
+
+최소 더미 = `2 슬롯 × E × K_STEP 행 × (align × nodes) 열` → 전체 0.14 GB.
+그래서 **C1은 블로커가 아니라 최적화**이고, 순서를 뒤로 뺀다.
 
 ### 3.3 단계와 게이트 (2026-09-01 구현)
 
