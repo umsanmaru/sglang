@@ -50,6 +50,10 @@ class _LayerProj:
     tiers: Mapping[Tier, tuple]
     # 그 티어를 **모든** 조각이 쓰는가 (아니면 버퍼를 0으로)
     writes_all: Mapping[Tier, bool]
+    # cold 호출들 (finalize에서 채워진다). unit 하나가 호출 하나다.
+    cold_calls: tuple = ()
+    # cold 호출들이 [0, n)을 전부 덮는가 (아니면 버퍼를 0으로)
+    cold_writes_all: bool = False
 
 
 class LinearExecutor:
@@ -69,7 +73,15 @@ class LinearExecutor:
     GROUPED_MIN_M = 16
 
     def __init__(self, *, max_tokens: int = 4096, device: Optional[torch.device] = None,
-                 grouped_min_m: Optional[int] = None):
+                 grouped_min_m: Optional[int] = None, cold=None, resources=None):
+        # cold: KtLinearColdBackend | None  /  resources: LinearColdResources | None.
+        # 둘은 짝이다 — 백엔드가 있으면 staging의 소유자도 있어야 한다 (계약 ④:
+        # primitive는 영구 메모리를 할당하지 않는다).
+        if (cold is None) != (resources is None):
+            raise ValueError("cold backend and resources must be given together")
+        self._cold = cold
+        self._res = resources
+        self._finalized = False
         self._projs: dict[tuple, _LayerProj] = {}
         self._max_tokens = int(max_tokens)
         self._device = device
@@ -90,17 +102,24 @@ class LinearExecutor:
         key = (layer_idx, name)
         if key in self._projs:
             raise RuntimeError(f"{key} already registered")
-        if any(p.cold is not None for p in prepared.parts):
+        has_cold = any(p.cold is not None for p in prepared.parts)
+        if has_cold and self._cold is None:
             raise NotImplementedError(
-                f"layer {layer_idx} proj '{name}': COLD rows are not wired yet — "
-                f"cold backend가 붙기 전까지 cold 밴드가 없는 plan만 실행할 수 있다"
+                f"layer {layer_idx} proj '{name}': plan에 COLD 행이 있는데 cold "
+                f"백엔드가 없다 — 조용히 그 행을 빼고 계산하면 **결과가 틀리는데** "
+                f"서버는 정상으로 보인다"
             )
+        if has_cold:
+            self._cold.register(layer_idx, name, prepared)
         per_tier: dict[Tier, list] = {}
         for part in prepared.parts:
             for tier, adapter in build_part_tiers(part, specs).items():
                 per_tier.setdefault(tier, []).append(adapter)
-        if not per_tier:
-            raise PlanError(f"layer {layer_idx} proj '{name}': no GPU tier rows")
+        if not per_tier and not has_cold:
+            raise PlanError(
+                f"layer {layer_idx} proj '{name}': 어느 티어에도 행이 없다 — "
+                f"plan의 밴드가 [0, k)를 덮지 않았다"
+            )
         n_parts = len(prepared.parts)
         self._projs[key] = _LayerProj(
             prepared=prepared,
@@ -110,6 +129,42 @@ class LinearExecutor:
 
     def registered(self) -> frozenset:
         return frozenset(self._projs)
+
+    # ── finalize (첫 step 직전 1회) ───────────────────────────────────────
+    def finalize(self) -> None:
+        """cold 그룹을 굳히고 pack한다. 등록이 전부 끝난 뒤여야 한다.
+
+        layer마다 즉시 pack할 수 없는 이유는 **그룹의 expert 수**다: 형상 그룹은
+        전 layer의 unit을 모은 것이고, 어느 layer가 어떤 projection을 갖는지는
+        plan만으로 알 수 없다 (Qwen3.8은 `self_attn.qkv_proj`가 64층 중 16층에만
+        있다 — `method.check_coverage`가 좌표가 아니라 이름으로 세는 것과 같은
+        이유다).
+
+        대가는 이 시점까지 cold weight 전량이 host RAM에 떠 있다는 것이고, 끝나면
+        소유권이 C++로 넘어가 여기 참조를 놓는다 (계약 ③).
+        """
+        if self._finalized or self._cold is None:
+            self._finalized = True
+            return
+        self._finalized = True
+        self._cold.finalize()
+        for group in self._cold.groups():
+            self._res.attach(group)
+        for (layer_idx, name), st in self._projs.items():
+            calls = self._cold.calls(layer_idx, name)
+            if not calls:
+                continue
+            covered = sum(c.n_cols for c in calls)
+            if covered > st.prepared.n:
+                raise PlanError(
+                    f"layer {layer_idx} proj '{name}': cold 호출이 {covered}열을 "
+                    f"쓰는데 proj는 {st.prepared.n}열이다"
+                )
+            st.cold_calls = calls
+            st.cold_writes_all = covered == st.prepared.n
+            # full 텐서 소멸 (계약 ③) — pack이 끝났으니 host 사본을 놓는다.
+            for part in st.prepared.parts:
+                part.cold = None
 
     def warmup(self, device) -> None:
         """지연 할당을 startup으로 앞당긴다 (캡처 안에서 처음 잡히면 graph pool에 들어간다).
@@ -171,6 +226,23 @@ class LinearExecutor:
         grouping = self._grouping(m, x.device) if (
             m >= self._grouped_min_m and not masking) else None
 
+        # ── cold submit — GPU보다 **먼저** enqueue한다 ───────────────────
+        # 순서가 곧 겹침이다: x D2H → kt submit host node → (GPU 티어 커널) →
+        # kt sync host node. submit host node는 CPU task를 큐에 넣고 즉시 돌아오므로
+        # 그 사이의 GPU 커널이 CPU 계산과 병렬로 돈다. sync를 앞으로 당기면 그
+        # 병렬성이 통째로 사라진다 (계약 ④: submit은 enqueue-only).
+        stream = torch.cuda.current_stream().cuda_stream if st.cold_calls else 0
+        if st.cold_calls:
+            capture = torch.cuda.is_current_stream_capturing()
+            qlen_ptr = self._res.qlen_ptr(m, capture=capture)
+            for call in st.cold_calls:
+                staging = call.group.staging
+                # 같은 proj의 두 그룹(qkv의 q와 k|v)은 같은 x를 각자 받는다 —
+                # 그룹마다 pinned 버퍼가 따로라 D2H가 두 번이다. decode에서 10 KB다.
+                staging.fill_x(x, non_blocking=True)
+                self._cold.submit(call, qlen_ptr=qlen_ptr, x_ptr=staging.x_ptr(),
+                                  out_ptr=staging.out_ptr(), cuda_stream=stream)
+
         parts = []
         for tier, adapters in st.tiers.items():
             alloc = torch.empty if st.writes_all[tier] else torch.zeros
@@ -178,4 +250,18 @@ class LinearExecutor:
             for adapter in adapters:
                 adapter.run(x, ids, ones, buf, masking=masking, grouping=grouping)
             parts.append(buf.view(m, prep.n))
+
+        # ── cold sync → H2D ──────────────────────────────────────────────
+        # 열 매핑이 복사에 흡수된다: kt는 자기 unit의 열만 담은 pinned 버퍼를 주고,
+        # 목적지가 out3d의 `[n_start, n_start + n_cols)` 슬라이스다. gateup unit은
+        # out이 곧 `[gate 열 | up 열]`이라 그 슬라이스가 연속이다 — 그래서 rejoin은
+        # cold를 특별히 알지 않아도 된다.
+        if st.cold_calls:
+            self._cold.sync(stream)
+            alloc = torch.empty if st.cold_writes_all else torch.zeros
+            buf = alloc(m, prep.n, dtype=torch.bfloat16, device=x.device)
+            for call in st.cold_calls:
+                buf[:, call.n_start:call.n_start + call.n_cols].copy_(
+                    call.group.staging.out_view(m), non_blocking=True)
+            parts.append(buf)
         return rejoin(parts)

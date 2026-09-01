@@ -164,8 +164,11 @@ def test_split_zeroes_columns_a_tier_does_not_write():
 
 
 def test_cold_rows_are_rejected(w):
-    """cold가 배선되기 전에 cold plan을 주면 즉사 — 조용히 그 행을 빼면 값이 틀린다."""
-    with pytest.raises(NotImplementedError, match="COLD rows are not wired"):
+    """cold 백엔드 없이 cold plan을 주면 즉사 — 조용히 그 행을 빼면 값이 틀린다.
+
+    백엔드가 붙은 경로는 `test_linear_cold.py`가 본다.
+    """
+    with pytest.raises(NotImplementedError, match="cold 백엔드가 없다"):
         _fit({"p": {"k": K, "n": N, "bands": [[0, 128, "hot"], [128, K, "cold"]],
                     "cold_shards": [[0, 0, N]]}}, {"p": w})
 

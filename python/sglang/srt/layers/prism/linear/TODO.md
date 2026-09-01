@@ -144,21 +144,58 @@ down 매핑에서 `intermediate_size`는 **dense proj의 K**다. `mlp.down_proj`
 수 GB VA / 수백 MB RSS다). 그래서 **C1은 블로커가 아니라 최적화**이고, 순서를
 뒤로 뺀다.
 
-### 3.3 단계와 게이트 (개정)
+### 3.3 단계와 게이트 (2026-09-01 구현)
 
-| 단계 | 작업 | 게이트 |
+| 단계 | 작업 | 상태 |
 |---|---|---|
-| **D0** | `cold_backend.py` — 슬롯 테이블(형상 그룹 도출, 슬롯→(instance, expert) 매핑), Plan→`MOEConfig` 번역, 인스턴스 수명 | 형상 그룹 도출이 plan에서 결정적. 그룹 내 (K, N, 커널) 동일 검증 |
-| **D1** | `resources.py` — pinned staging (x/act/out/qlen, **정적 expert_ids**) | 생성 후 재할당 없음 (계약 ④) |
-| **D2** | `weights.py` — 슬롯 cold 텐서를 그룹별 flat으로 이어붙이기 + `row_off` | wrapper의 `N × Σₑ k(e)` 원소 수 불변식 통과 |
-| **D3** | ~~`rejoin.py`~~ **불필요** — cold pinned out을 executor가 `out3d[:, 0, n_start:n_end]`로 H2D하면 열 매핑이 복사에 흡수된다. gateup 매핑은 out이 곧 `[M, N_total]`이라 연속 복사 1회 | — |
-| **D4** | `executor.py` — submit ∥ GPU → sync → H2D → rejoin, cold 거부 해제 | **계약 ⑤-5**: 무작위 순열 인덱스에서 `all_hot == all_warm == all_cold == 혼합` 비트일치 |
-| **D5** | 실모델 (Qwen3.8-27B) | 0.39 s/tok 근처 (§2 벤치가 기준선), 1.05 s/tok 대비 개선 |
-| **D6** | *(선택)* kt 선택적 proj 슬롯 | 더미 풀 소멸, 기존 MoE 경로 비트 동일 |
+| **D0** | `cold_backend.py` — 형상 그룹 도출, Plan→`MOEConfig` 번역, 인스턴스 수명 | ✅ 531줄 |
+| **D1** | `resources.py` — pinned staging (x/out/정적 expert_ids/bs별 qlen) | ✅ |
+| **D2** | 그룹 flat 조립 + `row_off` (`_concat_cold`/`_set_kindex`) | ✅ |
+| **D3** | ~~`rejoin.py`~~ **불필요** — H2D 목적지를 `out3d[:, n_start:+n_cols]`로 잡으면 열 매핑이 복사에 흡수된다. gateup unit은 out이 곧 `[gate 열 \| up 열]`이라 연속 복사 1회 | ✅ |
+| **D4** | `executor.py` — submit ∥ GPU → sync → H2D → rejoin, cold 거부 해제 | ✅ |
+| **D5** | `method.py` — 백엔드 생성 + 첫 step finalize | ✅ |
+| **D6** | 실모델 (Qwen3.8-27B) | ⬜ **다음** |
+| **D7** | *(선택)* kt 선택적 proj 슬롯 | ⬜ 이제 불필요에 가깝다 (아래) |
 
-**최대 리스크가 바뀌었다.** C0(C++ 견적)이 아니라 **D0의 형상 그룹 도출**이다:
-슬롯을 잘못 묶으면(N이 다른데 같은 인스턴스에) kt가 즉사하지 않고 **엉뚱한 열에
-쓴다**. `CONTRACTS.md` ②-4의 불변식 8개를 D0에서 전부 로드 타임 검사로 박는다.
+**게이트 결과** (`test/prism/test_linear_cold.py`, 9개 통과):
+
+- **계약 ⑤-5 비트일치** — `(hot, warm) ∈ {(1,0), (0,1), (0,0), (.25,.25), (.5,.25)}`
+  다섯 배치에서 출력이 **비트일치**한다. 정확히 표현 가능한 입력(±1 8개 × 정수
+  weight)이라 bf16 라운딩이 무손실이고, 그래서 이중계산·누락·좌표 뒤섞임이
+  tolerance 뒤에 숨지 못한다.
+  ⚠ dense에는 인덱스 자산이 없어 티어 멤버십이 늘 연속 밴드의 합집합이다 —
+  MoE 계약 ⑤-5가 요구하는 **무작위 순열 인덱스** 픽스처는 dense가 인덱스 자산을
+  갖게 될 때 함께 온다. 지금 잡는 것은 밴드 경계 이동까지다.
+- 혼합 plan == 단일 GEMM 레퍼런스 (비트일치).
+- 두 layer가 한 인스턴스로 접히고 gateup unit의 out이 `[gate | up]` 순서다.
+
+**실 형상 (Qwen3.8-27B, hot10/warm15/cold75, 2 NUMA):**
+
+```
+cold 슬롯 352개  →  형상 그룹 6개  →  C++ 객체 12개
+  gateup(K=5120,  N=17408) E=64   mlp.gate_up_proj      (gate|up 한 unit)
+  down  (K=17408, N=5120)  E=64   mlp.down_proj
+  down  (K=6144,  N=5120)  E=64   self_attn.o_proj + linear_attn.out_proj  ← 형상이 같아 합쳐진다
+  down  (K=5120,  N=16384) E=48   linear_attn.in_proj_qkvz
+  down  (K=5120,  N=12288) E=16   self_attn.qkv_proj q
+  gateup(K=5120,  N=1024)  E=16   self_attn.qkv_proj k|v                   ← 인접 + N 동일
+
+kt 풀 (init()의 식으로 산정, 전 노드 합)
+  형상 그룹 + 더미 최소화     1.6 GB   (그중 더미 0.14 GB)
+  슬롯당 인스턴스 + 더미가 실제 K를 물려받음   87.3 GB
+```
+
+§2가 잰 "+25 GB"는 RSS(만져진 페이지)였고 위는 예약 기준이라 숫자가 다르다.
+방향은 같다: **더미의 C 풀이 전부였고, 노드 테이블로 깎으니 0.14 GB가 됐다.**
+
+그래서 **D7(kt 선택적 proj 슬롯)은 사실상 불필요해졌다.** 남은 더미 비용은
+gateup 그룹의 down_bc뿐이고(그 축은 `hidden_size`에 묶여 못 깎는다) 0.13 GB다.
+
+**설계 메모 — 검사가 아니라 구성으로 집행한다.** `GroupKey`가
+`(entry, K, N, kernel, shards)` 전부를 담으므로 "그룹 안에서 이것들이 같은가"는
+검사할 것이 아니라 참이다. 다르면 오류가 아니라 **다른 인스턴스**가 된다. 처음엔
+이것을 `if`로도 썼는데 절대 참이 되지 않는 죽은 검사였고, 테스트가 잡았다
+(`test_mismatched_shards_split_into_two_groups`가 지금 그 설계를 지킨다).
 
 ### 3.4 폐기 — 초판 §3.4의 우회
 

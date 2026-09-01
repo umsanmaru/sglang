@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 _ENV_PLAN = "SGLANG_PRISM_LINEAR_PLAN"
 _ENV_MAX_TOKENS = "SGLANG_PRISM_LINEAR_MAX_TOKENS"
+# cold CPU 스레드 수. 벤치는 28이 최적이었지만(물리 16코어 = 8×2소켓; 14→28은 7%
+# 개선, 56은 9배 악화) 실서버는 GPU 스트림·스케줄러와 경합하므로 재측정 대상이다.
+_ENV_COLD_THREADS = "SGLANG_PRISM_LINEAR_COLD_THREADS"
 
 # 래핑이 **로더 선택을 바꾸는** 메서드들. `ColumnParallelLinear.__init__`이
 # `self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED`로 v1/v2
@@ -82,9 +85,41 @@ class _LinearRuntime:
             warmup_rejoin(device)
             for tag in {pp.kernels.gpu_warm for pp in self.plan.projs.values()}:
                 FORMATS[gpu_store_format_tag(tag)].warmup()
-            self._executor = LinearExecutor(max_tokens=self.max_tokens, device=device)
+            cold, resources = self._cold_backend()
+            self._executor = LinearExecutor(max_tokens=self.max_tokens, device=device,
+                                            cold=cold, resources=resources)
             self._executor.warmup(device)
+            if resources is not None:
+                resources.warmup()
         return self._executor
+
+    def _cold_backend(self):
+        """plan에 COLD 행이 있을 때만 만든다. 없으면 kt를 import조차 하지 않는다."""
+        if not any(pp.has_tier(Tier.COLD) for pp in self.plan.projs.values()):
+            return None, None
+        from sglang.srt.layers.prism.linear.cold_backend import KtLinearColdBackend
+        from sglang.srt.layers.prism.linear.resources import LinearColdResources
+        from sglang.srt.layers.prism.numa import numa_node_count
+
+        nodes = numa_node_count()
+        threads = int(os.environ.get(_ENV_COLD_THREADS, "28"))
+        logger.info("[prism-linear] cold backend: %d NUMA nodes, %d CPUInfer threads",
+                    nodes, threads)
+        return (
+            KtLinearColdBackend(self.plan, max_tokens=self.max_tokens,
+                                num_numa_nodes=nodes, cpuinfer_threads=threads),
+            LinearColdResources(max_tokens=self.max_tokens),
+        )
+
+    def finalize(self) -> None:
+        """cold 그룹을 굳히고 pack한다 (첫 step 1회).
+
+        로딩 중에 못 하는 이유는 그룹의 expert 수다 — `check_coverage`가 좌표가
+        아니라 이름으로 세는 것과 같은 이유로, 어느 layer가 어떤 projection을
+        갖는지는 plan만으로 알 수 없다.
+        """
+        if self._executor is not None:
+            self._executor.finalize()
 
     def check_coverage(self) -> None:
         """plan의 proj 이름이 **하나라도** 걸렸는가 (첫 step에서 1회).
@@ -241,6 +276,7 @@ class PrismLinearMethod:
                 f"layer {self.layer_idx} proj '{self.name}': prism dense does not "
                 f"support the pre-allocated-output call form"
             )
+        rt.finalize()
         rt.check_coverage()
         shape = x.shape
         x2d = x if x.dim() == 2 else x.view(-1, shape[-1])
