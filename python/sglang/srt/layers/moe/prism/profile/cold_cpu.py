@@ -304,20 +304,28 @@ def cold_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, iters: int = 100,
                      replays: int = 8, mask_pattern: str = "random",
                      numa_split: float = 0.5, threads: Optional[int] = None,
                      cpu_kernel: Optional[str] = None, dtype: str = "bf16", seed: int = 0,
-                     numa_map: Optional[Sequence[int]] = None) -> SparseGemv:
+                     numa_map: Optional[Sequence[int]] = None,
+                     experts: int = 1, topk: int = 1) -> SparseGemv:
     """[k, n] weight 하나의 cold sparse GEMV — shape과 sparsity만 받는다. CUDA 불필요.
 
-        cold_sparse_gemv(1792, 768, 0.9).us
+        cold_sparse_gemv(1792, 768, 0.9).us                       # 접힌 형태 (상한)
+        cold_sparse_gemv(1792, 768, 0.9, experts=128, topk=8).us   # 실제 풀·활성 수
 
-    `warm_sparse_gemv`의 CPU 짝이다: expert/top_k를 1로 접고 kt의 동기 진입점
-    `forward_gateup_partial`을 부른다 (`cold_backend`가 부르는 그 경로). s → thr →
-    점수 → 마스크 → masked GEMV가 전부 C++ 안에서 끝난다.
+    `warm_sparse_gemv`의 CPU 짝이다: kt의 동기 진입점 `forward_gateup_partial`을
+    부른다 (`cold_backend`가 부르는 그 경로). s → thr → 점수 → 마스크 → masked
+    GEMV가 전부 C++ 안에서 끝난다.
+
+    `experts`/`topk`가 기본값(1, 1)이면 expert 풀과 활성 수를 1로 **접은** 커널
+    상한이다. 한 번의 `forward_gateup`이 도는 GEMV 수는 `topk × 2`다 (활성
+    expert마다 gate와 up) — 그래서 접힌 형태는 2개, `topk=8`이면 16개다.
 
     **주의 — 이 축약은 warm보다 cold에 훨씬 위험하다.** cold 비용에는 **활성
     expert당 ~3.9 µs** 항이 있어서(버퍼 carve + BufferA pack + pair mask + plan
     인코딩) top_k를 8에서 1로 접으면 그만큼이 사라진다. 실측: 같은 바이트에서
-    cold gateup이 260.7 → 36.4 µs였다 (kt eb780a4 이전 측정). 커널 상한을 볼 때만
-    쓰고, 티어 비용은 `ColdCpuProfiler`/`WarmColdProfiler`로 잰다.
+    cold gateup이 260.7 → 36.4 µs였다 (kt eb780a4 이전 측정). **그래서 접힌 값을
+    `topk × 2`로 나눠 활성 expert 수만큼 선형 확장하면 그 고정비가 통째로 빠진다**
+    — 그 확장을 하려거든 `topk`를 실제 값으로 주고 재라. `experts`도 함께 키워야
+    한다: 풀이 1이면 iteration마다 같은 W가 L3에 남아 낙관적인 값이 나온다.
 
     `n`은 커널의 N 정렬을 지켜야 한다 — tile_k2는 노드당 256의 배수를 요구하므로
     작은 `n`은 `cpu_kernel="kt_amx_bf16"`(32) 또는 `numa_map=[0]`을 쓴다.
@@ -325,7 +333,9 @@ def cold_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, iters: int = 100,
     store = store_of(dtype)
     if k % store.rows_step():
         raise ValueError(f"{store.name}: k must be a multiple of {store.rows_step()}, got {k}")
-    shape = Shape(experts=1, topk=1, hidden=k, inter=n)
+    if topk > experts:
+        raise ValueError(f"topk {topk} > experts {experts} (풀에서 중복 없이 뽑는다)")
+    shape = Shape(experts=experts, topk=topk, hidden=k, inter=n)
     with ColdCpuProfiler(shape, cold_frac=1.0, sparsity=sparsity, proj="gateup",
                          mask_pattern=mask_pattern, numa_split=numa_split,
                          threads=threads, cpu_kernel=cpu_kernel, dtype=store,
@@ -334,6 +344,7 @@ def cold_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, iters: int = 100,
         rows = prof.node_gateup_rows   # proj="gateup" 고정
     return SparseGemv(where="cold", k_rows=k, n_cols=n, sparsity=sparsity,
                       keep_frac=rep.keep_frac,
-                      dense_bytes=store.store_bytes(1, k, n),
+                      # 한 호출이 읽는 weight 수 = topk × 2 (활성 expert의 gate + up).
+                      dense_bytes=store.store_bytes(2 * topk, k, n),
                       timing=rep.timing, numa_split=numa_split,
                       node_rows=rows)

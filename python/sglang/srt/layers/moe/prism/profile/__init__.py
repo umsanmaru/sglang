@@ -81,6 +81,16 @@ from sglang.srt.layers.moe.prism.profile.cold_cpu import (
     cold_cpu_sweep,
     cold_sparse_gemv,
 )
+from sglang.srt.layers.moe.prism.profile.full_layer import (
+    FullLayerProfiler,
+    GpuTier,
+    L2Flush,
+    LayerGroupReport,
+    ProjSplit,
+    build_splits,
+    compare,
+    planner_model,
+)
 from sglang.srt.layers.moe.prism.profile.common import (
     GRID,
     K_STEP,
@@ -105,10 +115,14 @@ from sglang.srt.layers.moe.prism.profile.common import (
     numa_nodes,
     nvtx,
     select_device,
+    per_expert,
     sparse_tables,
     split_rows,
+    split_rows_varied,
+    spread_values,
     store_of,
     tier_index,
+    tier_indices,
 )
 from sglang.srt.layers.moe.prism.profile.hot import (
     HotGemvReport,
@@ -138,15 +152,18 @@ from sglang.srt.layers.moe.prism.profile.warm_cold import (
 __all__ = [
     # shape / 결과 타입
     "Shape", "Timing", "ProjGemv", "HotGemvReport", "GroupReport", "Split",
-    "ColdCpuReport", "SparseGemv", "Store",
+    "ColdCpuReport", "SparseGemv", "Store", "LayerGroupReport", "ProjSplit",
     # 측정 진입점
     "hot_dense_gemv", "measure_proj", "measure_gateup", "dense_gemv",
     "WarmColdProfiler", "warm_cold_sparse", "single_expert_warm_cold",
     "ColdCpuProfiler", "cold_cpu", "cold_cpu_sweep",
     "warm_sparse_gemv", "cold_sparse_gemv",
+    "FullLayerProfiler", "compare", "planner_model",
     # 구성 요소 (직접 조립할 때)
     "WarmTier", "ColdTier", "make_split", "footprint", "node_table",
-    "sparse_tables", "tier_index", "split_rows",
+    "GpuTier", "L2Flush", "build_splits",
+    "sparse_tables", "tier_index", "tier_indices", "split_rows",
+    "split_rows_varied", "spread_values", "per_expert",
     "graph_timing", "host_timing", "nvtx",
     # 헬퍼 / 상수
     "emit", "env_stamp", "gbps", "select_device", "numa_nodes",

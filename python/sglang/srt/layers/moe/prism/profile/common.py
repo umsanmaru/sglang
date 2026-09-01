@@ -152,13 +152,19 @@ class Store:
         w.normal_(0, 0.02, generator=g)
         return (w, None)
 
-    def gpu_store(self, experts: int, k_rows: int, n: int, *, device=None,
+    def gpu_store(self, experts: int, k_rows, n: int, *, device=None,
                   node: Optional[int] = None, seed: int = 0) -> tuple:
         """hot(device) 또는 warm(pinned) 스토어 인자 — `fmt.store_args`와 같은 순서.
 
+        `k_rows`는 스칼라(균일) 또는 expert당 하나의 시퀀스다 — 스토어가
+        [Σₑ k(e), N]이므로 가변 행 수는 총합만 바뀌는 것이고, 어디서 어디까지가
+        어느 expert인지는 `row_off`가 말한다 (`tier_indices`가 같이 만든다).
+
         `node`를 주면 pinned + NUMA 바인딩(warm), 아니면 device 상주(hot)다."""
-        self.check_geometry(k_rows, n)
-        parts = self._codes_scales(experts * k_rows, n, seed)
+        rows = per_expert(k_rows, experts, "k_rows")
+        for ke in rows:
+            self.check_geometry(int(ke), n)
+        parts = self._codes_scales(sum(int(k) for k in rows), n, seed)
         out = []
         for t in parts:
             if t is None:
@@ -174,9 +180,23 @@ class Store:
                 out.append(t.to(device) if device is not None else t)
         return tuple(out)
 
-    def cold_store(self, experts: int, n: int, k: int, *, seed: int = 0) -> tuple:
-        """kt 주입용 (w_flat, scale_flat|None) — expert 블록이 ckpt 방향 [N, k]인 1-D flat
-        (weights.py `cold_flat`과 같은 레이아웃)."""
+    def cold_store(self, experts: int, n: int, k, *, seed: int = 0) -> tuple:
+        """kt 주입용 (w_flat, scale_flat|None) — expert 블록이 ckpt 방향 [N, k(e)]인 1-D flat
+        (weights.py `cold_flat`과 같은 레이아웃).
+
+        `k`가 시퀀스면 expert마다 행 수가 다른 형태다. kt는 이 형태를 정식으로
+        받는다 — 검증이 shape가 아니라 `N × Σₑ k(e)` 원소 수 기준이다
+        (`experts_partial._k_total`).
+        """
+        rows = [int(x) for x in per_expert(k, experts, "k")]
+        if len(set(rows)) > 1:
+            parts = [self.cold_store(1, n, ke, seed=seed + e)
+                     for e, ke in enumerate(rows)]
+            w = torch.cat([p[0] for p in parts]).contiguous()
+            s = (None if parts[0][1] is None
+                 else torch.cat([p[1] for p in parts]).contiguous())
+            return w, s
+        k = rows[0]
         self.check_geometry(k, n)
         g = torch.Generator().manual_seed(seed)
         if self.name == "bf16":
@@ -206,13 +226,15 @@ class Store:
         if self.name == "fp8" and n % 128:
             raise ValueError(f"fp8: n {n} must be a multiple of 128 (배율 블록의 N축)")
 
-    def store_bytes(self, experts: int, k_rows: int, n: int) -> int:
-        """스토어 전체 바이트 (코드 + 배율)."""
-        base = experts * k_rows * n * self.elem_bytes
+    def store_bytes(self, experts: int, k_rows, n: int) -> int:
+        """스토어 전체 바이트 (코드 + 배율). `k_rows`는 스칼라 또는 expert별 시퀀스."""
+        rows = [int(k) for k in per_expert(k_rows, experts, "k_rows")]
+        total = sum(rows)
+        base = total * n * self.elem_bytes
         if self.name == "mxfp4":
-            base += experts * (k_rows // 32) * n
+            base += sum(k // 32 for k in rows) * n
         elif self.name == "fp8":
-            base += experts * (k_rows // 128) * max(1, n // 128) * 4
+            base += sum(k // 128 for k in rows) * max(1, n // 128) * 4
         return int(base)
 
     def call(self, fn, args: tuple, *, vec: int = 0) -> None:
@@ -292,6 +314,89 @@ def split_rows(k_axis: int, frac: float, *, step: int = K_STEP) -> int:
     return max(step, min(k_axis, rows))
 
 
+def per_expert(value, experts: int, name: str) -> tuple:
+    """스칼라 → E개 반복, 시퀀스 → 길이 검증 후 그대로.
+
+    "expert마다 다르게"를 받는 인자는 전부 이걸 통과한다 — 균일 구성이 특수한
+    경우일 뿐 별도 경로가 아니게 하려는 것이다.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return (value,) * experts
+    vals = tuple(value)
+    if len(vals) != experts:
+        raise ValueError(f"{name}: expert마다 하나씩 필요하다 — {experts}개 기대, {len(vals)}개 받음")
+    return vals
+
+
+def spread_values(mean: float, experts: int, *, spread: float,
+                  seed: int = 0, lo: float = 0.0, hi: float = 1.0) -> tuple:
+    """평균이 **정확히** `mean`인 expert별 값 — [mean-spread, mean+spread]에서 뽑는다.
+
+    대칭 쌍(antithetic)으로 뽑는다: 짝수 번째에 `mean-d`, 홀수 번째에 `mean+d`를
+    주면 쌍마다 평균이 보존되므로 시드·E와 무관하게 총평균이 흔들리지 않는다.
+    (독립 표본이면 E가 작을 때 표본평균이 목표에서 벗어나 "평균 0.5를 줬는데
+    실현값은 0.47"이 되고, 그러면 모델 대비 오차에 그 편차가 섞인다.)
+    E가 홀수면 마지막 하나가 정확히 `mean`이다.
+    """
+    if spread < 0:
+        raise ValueError(f"spread must be >= 0, got {spread}")
+    if not lo <= mean <= hi:
+        raise ValueError(f"mean {mean} out of [{lo}, {hi}]")
+    if mean - spread < lo or mean + spread > hi:
+        raise ValueError(f"mean {mean} ± {spread} escapes [{lo}, {hi}]")
+    g = torch.Generator().manual_seed(seed)
+    out = []
+    for _ in range(experts // 2):
+        d = float(torch.rand(1, generator=g)) * spread
+        out += [mean - d, mean + d]
+    if experts % 2:
+        out.append(mean)
+    # 쌍을 섞는다 — 안 섞으면 짝수 expert가 항상 평균 이하, 홀수가 항상 평균
+    # 이상이 되어 두 번 부른 결과(행 수와 sparsity)가 구조적으로 **역상관**한다.
+    # 실측으로 드러난 문제다: 행 많은 expert에 늘 높은 sparsity가 붙어 페어 가중
+    # keep이 0.5 요청에 0.466으로 나왔다. 순열은 평균을 보존한다.
+    perm = torch.randperm(experts, generator=g).tolist()
+    return tuple(out[i] for i in perm)
+
+
+def split_rows_varied(k_axis: int, frac: float, experts: int, *,
+                      spread: float = 0.0, step: int = K_STEP,
+                      seed: int = 0) -> tuple:
+    """expert마다 다른 티어 행 수 [E] — 평균 비율이 `frac`, 각각 `step`의 배수.
+
+    실제 plan의 티어 경계는 expert마다 다르다 (중요도 곡선이 expert마다 다르므로).
+    `spread=0`이면 전부 같은 값이라 `split_rows`와 같다.
+
+    **반올림이 평균을 흔든다**: 비율은 정확히 대칭으로 뽑지만 각 값을 `step`
+    배수로 반올림하므로 실현 평균은 요청과 조금 다르다. 호출부는 실현값을
+    리포트에 남겨야 한다 (`sum(rows) / (experts * k_axis)`).
+    """
+    fracs = spread_values(frac, experts, spread=spread, seed=seed)
+    return tuple(split_rows(k_axis, f, step=step) for f in fracs)
+
+
+def tier_indices(k_axis: int, rows, experts: int, *, skip=0,
+                 shuffle: bool = False, seed: int = 0) -> tuple:
+    """expert별 K-인덱스를 이어붙인 (k_index [Σₑ k(e)] int32, row_off [E+1] int32).
+
+    `rows`와 `skip`은 스칼라(균일) 또는 expert당 하나의 시퀀스다. expert마다
+    **다른** 순열을 쓴다 (`seed + e`) — 실제 plan에서 어느 행이 어느 티어에
+    가는지는 expert마다 다르고, 같은 인덱스를 돌려 쓰면 gather 패턴이 실제보다
+    규칙적이 된다.
+
+    세 티어를 서로소로 만들려면 같은 `seed`로 세 번 부르고 `skip`을 누적해서
+    준다 — expert e의 순열 하나에서 앞을 hot, 그 다음을 warm, 그 다음을 cold가
+    갖는다 (`skip`이 expert마다 다른 이유: 앞 티어의 행 수가 expert마다 다르다).
+    """
+    per = per_expert(rows, experts, "rows")
+    skips = per_expert(skip, experts, "skip")
+    parts = [tier_index(k_axis, int(k), skip=int(s), shuffle=shuffle, seed=seed + e)
+             for e, (k, s) in enumerate(zip(per, skips))]
+    off = torch.zeros(experts + 1, dtype=torch.int32)
+    off[1:] = torch.tensor(per, dtype=torch.int32).cumsum(0)
+    return torch.cat(parts).contiguous(), off.contiguous()
+
+
 def tier_index(k_axis: int, k_rows: int, *, skip: int = 0,
                shuffle: bool = False, seed: int = 0) -> torch.Tensor:
     """이 티어가 소유하는 K축 행 번호 [k_rows] int32.
@@ -311,41 +416,54 @@ def tier_index(k_axis: int, k_rows: int, *, skip: int = 0,
 
 
 # ─── sparsity 합성 ─────────────────────────────────────────────────────────
-def sparse_tables(experts: int, k_rows: int, sparsity: float, *,
+def sparse_tables(experts: int, k_rows, sparsity, *,
                   pattern: str = "random", seed: int = 0,
                   ng: int = NG, thr: float = THR_CONST):
     """요청 sparsity를 정확히 실현하는 (a, c, thr_tab, 실현 keep 비율).
 
-    a: fp32 [E·k_rows] — wn². c: fp32 [E·k_rows/2] — 0. thr_tab: fp32 [E, ng].
+    a: fp32 [Σₑ k(e)] — wn². c: fp32 [Σₑ k(e)/2] — 0. thr_tab: fp32 [E, ng].
     모두 weight 스토어와 같은 오프셋(expert 블록 이어붙인 flat)이다.
+
+    `k_rows`와 `sparsity`는 스칼라(균일) 또는 expert당 하나의 시퀀스다 — 실제
+    plan은 둘 다 expert마다 다르다(티어 경계는 중요도 곡선이, sparsity는 라우터
+    분포가 정한다). thr 곡선이 상수이므로 expert마다 다른 keep 비율을 줘도 마스크
+    역산은 그대로 성립한다 (`keep[j] = a[2j] == 1`).
 
     pattern:
       random — 페어를 시드 고정 랜덤으로 죽인다 (실제 마스크의 산포에 가깝다).
       block  — 앞쪽 페어만 살린다 (kt의 16-페어 워드 스킵이 최대로 먹는 최선 경우).
+
+    반환하는 keep 비율은 **페어 수로 가중한 실현 평균**이다 — expert마다 행 수와
+    sparsity가 다르면 단순 평균은 바이트 회계와 어긋난다.
     """
-    if not 0.0 <= sparsity <= 1.0:
-        raise ValueError(f"sparsity must be in [0, 1], got {sparsity}")
-    if k_rows % PAIR_GROUP:
-        raise ValueError(f"tier rows must be even (pair group), got {k_rows}")
-    npairs = k_rows // PAIR_GROUP
-    keep_n = int(round(npairs * (1.0 - sparsity)))
-    a = torch.zeros(experts, k_rows, dtype=torch.float32)
-    for e in range(experts):
+    rows = per_expert(k_rows, experts, "k_rows")
+    sps = per_expert(sparsity, experts, "sparsity")
+    if pattern not in ("random", "block"):
+        raise ValueError(f"unknown mask pattern {pattern!r} (random|block)")
+    a_parts, kept, total = [], 0, 0
+    for e, (ke, sp) in enumerate(zip(rows, sps)):
+        ke = int(ke)
+        if not 0.0 <= sp <= 1.0:
+            raise ValueError(f"sparsity[{e}] must be in [0, 1], got {sp}")
+        if ke % PAIR_GROUP:
+            raise ValueError(f"tier rows must be even (pair group), got {ke} at expert {e}")
+        npairs = ke // PAIR_GROUP
+        keep_n = int(round(npairs * (1.0 - sp)))
         if pattern == "block":
             sel = torch.arange(keep_n)
-        elif pattern == "random":
+        else:
             g = torch.Generator().manual_seed(seed + e)
             sel = torch.randperm(npairs, generator=g)[:keep_n]
-        else:
-            raise ValueError(f"unknown mask pattern {pattern!r} (random|block)")
         pair = torch.zeros(npairs, dtype=torch.float32)
         pair[sel] = 1.0
-        a[e] = pair.repeat_interleave(PAIR_GROUP)
+        a_parts.append(pair.repeat_interleave(PAIR_GROUP))
+        kept += keep_n
+        total += npairs
     return (
-        a.reshape(-1).contiguous(),
-        torch.zeros(experts * npairs, dtype=torch.float32),
+        torch.cat(a_parts).contiguous(),
+        torch.zeros(total, dtype=torch.float32),
         torch.full((experts, ng), thr, dtype=torch.float32).contiguous(),
-        keep_n / npairs if npairs else 1.0,
+        kept / total if total else 1.0,
     )
 
 

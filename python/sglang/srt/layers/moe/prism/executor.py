@@ -119,7 +119,8 @@ class PrismExecutor:
                  cold_gpu_min_m: Optional[int] = None,
                  cold_hybrid_frac=None, hybrid_local_node: int = 0,
                  warm_cpu_min_m: Optional[int] = None,
-                 cold_async: bool = False):
+                 cold_async: bool = False,
+                 cold_split: bool = False):
         """cold_stream: eager에서도 cold submit/sync를 stream 통합으로 (opt-in).
         force_graph_path: 캡처 없이 graph-safe 경로 강제 (테스트/디버그).
         capture_mode_fn: sglang CudaGraphRunner의 capture 구간(캡처 전 워밍업
@@ -159,6 +160,17 @@ class PrismExecutor:
         # ⚠ cold_async는 미완이다 (2026-08-27): 첫 호출에서 partial H2D가 flag wait보다
         # 앞서 실행돼 결과가 틀리고, wait_flag 스핀 커널의 stream 오배치로 hang한다.
         # 기본 꺼짐. 켜지 말 것 — cuStreamWaitValue32 재구현 후 활성화 (TODO.md).
+        # cold_split (2026-08-31): graph/stream 경로에서 cold의 submit/sync host node를
+        # **곁 스트림**(res.cold_stream)에 얹는다. 신호 방식은 그대로 두고 stream만
+        # 가른다 — cold_async와 달리 플래그도 wait 커널도 쓰지 않으므로 그 미완 경로에
+        # 기대지 않는다.
+        #
+        # 왜: 지금은 sync host node가 main stream에 있어 **hot/warm 커널 완료까지**
+        # 기다린다. sync가 실제로 기다려야 하는 것은 CPU 완료뿐이라 그 의존은 가짜다.
+        # 프로파일 ④ 실측(E=128, top_k=8, fp8): down phase가 71.4 → 49.5 µs (−31%),
+        # GPU 39 µs가 통째로 숨는다. gateup은 이미 cold가 훨씬 길어 변화 없음(−0.06 µs).
+        # 4라운드 반복에서 재현됨.
+        self._cold_split = cold_split
         self._cold_async = cold_async
         if cold_async:
             import warnings
@@ -346,6 +358,14 @@ class PrismExecutor:
             warm_cpu_legacy = False
         else:
             warm_cpu_legacy = warm_cpu
+        # cold를 곁 스트림으로 (P2). use_cold_stream 경로에서만이고, 그 경로는
+        # hybrid·warm_cpu가 모두 꺼져 있으므로 cold 하나만 옮기면 된다.
+        cold_split = bool(
+            self._cold_split and has_cold and flow.use_cold_stream
+            and res.cold_stream is not None and not warm_cpu_legacy and not hybrid
+        )
+        # host-block 경로: split이 켜지면 그쪽이 대신한다.
+        cold_host_block = (has_cold or warm_cpu_legacy) and not cold_split
 
         # ── Phase 1: gateup ──────────────────────────────────────────────
         w_ptr = 0
@@ -354,7 +374,10 @@ class PrismExecutor:
             cold_gu, warm_gu = self._cold_phase_async(
                 layer_idx, "gateup", hidden, topk_ids, w32, m, k, masking,
                 async_has_cold, async_warm_cpu)
-        if has_cold or warm_cpu_legacy:
+        if cold_split:
+            self._cold_split_submit(layer_idx, "gateup", hidden, topk_ids, w32,
+                                    m, k, masking, flow)
+        if cold_host_block:
             with _nvtx("cold.gu.fill_x(D2H-block)"):
                 # stream 통합 시 non_blocking: kt host node가 같은 stream에
                 # 순서대로 실행되므로 host-측 완료 보장이 불필요하다.
@@ -401,7 +424,9 @@ class PrismExecutor:
         if cold_async:
             torch.cuda.current_stream().wait_stream(res.cold_stream)   # partial H2D 완료
 
-        if has_cold or warm_cpu_legacy:
+        if cold_split:
+            cold_gu = self._cold_split_join("gateup", m, hidden.device)
+        if cold_host_block:
             with _nvtx("cold.gu.sync(host-block)"):
                 self._cold.sync(cuda_stream=flow.stream_arg)   # 두 인스턴스 모두 (같은 풀)
             _nvtx_pop()                           # cold.gu.window
@@ -428,7 +453,10 @@ class PrismExecutor:
             cold_down, warm_down = self._cold_phase_async(
                 layer_idx, "down", act, topk_ids, w32, m, k, masking,
                 async_has_cold, async_warm_cpu)
-        if has_cold or warm_cpu_legacy:
+        if cold_split:
+            self._cold_split_submit(layer_idx, "down", act, topk_ids, w32,
+                                    m, k, masking, flow)
+        if cold_host_block:
             with _nvtx("cold.dn.fill_act(D2H-block)"):
                 res.staging.fill_act(act, non_blocking=flow.use_cold_stream)
             if has_cold:
@@ -456,7 +484,9 @@ class PrismExecutor:
         if cold_async:
             torch.cuda.current_stream().wait_stream(res.cold_stream)
 
-        if has_cold or warm_cpu_legacy:
+        if cold_split:
+            cold_down = self._cold_split_join("down", m, act.device)
+        if cold_host_block:
             with _nvtx("cold.dn.sync(host-block)"):
                 self._cold.sync(cuda_stream=flow.stream_arg)
             _nvtx_pop()                           # cold.dn.window
@@ -513,6 +543,57 @@ class PrismExecutor:
         return out
 
     # ── cold_async ──────────────────────────────────────────────────────
+    def _cold_split_submit(self, layer_idx, phase, x_or_act, topk_ids, w32, m, k,
+                           masking: bool, flow: "_LayerFlow") -> None:
+        """cold 한 phase의 [입력 D2H] → [submit host node]를 **곁 스트림**에 얹는다.
+
+        host node 방식은 그대로다 — 바뀌는 것은 그것이 어느 stream에 붙느냐뿐이다.
+        곁 스트림에 두면 뒤따르는 sync가 main의 hot/warm 커널 완료를 기다리지 않는다.
+        `use_cold_stream` 경로에서만 부른다 (그 경로에서는 hybrid·warm_cpu가 모두
+        꺼져 있으므로 cold 하나만 다루면 된다).
+        """
+        res, cs = self._res, self._res.cold_stream
+        st = res.staging
+        cs.wait_stream(torch.cuda.current_stream())   # hidden/act·topk 준비 완료
+        with torch.cuda.stream(cs), _nvtx(f"cold.{phase}.split.submit"):
+            sarg = cs.cuda_stream
+            w_ptr = 0
+            if masking:
+                st.fill_topk_w(w32, non_blocking=True)
+                w_ptr = st.topk_w_ptr()
+            if phase == "gateup":
+                st.fill_x(x_or_act, non_blocking=True)
+                st.fill_expert_ids(topk_ids, non_blocking=True)
+                self._cold.submit_gateup(
+                    layer_idx, flow.qlen_ptr, k, st.expert_ids_ptr(), st.x_ptr(),
+                    st.partial_gateup_ptr(), cuda_stream=sarg, weights_ptr=w_ptr)
+            else:
+                st.fill_act(x_or_act, non_blocking=True)
+                self._cold.submit_down(
+                    layer_idx, flow.qlen_ptr, k, st.expert_ids_ptr(), st.act_ptr(),
+                    st.partial_down_ptr(), cuda_stream=sarg, weights_ptr=w_ptr)
+
+    def _cold_split_join(self, phase: str, m: int, device) -> torch.Tensor:
+        """곁 스트림의 [sync host node] → [partial H2D]를 마치고 main에 합류시킨다.
+
+        rejoin이 이 partial을 main에서 읽으므로 합류는 없앨 수 없다 — 없앨 수 있는
+        것은 sync가 GPU 커널을 기다리던 쪽이었다.
+        """
+        res, cs = self._res, self._res.cold_stream
+        st = res.staging
+        with torch.cuda.stream(cs), _nvtx(f"cold.{phase}.split.join"):
+            self._cold.sync(cuda_stream=cs.cuda_stream)
+            src = st.gateup_out(m) if phase == "gateup" else st.down_out(m)
+            out = src.to(device, non_blocking=True)
+        main = torch.cuda.current_stream()
+        main.wait_stream(cs)
+        # 캡처 밖에서만: 이 블록은 cs에서 할당됐고 main이 읽는다 — 할당자가 cs의
+        # 다음 할당에 재사용하지 못하게 막는다. 캡처 중에는 graph 전용 풀이라
+        # 재사용 규칙이 다르고 record_stream이 유효하지 않다.
+        if not torch.cuda.is_current_stream_capturing():
+            out.record_stream(main)
+        return out
+
     def _cold_phase_async(self, layer_idx, phase, x_or_act, topk_ids, w32, m, k, masking,
                           has_cold: bool, warm_cpu: bool):
         """cold(+warm-kt) 한 phase를 cold stream에 **enqueue만** 하고 partial(device)을

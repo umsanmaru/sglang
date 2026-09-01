@@ -65,15 +65,21 @@ VARIANTS = ("warm_only", "cold_only", "combined", "combined_eager",
 
 # 노드 N shard의 정렬 요구 — **커널이 정한다**.
 #
-# tile_k2의 `gemv_slab`은 타일 컬럼 stride를 `c * TILE_ELEMS`(= N_BLOCK 256 ×
-# K_STEP 32)로 계산하므로 마지막 부분 블록을 표현할 수 없고, 그래서 스스로
-# `assert(n % N_BLOCK == 0)`을 건다. Release 빌드는 NDEBUG라 그 assert가 없어
-# **조용히 남의 열을 읽고 segfault한다** (2026-08-26 실측: I=768을 2노드 384씩
-# 나눴을 때). 그래서 이 정렬은 입력 단계에서 막는다.
-#
 # AMX(kt_amx_bf16)의 mat_mul/amx_kernel은 부분 N_BLOCK을 처리하므로 N_STEP(32)만
-# 지키면 된다. 노드 하나가 받는 shard는 kt가 rows > 0을 요구한다.
-N_ALIGN = {"kt_tile_k2_bf16": 256, "kt_amx_bf16": 32,
+# 지키면 된다 — 패커가 타일 컬럼 stride를 `n_block_size`로 계산하기 때문이다.
+# 노드 하나가 받는 shard는 kt가 rows > 0을 요구한다.
+#
+# tile_k2 계열은 `gemv_slab`이 그 stride를 `c * TILE_ELEMS`(= N_BLOCK 256 ×
+# K_STEP 32) **상수**로 접어 넣어 부분 블록을 표현할 수 없었고, 그래서 256이었다.
+# Release 빌드는 NDEBUG라 커널의 assert가 없어 조용히 남의 열을 읽고 segfault한다
+# (2026-08-26 실측: I=768을 2노드 384씩 나눴을 때) — 그래서 이 정렬은 입력
+# 단계에서 막는다.
+#
+# **bf16만 2026-08-31에 32로 내려왔다**: 꼬리 블록용 오프셋 표
+# (`ActivationPlan.koff_tail`)와 런타임 그룹 수로 도는 `super_block_partial`이
+# 붙어 kt 원본과 같은 하한이 됐다. mxfp4/fp8은 각자 gemv_slab·인코더가 따로라
+# 아직 256이다.
+N_ALIGN = {"kt_tile_k2_bf16": 32, "kt_amx_bf16": 32,
            "kt_amx_fp4": 32, "kt_tile_k2_mxfp4": 256,
            "kt_tile_k2_fp8b128": 256}
 
@@ -218,13 +224,25 @@ class ColdTier:
     Plan을 읽지 않는다 (프로파일 결과가 Plan의 입력이므로)."""
 
     def __init__(self, shape: Shape, splits: Mapping[str, Split], *,
-                 sparsity: float, pattern: str, seed: int, numa_split: float,
+                 sparsity, pattern: str, seed: int, numa_split: float,
                  threads: int, kernel_key: str, dtype: str = "bf16",
-                 numa_map: Optional[Sequence[int]] = None):
+                 numa_map: Optional[Sequence[int]] = None,
+                 rows_per_expert: Optional[Mapping[str, Sequence[int]]] = None,
+                 index_per_expert: Optional[Mapping[str, torch.Tensor]] = None):
+        """`sparsity`는 스칼라 또는 expert당 하나의 시퀀스다.
+
+        `rows_per_expert`/`index_per_expert`를 함께 주면 expert마다 **다른 cold 행
+        수**를 쓴다 (`splits[proj].k_cold`를 무시한다). 인덱스는 expert 블록을
+        이어붙인 [Σₑ k(e)] int32여야 하고, kt는 이 형태를 정식으로 받는다 —
+        검증이 `row_off[-1]` 기준 원소 수다 (`experts_partial._k_total`).
+        """
         from kt_kernel import kt_kernel_ext
         from kt_kernel.experts_partial import PartialMoEWrapper
 
-        from sglang.srt.layers.moe.prism.profile.common import sparse_tables
+        from sglang.srt.layers.moe.prism.profile.common import per_expert, sparse_tables
+
+        if (rows_per_expert is None) != (index_per_expert is None):
+            raise ValueError("rows_per_expert와 index_per_expert는 함께 준다")
 
         self.store = store_of(dtype)
         if kernel_key not in N_ALIGN:
@@ -259,12 +277,23 @@ class ColdTier:
         cfg.layer_idx = 0
         cfg.partial.enabled = True
         cfg.partial.n_total = I
+        # proj별 expert당 cold 행 수 — 균일이면 전부 같은 값이다.
+        self.rows = {p: tuple(int(r) for r in per_expert(
+            splits[p].k_cold if rows_per_expert is None else rows_per_expert[p],
+            E, f"{p} cold rows")) for p in PROJS}
         for proj, ki in (("gate", cfg.partial.gate), ("up", cfg.partial.up),
                          ("down", cfg.partial.down)):
             sp = splits[proj]
-            ki.row_off = [e * sp.k_cold for e in range(E + 1)]
-            ki.idx = sp.cold_rows.to(torch.int32).repeat(E).tolist()
-            # real_rows는 비워 둔다 — k_cold가 K_STEP 배수라 패딩이 없다.
+            rows = self.rows[proj]
+            off = [0]
+            for r in rows:
+                off.append(off[-1] + r)
+            ki.row_off = off
+            ki.idx = ((sp.cold_rows.to(torch.int32).repeat(E) if index_per_expert is None
+                       else index_per_expert[proj].to(torch.int32)).tolist())
+            if len(ki.idx) != off[-1]:
+                raise ValueError(f"{proj}: cold index {len(ki.idx)} != Σₑ k(e) {off[-1]}")
+            # real_rows는 비워 둔다 — 행 수가 K_STEP 배수라 패딩이 없다.
         align = N_ALIGN[kernel_key]
         gu_off, gu_rows, gu_frac = node_table(I, numa_split, self.nodes, align)
         dn_off, dn_rows, dn_frac = node_table(H, numa_split, self.nodes, align)
@@ -290,20 +319,23 @@ class ColdTier:
         self.w, self.s = {}, {}
         for proj in PROJS:
             sp = splits[proj]
-            w, sc = self.store.cold_store(E, sp.n_cols, sp.k_cold, seed=seed + hash(proj) % 97)
+            w, sc = self.store.cold_store(E, sp.n_cols, self.rows[proj],
+                                          seed=seed + hash(proj) % 97)
             self.w[proj] = w
             self.s[proj] = sc
 
         tables, self.keep_frac, self.a_host = {}, {}, {}
         for proj in PROJS:
-            sp = splits[proj]
             a, c, thr, frac = sparse_tables(
-                E, sp.k_cold, sparsity, pattern=pattern, seed=seed)
+                E, self.rows[proj], sparsity, pattern=pattern, seed=seed)
             tables[f"{proj}_wn_sq"] = a
             tables[f"{proj}_pair_dot"] = c
             tables[f"thr_{proj}"] = thr
             self.keep_frac[proj] = frac
-            self.a_host[proj] = a.reshape(E, sp.k_cold)
+            # 행 수가 expert마다 다르면 [E, k]로 접을 수 없다 — expert별 뷰 목록으로
+            # 둔다 (check의 레퍼런스가 expert 하나씩 읽는다).
+            off = torch.tensor((0,) + self.rows[proj]).cumsum(0)
+            self.a_host[proj] = [a[off[e]:off[e + 1]] for e in range(E)]
 
         self.wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=kernel_key)
         scale_kw = ({} if self.s["gate"] is None else
@@ -314,25 +346,34 @@ class ColdTier:
             **scale_kw)
 
     def rows_of(self, proj: str) -> int:
-        return int(self.a_host[proj].shape[1])
+        """expert당 cold 행 수의 평균 (균일이면 그 값 그대로) — 바이트 회계용."""
+        rows = self.rows[proj]
+        return int(round(sum(rows) / len(rows)))
 
-    def dequant_blocks(self, proj: str, n: int, k: int) -> torch.Tensor:
-        """cold 주입 스토어 → fp32 [E, N, k] (check의 레퍼런스가 열을 더한다).
+    def dequant_blocks(self, proj: str, n: int) -> list:
+        """cold 주입 스토어 → expert별 fp32 [N, k(e)] (check의 레퍼런스가 열을 더한다).
 
+        행 수가 expert마다 다를 수 있으므로 [E, N, k]로 접지 않고 목록으로 돌려준다.
         이 프로파일의 합성 배율은 전부 1.0이라 dequant는 코드 값 그 자체다 — 배율을
         섞으면 여기도 dtype별 블록 재구성이 필요해진다."""
-        E = int(self.a_host[proj].shape[0])
-        w = self.w[proj]
-        if self.store.name == "bf16":
-            return w.float().reshape(E, n, k)
         from sglang.srt.layers.moe.prism.profile.common import _FP4_TABLE, _e4m3_table
 
-        if self.store.name == "mxfp4":
-            b = w.reshape(E * n, k // 2)
-            low, high = (b & 0xF).long(), (b >> 4).long()
-            vals = torch.stack([_FP4_TABLE[low], _FP4_TABLE[high]], dim=2).reshape(E * n, k)
-            return vals.reshape(E, n, k)
-        return _e4m3_table()[w.long()].reshape(E, n, k)
+        rows, w, out, pos = self.rows[proj], self.w[proj], [], 0
+        for k in rows:
+            if self.store.name == "bf16":
+                take = n * k
+                out.append(w[pos:pos + take].float().reshape(n, k))
+            elif self.store.name == "mxfp4":
+                take = n * k // 2
+                b = w[pos:pos + take].reshape(n, k // 2)
+                low, high = (b & 0xF).long(), (b >> 4).long()
+                out.append(torch.stack([_FP4_TABLE[low], _FP4_TABLE[high]],
+                                       dim=2).reshape(n, k))
+            else:
+                take = n * k
+                out.append(_e4m3_table()[w[pos:pos + take].long()].reshape(n, k))
+            pos += take
+        return out
 
 
 # ─── 리포트 ────────────────────────────────────────────────────────────────
@@ -694,9 +735,8 @@ class WarmColdProfiler:
         cold.wrapper.sync(None)
         got_all = (st.gateup_out(1) if group == "gateup" else st.down_out(1)).float()
         for pi, proj in enumerate(projs):
-            kc = cold.rows_of(proj)
             n = shape.n_cols(proj)
-            blocks = cold.dequant_blocks(proj, n, kc)
+            blocks = cold.dequant_blocks(proj, n)
             errs = []
             for j in range(topk):
                 e = int(ids[0, j])
@@ -783,24 +823,32 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
                      mask_pattern: str = "random", seed: int = 0,
                      warm_node: Optional[int] = None,
                      x_row_is_pair: bool = False,
-                     dtype: str = "bf16") -> SparseGemv:
+                     dtype: str = "bf16",
+                     experts: int = 1, topk: int = 1) -> SparseGemv:
     """[k, n] weight 하나의 warm sparse GEMV — shape과 sparsity만 받는다.
 
-        warm_sparse_gemv(1792, 768, 0.9, device=1).us
+        warm_sparse_gemv(1792, 768, 0.9, device=1).us                       # 접힌 형태
+        warm_sparse_gemv(1792, 768, 0.9, device=1, experts=128, topk=8).us  # 실제 풀·활성 수
 
-    `dense_gemv`의 sparse 짝이다: expert/top_k를 1로 접고, W는 pinned host에 두고
-    GPU가 UVA로 제자리 읽는다 (`gemv_worklist_indexed_pinned_sparse` —
-    `tiers.SparsePinnedGateUp`이 부르는 그 커널). 죽은 페어의 로드를 발행하지
-    않으므로 건너뛴 만큼이 그대로 PCIe 절약이다.
+    `dense_gemv`의 sparse 짝이다: W는 pinned host에 두고 GPU가 UVA로 제자리 읽는다
+    (`gemv_worklist_indexed_pinned_sparse` — `tiers.SparsePinnedGateUp`이 부르는 그
+    커널). 죽은 페어의 로드를 발행하지 않으므로 건너뛴 만큼이 그대로 PCIe 절약이다.
 
-    **주의 — 커널 상한이지 warm 티어 비용이 아니다.** top_k를 1로 접으면
-    (a) 블록이 `ceil(n/64)`뿐이라 SM이 덜 붙고 — outstanding 요청 한계가 SM당이라
-    실측에서 12블록은 PCIe 피크의 9%밖에 못 뽑았다 — (b) pair 블록마다 하던 thr
-    계산이 1회로 줄어 ~17% 낙관적이다. 티어 비용은 `WarmColdProfiler`로 잰다.
-    바이트를 보존해 비교하려면 top_k를 줄인 만큼 `n`을 키우면 된다.
+    `experts`/`topk`가 기본값(1, 1)이면 expert 풀과 활성 수를 1로 **접은** 커널
+    상한이다. 실제 값을 주면 worklist가 `m × topk`개가 되고, iteration마다 다른
+    top_k를 태워 W가 L2에 남지 않게 한다 (`hot_dense_gemv`와 같은 회전).
+
+    **주의 — 접힌 형태는 커널 상한이지 warm 티어 비용이 아니다.** top_k를 1로
+    접으면 (a) 블록이 `ceil(n/64)`뿐이라 SM이 덜 붙고 — outstanding 요청 한계가
+    SM당이라 실측에서 12블록은 PCIe 피크의 9%밖에 못 뽑았다 — (b) pair 블록마다
+    하던 thr 계산이 1회로 줄어 ~17% 낙관적이다. **그래서 접힌 값을 top_k로 나눠
+    선형 확장하면 그 두 편향이 그대로 남는다** — 확장을 하려거든 `topk`를 실제
+    값으로 주고 재라. 티어 비용(스토어 분할·흩어진 K 인덱스까지)은
+    `WarmColdProfiler`로 잰다.
     """
     from sglang.srt.layers.moe.prism.numa import gpu_numa_node
-    from sglang.srt.layers.moe.prism.profile.common import sparse_tables
+    from sglang.srt.layers.moe.prism.profile.common import Shape, sparse_tables
+    from sglang.srt.layers.moe.prism.profile.hot import _ids as rotate_ids
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
     store = store_of(dtype)
@@ -809,34 +857,44 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
     if k % max(PAIR_GROUP, store.k_align):
         raise ValueError(f"{store.name}: k must be a multiple of "
                          f"{max(PAIR_GROUP, store.k_align)}, got {k}")
+    if topk > experts:
+        raise ValueError(f"topk {topk} > experts {experts} (풀에서 중복 없이 뽑는다)")
     node = warm_node if warm_node is not None else gpu_numa_node(dev.index or 0)
 
-    parts = store.gpu_store(1, k, n, node=node, seed=seed)
-    row_off = torch.tensor([0, k], dtype=torch.int32, device=dev)
-    kidx = torch.arange(k, dtype=torch.int32).to(torch.uint16).to(dev)
-    a, c, thr, keep = sparse_tables(1, k, sparsity, pattern=mask_pattern, seed=seed)
+    parts = store.gpu_store(experts, k, n, node=node, seed=seed)
+    row_off = (torch.arange(experts + 1, dtype=torch.int32) * k).to(dev)
+    # 이 티어가 K축 전체를 갖는 형태 — 인덱스는 항등이고 expert마다 반복된다.
+    kidx = (torch.arange(k, dtype=torch.int32).to(torch.uint16)
+            .repeat(experts).contiguous().to(dev))
+    a, c, thr, keep = sparse_tables(experts, k, sparsity, pattern=mask_pattern,
+                                    seed=seed)
     spec = SparseSpec(a=a.to(dev), c=c.to(dev), thr=thr.to(dev),
                       p=SPARSITY_P, lam=SPARSITY_LAM, pmax=PMAX, grid=GRID,
                       ng=NG, renorm_it=RENORM_IT)
     # x ≡ 1 — sparsity 합성이 x0=x1=1을 전제한다 (common.py의 역산).
-    x = torch.ones(m, k, dtype=torch.bfloat16, device=dev)
-    ids = torch.zeros(m, 1, dtype=torch.int32, device=dev)
-    tw = torch.ones(m, 1, dtype=torch.float32, device=dev)
-    out = torch.zeros(m, 1, n, dtype=torch.bfloat16, device=dev)
+    # down은 x가 expert별 act라 행이 pair (m, j)다 (executor와 같은 규약).
+    x = torch.ones(m * topk if x_row_is_pair else m, k,
+                   dtype=torch.bfloat16, device=dev)
+    ids = rotate_ids(Shape(experts=experts, topk=topk, hidden=k, inter=n),
+                     m, reps, dev, seed + 1)
+    tw = torch.full((m, topk), 1.0 / topk, dtype=torch.float32, device=dev)
+    out = torch.zeros(m, topk, n, dtype=torch.bfloat16, device=dev)
 
     fn = store.fmt.gemv(pinned=True, sparse=True)
 
     def launch(i: int) -> None:
-        store.call(fn, (x, ids, tw, *parts, row_off, kidx, out, spec, 0,
+        store.call(fn, (x, ids[i], tw, *parts, row_off, kidx, out, spec, 0,
                         x_row_is_pair, torch.cuda.current_stream()))
 
     try:
         with nvtx("warm/sparse_gemv"):
             timing = graph_timing(launch, reps, replays=replays)
     finally:
-        del parts, x, out
+        del parts, x, out, ids
         torch.cuda.empty_cache()
 
     return SparseGemv(where="warm", k_rows=k, n_cols=n, sparsity=sparsity,
-                      keep_frac=keep, dense_bytes=store.store_bytes(m, k, n),
+                      keep_frac=keep,
+                      # 한 launch가 읽는 weight 수 = m × topk (worklist 항목 수).
+                      dense_bytes=store.store_bytes(m * topk, k, n),
                       timing=timing)

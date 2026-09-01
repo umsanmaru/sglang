@@ -106,6 +106,36 @@ def test_cold_stream_integration_matches(qlen):
     assert torch.equal(out, ref)
 
 
+@cuda_required
+@pytest.mark.parametrize("qlen", [1, 16])
+def test_cold_split_matches(qlen):
+    """cold_split=True(SGLANG_PRISM_COLD_SPLIT=1 상당): cold의 submit/sync를
+    곁 스트림(res.cold_stream)에 얹어도 수치는 bitwise 동일해야 한다.
+
+    바뀌는 것은 host node가 **어느 stream에 붙느냐**뿐이다 — 신호 방식도
+    계산도 그대로다. 그래서 tolerance가 아니라 등호가 성립해야 하고,
+    깨진다면 fork/join이 어긋나 rejoin이 미완성 partial을 읽은 것이다."""
+    plan = make_plan("mixed")
+    w13, w2 = make_weights()
+    x, ids, w = make_inputs(qlen, seed=11 + qlen)
+    ref = run1(build_executor(plan, w13, w2), x, ids, w)
+    out = run1(build_executor(plan, w13, w2, cold_stream=True, cold_split=True),
+               x, ids, w)
+    assert torch.equal(out, ref)
+
+
+@cuda_required
+def test_cold_split_only_when_cold_stream():
+    """cold_split은 use_cold_stream 경로 전용이다 — 순수 eager에서 켜도
+    조용히 다른 결과를 내면 안 된다 (그 경로에서는 아예 안 켜진다)."""
+    plan = make_plan("mixed")
+    w13, w2 = make_weights()
+    x, ids, w = make_inputs(1, seed=23)
+    ref = run1(build_executor(plan, w13, w2), x, ids, w)
+    out = run1(build_executor(plan, w13, w2, cold_split=True), x, ids, w)
+    assert torch.equal(out, ref)
+
+
 # ── 3. 실캡처 + replay ───────────────────────────────────────────────────
 
 def _warmup_and_capture(ex, x_buf, ids_buf, w_buf):
@@ -350,3 +380,28 @@ def test_capture_mode_fn_routes_graph_path():
     assert torch.equal(out, ref), (
         f"max abs diff {(out.float() - ref.float()).abs().max().item()}"
     )
+
+
+@cuda_required
+@pytest.mark.parametrize("kind", ["mixed", "three_tier"])
+def test_capture_replay_matches_eager_with_cold_split(kind):
+    """진짜 관문: 곁 스트림 fork/join이 **캡처 안에서** 성립하는가.
+
+    프로파일러(`profile/full_layer.py`의 `combined_split`)에서는 성립했지만
+    executor는 버퍼 수명과 rejoin 경로가 더 복잡하다. 캡처 후 replay한 값이
+    eager와 같아야 한다 — 다르면 partial H2D가 sync보다 앞섰거나 합류가
+    빠진 것이다."""
+    plan = make_plan(kind)
+    w13, w2 = make_weights()
+    x, ids, w = make_inputs(1, seed=31)
+    ref = run1(build_executor(plan, w13, w2), x, ids, w)
+
+    toggle = _Toggle()
+    ex = build_executor(plan, w13, w2, capture_mode_fn=toggle, cold_split=True)
+    x_buf, ids_buf, w_buf = x.cuda(), ids.cuda(), w.cuda()
+    toggle.on = True
+    g, out_buf = _warmup_and_capture(ex, x_buf, ids_buf, w_buf)
+    g.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out_buf.cpu(), ref)
+

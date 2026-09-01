@@ -62,6 +62,9 @@ _ENV_WARM_KT = "SGLANG_PRISM_WARM_KT"
 _ENV_WARM_CPU_MIN_M = "SGLANG_PRISM_WARM_CPU_MIN_M"
 # cold를 전용 stream + 플래그 wait로 (블로킹 콜백 없음). eager 전용. hybrid와 동시 불가.
 _ENV_COLD_ASYNC = "SGLANG_PRISM_COLD_ASYNC"
+# cold submit/sync host node를 곁 스트림에 얹는다 (P2). graph decode에서
+# sync가 hot/warm 커널 완료를 기다리던 가짜 의존을 끊는다 — 실측 down phase −31%.
+_ENV_COLD_SPLIT = "SGLANG_PRISM_COLD_SPLIT"
 # 로딩 훅(process_weights_after_loading)의 torch intra-op 스레드 수. model_runner가
 # load_model 진입부에서 전역 1로 고정하는데(평범한 로딩의 memcpy 스레드 경합 방지),
 # prism의 훅은 memcpy가 아니라 층당 3.4 GB를 훑는 K-슬라이스 repack이라 그 값이
@@ -133,6 +136,18 @@ class _PrismRuntime:
         # 모델의 SwiGLU clamp (DSV4-Flash swiglu_limit=10). create_moe_runner가 layer의
         # MoeRunnerConfig에서 읽어 채운다 — 전 층 공통 값이라 프로세스 1벌.
         self.swiglu_limit: Optional[float] = None
+        # 모델의 routed_scaling_factor (GLM-5.3 2.5 / DSV4-Flash 1.5). 이것도 create_moe_runner에서만
+        # 보인다. 일반 경로에서는 **MoE 러너가** 곱하는데(moe_runner/triton.py:109·164·209,
+        # triton_kernels.py:205, flashinfer_cutlass.py:151) prism은 apply를 전유해 러너를 안 쓴다.
+        # 모델 쪽 사후 곱셈도 prism에는 걸리지 않는다: deepseek_v2.py의 가드는
+        # `not _is_cuda ... or isinstance(KTEPWrapperMethod)`이고(upstream:1021-1027,
+        # 포크:810-816) prism은 그 목록에 없으며, maybe_fuse_routed_scale_and_shared_add는
+        # 비-fused method에 대해 shared만 더하고 스케일 없이 반환한다
+        # (mxfp4_flashinfer_trtllm_moe.py:415-417). 그래서 prism이 직접 곱한다.
+        # 정답 규약은 체크포인트 레퍼런스가 정한다: DeepSeek-V4-Flash-0731
+        # inference/model.py:588 `weights *= self.route_scale` (Gate.forward 안) —
+        # 라우터 가중에 접는 것이고, 곱셈이 선형이므로 expert 가중합 결과에 곱하는 것과 같다.
+        self.routed_scaling_factor: Optional[float] = None
         # cold(CPU) 행이 plan 어디에도 없으면 kt 백엔드(스레드풀)를 만들지 않는다 — GPU
         # 스트리밍 전용 plan(mxfp4)에서 idle 워커가 CPU를 점유할 이유가 없다.
         self.has_cold = any(
@@ -189,6 +204,7 @@ class _PrismRuntime:
                 warm_cpu_min_m=(int(os.environ[_ENV_WARM_CPU_MIN_M])
                                 if os.environ.get(_ENV_WARM_CPU_MIN_M) else None),
                 cold_async=os.environ.get(_ENV_COLD_ASYNC) == "1",
+                cold_split=os.environ.get(_ENV_COLD_SPLIT) == "1",
             )
         return self._executor
 
@@ -298,6 +314,15 @@ class PrismMoEMethod(FusedMoEMethodBase):
             if runtime.swiglu_limit is not None and runtime.swiglu_limit != limit:
                 raise PlanError(f"swiglu_limit differs across layers ({runtime.swiglu_limit} vs {limit})")
             runtime.swiglu_limit = float(limit)
+        rsf = getattr(moe_runner_config, "routed_scaling_factor", None)
+        if rsf is not None:
+            if runtime.routed_scaling_factor is not None and runtime.routed_scaling_factor != rsf:
+                raise PlanError(
+                    f"routed_scaling_factor differs across layers "
+                    f"({runtime.routed_scaling_factor} vs {rsf})")
+            if runtime.routed_scaling_factor is None:
+                logger.info("[prism] routed_scaling_factor = %s (출력에 적용)", float(rsf))
+            runtime.routed_scaling_factor = float(rsf)
         try:
             return self.gpu_method.create_moe_runner(layer, moe_runner_config)
         except Exception as exc:  # 내부 method의 runner는 쓰이지 않는다 — 실패해도 진행
@@ -416,6 +441,14 @@ class PrismMoEMethod(FusedMoEMethodBase):
             from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
 
             deepseek_v4_moe_code_path_checker.observed += 1
+        rsf = runtime.routed_scaling_factor
+        if rsf is not None and rsf != 1.0:
+            # **출력에** 곱한다 — 라우터 가중(topk_weights)에 곱하면 안 된다. 그 배열은 cold
+            # 커널의 sparsity 정책이 `s = clip(p − λ(g_e − ḡ), 0, pmax)`로 읽는 입력이고,
+            # calib은 `router_weight_norm: sum1`(합 1) 규약으로 만들어졌다. w32를 rsf배 하면
+            # λ 항이 rsf배 세져 마스크가 조용히 달라진다. 수학적으로 동일한 두 위치가
+            # sparsity 때문에 갈리는 지점이다.
+            out = out * rsf
         return StandardCombineInput(hidden_states=out.to(x.dtype))
 
 

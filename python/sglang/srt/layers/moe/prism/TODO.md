@@ -4,6 +4,220 @@ P0에서 결정만 해두고 구현을 미룬 항목들. 각 항목은 "왜 미�
 "구현 시 건드릴 곳"을 함께 기록한다. (P0 범위 자체는 CONTRACTS.md와
 커밋 계획 참조)
 
+## dense 확장 — 진행 중 (2026-08-31)
+
+MoE 오프로드와 같은 K-split을 qkvo(`wq_a`/`wq_b`/`wo_a`/`wo_b`)와 dense MLP
+(`gate_up_proj`/`down_proj`)에도 적용한다.
+
+### 확정된 설계 (2026-08-31 사용자 결정)
+
+- **plan은 MoE와 분리.** 별도 파일 + 별도 env(`SGLANG_PRISM_LINEAR_PLAN`).
+  근거: MoE만 / dense만 / 둘 다를 env 조합으로 스윕할 수 있어야 벤치가 성립한다.
+  대가는 VRAM/PCIe/CPU 예산을 두 plan이 따로 정해 합이 하드웨어를 넘을 수 있다는
+  것 — planner의 책임이고 런타임은 검사하지 않는다.
+- **executor도 별도.** dense는 pair 축이 없어 `[M,k,N]` → `[M,N]`이고
+  grouping·worklist·라우터 가중합이 통째로 불필요하다.
+- **위치: 공유 코어만 승격.** `layers/prism/`에 축 무관한 것만 올리고 dense를 그
+  밑에. MoE 5,000줄은 제자리에서 re-export한다 (기존 42파일 무수정).
+
+### 착지한 것
+
+**① linear 래퍼 훅** — `FusedMoE.__init__`에는 `maybe_wrap_moe_quant_method`
+슬롯이 있는데 `LinearBase.__init__`은 `quant_method`를 고르고 그대로 끝났다.
+그 사이가 비면 래퍼가 **파라미터를 어디에 할당할지** 정할 수 없다 — 계약 ③
+(full 텐서를 host에 받아 K-슬라이스 후 원본 소멸)이 성립하지 않는다.
+
+- `layers/linear_method_registry.py` 신설, `LinearBase.__init__` 마지막 줄에 훅
+- MoE registry와 다른 점 셋 (전부 `LinearBase`의 성질에서 강제됨):
+  `prefix`가 predicate 인자다(`layer_id`가 없다) · 모든 linear가 지나가므로
+  predicate는 모르는 prefix에 반드시 None을 내야 한다 · **`tp_size`는 predicate
+  시점에 아직 없다**(서브클래스가 `super().__init__()` 반환 후 대입).
+  `server_args`도 None일 수 있다 — linear는 서버 없이도 routinely 생성된다
+  (`get_global_server_args()`가 `ValueError`를 던진다).
+- `test/prism/test_linear_registry.py` 13종
+
+**② 공유 코어 승격** — `layers/prism/` (505줄). 의존은 아래로만 흐른다:
+`moe/prism/` → `prism/`, `prism/linear/` → `prism/`. 역방향 0 (검증됨).
+
+- `numa.py` (266줄, 변경 0) · `kernels.py` (130줄) · `geometry.py` (78줄:
+  `Tier`/`BandSpec`/`NumaShard`/`KernelSpec`/`PlanError`/`ROW,COL,PAIR_GROUP`)
+- `kernels.gpu_store_format`만 갈렸다: 태그(`"bf16"`/`"mxfp4"`/`"fp8"`)까지는
+  공유고, 태그 → `StoreFormat` 객체 해석은 각 오프로드가 한다. 포맷 객체가
+  파라미터 이름과 full 텐서 인출을 들고 있고 그것이 MoE(w13/w2)와
+  dense(weight)에서 갈리기 때문이다.
+- `moe/prism/{numa,kernels}.py`는 shim, `plan.py`는 기하를 re-export →
+  `moe.prism.plan.Tier` 같은 기존 경로가 전부 산다. `test_numa.py`만 새 경로로
+  옮겼다 (private `_libnuma`를 쓰는데 `import *`가 안 넘긴다).
+
+**③ dense plan** — `layers/prism/linear/plan.py` + `test_linear_plan.py` 36종.
+
+- 좌표가 `(layer, proj)`이고 proj는 **열린 문자열**이다. MoE는 gate/up/down
+  enum이면 됐다 — 세 개뿐이고 K가 `hidden`/`intermediate`에서 파생된다. dense는
+  모델마다 projection 집합이 다르고 K에 파생 공식이 없어서 **k/n을 plan이 직접
+  적고** 로드 타임에 실제 layer와 대조한다(`check_dims`). 안 대조하면 엉뚱한 행을
+  슬라이스해 **결과가 조용히 틀린다**.
+- `split_prefix("model.layers.7.self_attn.wq_b") → (7, "self_attn.wq_b")`.
+  이 규약을 plan에 둔 이유: "무엇이 proj인가"는 plan의 어휘다. 훅은 이걸 부를 뿐
+  이름 규칙을 자기가 알지 않는다.
+- `projs`에 없는 projection은 안 건드린다. "전부 오프로드" 축약형은 두지 않았다 —
+  무엇을 오프로드하는지가 곧 실험 변수라 명시가 기본이다.
+- **sparsity는 v1 범위 밖** (의도적): MoE calib 자산이 `[L,E,K]` 축이라 dense의
+  `[L,K]`와 포맷이 다르고 자산 생성이 선행되어야 한다.
+
+**④ 인덱스 어휘 승격** — `layers/prism/store.py` (`IDX_DTYPE`/`OFF_DTYPE`/`MAX_K`/
+`is_row_run`). dense가 같은 K-인덱스 표현을 쓰므로 두 곳에 두면 드리프트가 곧
+**무증상 오답**이다 — 한쪽만 int32로 올라가면 wrap된 인덱스가 전혀 다른 행을 읽는데
+예외가 안 난다. `moe/prism/index.py`는 re-export.
+
+**⑤ dense weights** — `layers/prism/linear/weights.py` + `test_linear_weights.py` 27종.
+
+- `PreparedLinear{hot, warm, cold}` — proj 3개 × 티어 3개 = 9 shard였던 것이 티어 3개로.
+  `row_off[E+1]`이 **사라졌다**: 그 테이블은 "expert마다 k가 다르다"를 표현하려고
+  있었고 dense에는 expert가 없다. `LinearTierShard`는 `w_flat [k_tier, N]` +
+  `k_index [k_tier]` + `contiguous`/`k_start`뿐이다.
+- 방향 규약은 MoE 그대로: hot/warm은 `[k_tier, N]` **K-major**(전치 없는 정준 방향,
+  GPU 커널 공유), cold는 `[N, k_pad]` **ckpt 방향 유지**(kt `from_mat`이 읽는 방향) +
+  커널 타일 배수까지 0 패딩. `real_rows`는 `[E]` 텐서가 아니라 **스칼라**다 —
+  "E=1 퇴화 MOEConfig"로의 번역은 cold backend 어댑터 한 곳에서 하고 이 구조체는
+  dense의 사실만 말한다.
+- 테스트의 축은 **계약 ⑤**다: 세 티어 부분합의 fp32 합 == 원래 행렬곱, 그리고 hot/warm/
+  cold 경계를 옮긴 두 plan의 재구성 weight가 비트일치(배치 불변성). 실제 배치
+  (hot→VRAM, warm→GPU-local NUMA pinned, cold→평범한 host)도 CUDA 테스트로 잡는다 —
+  warm이 원격 소켓에 앉는 것은 결과가 정확하고 느리기만 해서 다른 어떤 테스트도 안 잡는다.
+**⑥ dense 포맷 (bf16 + blockwise fp8)** — `layers/prism/linear/formats.py`.
+
+- MoE `StoreFormat`을 그대로 못 가져온다: `create_params`/`take_full`이 `w13_weight`/
+  `w2_weight`라는 MoE 어휘에 묶여 있다. dense에서 그 역할은 `method.py`가
+  `LinearBase`의 `weight`/`weight_scale_inv`를 직접 읽어 넘기는 것이므로, 이 포맷
+  객체는 **텐서만 보고 layer를 모른다**.
+- 포맷이 정하는 것은 결국 하나다: **K를 어디서 자를 수 있는가.** bf16은 페어(2),
+  fp8은 **128** — 배율 하나가 128k×128n 블록을 덮으므로 티어 경계가 블록을 쪼개면
+  두 티어가 같은 배율을 나눠 갖는다. `check_rows`가 로드마다 본다 (plan 밴드 검증은
+  `ROW_GROUP=2`까지만 보므로 여기가 유일한 게이트다).
+- fp8 스토어: GPU 티어 `[k_tier, N]` u8 코드 + `[k_tier/128, N/128]` fp32 배율,
+  cold `[N, k_pad]` + `[N/128, k_pad/128]`. **fp8 cold에는 패딩이 없다** — 타일(128)과
+  K 정렬(128)이 같기 때문. `float8_e4m3fn`은 index_select가 안 되므로 u8 뷰로 다룬다.
+- 테스트는 **비트일치 재구성**(`test_fp8_reconstruction_is_bit_exact`)이 절단의
+  정확성을 증명하고, 행렬곱 비교는 재결합 오차 때문에 명시 tolerance를 쓴다 —
+  둘을 섞으면 tolerance가 진짜 버그를 숨긴다.
+- **mxfp4는 두지 않았다** (dense 대상에 없다는 2026-08-31 사용자 확인). 필요해지면
+  `k_align=32` 구현을 더하면 되고 배관은 이미 배율 있는 포맷을 지원한다.
+
+**⑦ proj별 커널 (혼합 포맷)** — plan 스키마 변경.
+
+`projs[name].kernels`가 top-level `kernels`를 덮는다. MoE는 model-global 하나로
+족했지만 dense는 **한 모델 안에서 형식이 갈린다**: DSV4의 `wo_a`는
+`SGLANG_OPT_FP8_WO_A_GEMM`이 꺼져 있으면 `quant_config=None` +
+`params_dtype=bfloat16`으로 만들어져, 같은 모델의 `wq_b`/`wo_b`가 fp8인데 혼자
+bf16이다 (`models/deepseek_v4.py:641`). model-global 커널 쌍으로는 그 모델을 아예
+표현할 수 없다 — 나중에 발견하면 schema_version bump가 되므로 지금 넣었다.
+
+⚠ **cold backend에 파급된다**: proj마다 kt 커널이 다르면 kt 인스턴스도 proj마다
+따로 만들어야 한다. MoE는 한 layer의 gate/up/down이 한 `PartialMoEWrapper`를 공유하는데,
+dense는 애초에 proj별 인스턴스이므로 구조적으로는 맞다 — 다만 스레드풀 하나에 인스턴스
+수가 늘어나는 비용은 실측해야 한다.
+
+**⑧ dense 레인 분리 — `sglang-dense` 워크트리** (2026-09-01)
+
+타깃이 Muse-Glimmer-30B로 정해지면서 트리를 나눴다. 그 모델 파일이 **upstream main에만**
+있고 포크는 7,496커밋 뒤처져 있어서다 (포크 173 모델 파일 / main 221). GLM 레인은
+pr-36507 기준인데 거기엔 GLM 전용 tilelang 패치가 섞여 있어 dense에는 불필요하다.
+
+    sglang        f116b6dd9 [prism-orchestration]   포크 = 개발 트리(source of truth)
+    sglang-dense  9e9d26a4a [prism-dense]           upstream/main
+    sglang-glm    3992c4ce2 [pr-36507]
+
+`scripts/port_prism_to_upstream.sh`를 dense용으로 확장했다:
+
+- `copy srt/layers/linear_method_registry.py`
+- **`== 2c) LinearBase 훅`** — 앵커 삽입. 후보 2개 fallback을 둔 이유는 base마다
+  `LinearBase.__init__`의 끝 모양이 다르기 때문이다: 최신 upstream은 quant_method 선택
+  뒤에 `wrap_method_with_debug_kernel_once` 블록이 있고 구버전 포크에는 없다. main에서는
+  첫 후보가 걸렸고 그 **앞**에 붙는다 — debug 래퍼가 prism의 `apply`를 감싸야 계측 대상이
+  prism이 된다.
+- 검증에 dense 항목 (훅·registry·method 존재, 문법, `keeps_params_on_host` 선언)
+
+**`linear.py`의 훅을 지역 import로 바꿨다.** module-level import면 registry 파일이 없는
+트리에서 `linear.py` 자체가 import되지 않아 이식이 성립하지 않는다. 오버헤드는
+**0.84 µs/linear**(2000개에 1.7 ms) — 같은 프로세스에서 훅을 no-op으로 치환해 비교한 값이다.
+
+⚠ **`keeps_params_on_host`를 빠뜨렸다가 이식 스크립트를 읽고 발견했다.** MoE는
+`method.py:293`에 선언하고 `loader.py:142`가 소비하는데 dense method엔 없었다. 없으면
+`device_loading_context`가 layer마다 full weight를 GPU로 올렸다 내린 뒤 버린다 —
+**에러 없이 느려지기만** 한다(DSV4 실측 43층 186초). 스크립트의 "선언+소비 양쪽을 센다"
+검증이 정확히 이 부류를 잡는 장치다.
+
+**남은 Phase 0**: `scripts/build_prism_dense_env.sh` 실행 (Qwen3.8 다운로드가 대역폭·디스크를
+쓰고 있어 그 뒤로 미뤘다). 게이트는 `import muse_glimmer` + `pytest test/prism` 전량.
+
+**⑨ dense cold — C++ `PartialDenseWrapper`로 간다** (2026-09-01 결정)
+
+퇴화 `MOEConfig`(E=1, down 슬롯만) 실측은 **정확히 동작한다** — `forward_down`이
+`x @ W_cold.T`를 내고 decode 0.39 s/tok(28스레드, 119 GB/s)로 warm-only의 2.7배다.
+인스턴스를 9→72개로 늘려도 슬롯당 시간이 평평하다.
+
+그런데 **빈 슬롯을 못 쓴다** (`moe.hpp:513` "no weight source") — gate/up에 32행 더미가
+필수고, 그건 증상이지 원인이 아니다. 원인은 슬롯이 gate/up/down 3개로 고정이라는
+구조이고, dense는 층당 5~8슬롯이라 거기 맞출 수가 없다. 대가가 슬롯당 인스턴스
+(Qwen3.8 352개, 오버헤드 +25 GB, 로딩 78초)로 나온다.
+
+**계획·발견·게이트 전부 `layers/prism/linear/TODO.md`에 있다.** 그쪽이 dense 인계
+문서다. 여기서는 MoE와 공유되는 사실만 적는다:
+
+- kt 출력 dtype은 **bf16**이다 (`resources.py:75`가 이미 적어놨는데 못 보고 fp8로 잡아
+  `got[j] ≈ ref[2j+1]` + 50% 0을 한참 디버깅했다)
+- shard 테이블은 **NUMA 노드 수만큼** 필요하다 (`partial shard table size != tp_count`)
+- 스레드 최적점은 이 박스에서 **28** (물리 16코어). 14→28 +7%, **56은 9배 악화** —
+  MoE 메모의 과다구독 현상과 같다
+- kt 빌드에 **`libxml2-devel`**이 필요하다 (conda `hwloc.pc`의 `Requires.private`가
+  시스템 `.pc`로 폴백해 없는 경로를 만든다)
+
+### 남은 것
+
+- **`executor.py`** — 2-phase가 아니라 **1-phase**다 (gate_up/down이 별개 layer라
+  prism이 둘을 한 호출에서 볼 일이 없다). cold submit ∥ hot/warm GEMV → sync →
+  fp32 Σ → bf16. rejoin이 라우터 가중합 없이 단순 합이라 MoE `rejoin.py`를 못 쓴다.
+- **`method.py`** — `LinearMethodBase` 형태: `create_weights(layer,
+  input_size_per_partition, output_partition_sizes, input_size, output_size,
+  params_dtype, **attrs)` / `apply(layer, x, bias) -> Tensor`. MoE의
+  `dispatch_output`/`CombineInput` 래핑이 없다. predicate에서 `tp_size`를 못 보므로
+  TP=1 방어는 `create_weights`에서 (`input_size_per_partition != input_size`면 즉사).
+- **② kt cold의 dense 입구 (미해소).** cold는 kt `MOEConfig` + `expert_ids`를
+  전제한다. `operators/llamafile/linear.h`의 `Linear`는 (a) python 바인딩이
+  `ext_bindings.cpp:678`에서 주석 처리돼 있고 (b) llamafile 경로라 AMX가 아니다.
+  **권고: E=1 퇴화 `MOEConfig`로 우회** — 기존 배관(`PartialMoEWrapper`, partial
+  K-index, NUMA N-shard)을 그대로 쓰고 `expert_ids`를 전부 0으로 준다. AMX GEMM
+  바인딩 신설은 그 다음.
+- **최종형으로의 이동.** MoE도 `layers/prism/moe/`로 내리면 이름이 완전히 정직해지고
+  upstream rebase 충돌 표면도 준다(prism은 fork 전용 코드). 5,432줄 이동 + import
+  재작성 42파일이라 별도 커밋으로 미뤘다.
+
+### TP를 열 때 (지금은 TP=1 전용이라 무관)
+
+축 관계는 다음과 같다 — kt NUMA shard는 **N축**(`plan.NumaShard`)이라
+prism band(K축)와 원래 직교다. 부딪히는 것은 TP다.
+
+| | 쪼개는 축 |
+|---|---|
+| prism band (hot/warm/cold) | K |
+| kt NUMA shard | N |
+| `ColumnParallelLinear` TP | N |
+| `RowParallelLinear` TP | K |
+
+- `RowParallelLinear`(down_proj, wo_b): TP(K) 안에 prism band(K) 중첩.
+  정확성은 무해하다 — all_reduce가 `apply` 뒤에 온다. 숙제는 (a) plan의 K
+  오프셋이 full-K 절대좌표라 rank별 re-base 필요, (b) 밴드 경계 페어(%2) 정렬이
+  K/T 분할 후에도 유지, (c) sparsity calib(`wn`, `pair_dot`)도 K축이라 동반 슬라이스.
+- `ColumnParallelLinear`(gate_up, wq_b, wo_a): TP(N) 안에 kt NUMA(N) 중첩.
+  `N/TP/nodes`가 `COL_GROUP=32` 배수여야 하며 아니면 `cold_backend._build_config`의
+  정렬 검사가 즉사시킨다.
+- **진짜 병목은 축이 아니라 프로세스 자원이다.** TP>1은 rank마다 별도 프로세스인데
+  `_PrismRuntime`(CPUInfer 스레드풀)은 프로세스 전역 1벌이라 T배 과다구독된다 —
+  이 파일 위쪽 "테스트 위생" 절과 `method.py`의 실측(16코어 60스레드 → sync
+  1.85ms) 그대로다. `SGLANG_PRISM_CPUINFER_THREADS`를 코어/TP로 낮추고 rank별
+  코어 pin이 전제. warm pinned store도 GPU-local 노드에 놓이므로 2소켓 4GPU에서는
+  rank 둘이 같은 노드의 host 대역폭을 나눠 쓴다.
+
 ## cold 커널 교체 — 두 포팅이 같은 레이아웃을 다른 방법으로 만든다 (2026-08-25 밤)
 
 두 커널이 도착했고 **둘 다 n-contiguous B 레이아웃을 전제**하는데, 그 레이아웃을
