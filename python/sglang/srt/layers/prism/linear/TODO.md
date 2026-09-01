@@ -161,13 +161,34 @@ down 매핑에서 `intermediate_size`는 **dense proj의 K**다. `mlp.down_proj`
 | **D3** | ~~`rejoin.py`~~ **불필요** — H2D 목적지를 `out3d[:, n_start:+n_cols]`로 잡으면 열 매핑이 복사에 흡수된다. gateup unit은 out이 곧 `[gate 열 \| up 열]`이라 연속 복사 1회 | ✅ |
 | **D4** | `executor.py` — submit ∥ GPU → sync → H2D → rejoin, cold 거부 해제 | ✅ |
 | **D5** | `method.py` — 백엔드 생성 + 첫 step finalize | ✅ |
-| **D6** | 실모델 (Qwen3.8-27B) | ⬜ **다음** |
+| **D6** | 실모델 (Qwen3.8-27B) | ✅ **0.285~0.38 s/tok** (아래) |
 | **D7** | *(선택)* kt 선택적 proj 슬롯 | ⬜ 이제 불필요에 가깝다 (아래) |
 
-**게이트 결과** (`test/prism/test_linear_cold.py`, 9개 통과):
+**D6 실모델** (Qwen3.8-27B, RTX 5090, hot10/warm15/cold75, CUDA graph 없이, 28스레드):
 
-- **계약 ⑤-5 비트일치** — `(hot, warm) ∈ {(1,0), (0,1), (0,0), (.25,.25), (.5,.25)}`
-  다섯 배치에서 출력이 **비트일치**한다. 정확히 표현 가능한 입력(±1 8개 × 정수
+```
+기동          weight load 112.9 s · hot 10.55 GB · KV 10.5 GB · GPU 총 23.1 GB
+첫 요청       24.1 s (cold pack finalize 포함)
+정상 상태     32 tok  9.13 s → 0.285 s/tok
+              64 tok 19.73 s → 0.308 s/tok
+출력          "The capital of France is" → " Paris.\nThe capital of Germany is
+              Berlin.\nThe capital of Italy is Rome.\n…"
+```
+
+**warm-only 1.05 s/tok 대비 3.4배**이고 §2 퇴화 벤치의 예측 0.39 s/tok보다 낫다.
+
+**첫 기동은 틀렸다** — 그리고 그 실패가 이 단계에서 가장 값진 것이다. `expert_ids`를
+슬롯당 **한 칸**만 줬는데 kt는 `expert_ids[i·k + j]`를 `i ∈ [0, qlen)`로 읽는다
+(`prepare_prefill_routing`, `export_*_partial`). 그래서 prefill이 토큰 n을 슬롯 e+n의
+weight로 계산했고, decode는 멀쩡했다. 실모델 첫 응답이
+`"The capital of France is" → "复数形式"`였다. **테스트가 M=1만 봐서 통과했다** —
+지금은 M ∈ {1, 2, 5, 17}로 돈다. kt는 `qlen == 1`과 `qlen > 1`이 서로 다른 경로이므로
+**M을 파라미터로 돌지 않는 cold 테스트는 prefill을 전혀 보지 않는 것**이다.
+
+**게이트 결과** (`test/prism/test_linear_cold.py`, 30개 통과):
+
+- **계약 ⑤-5 비트일치** — `(hot, warm)` 다섯 배치 × `M ∈ {1, 2, 5, 17}`에서
+  출력이 **비트일치**한다. 정확히 표현 가능한 입력(±1 8개 × 정수
   weight)이라 bf16 라운딩이 무손실이고, 그래서 이중계산·누락·좌표 뒤섞임이
   tolerance 뒤에 숨지 못한다.
   ⚠ dense에는 인덱스 자산이 없어 티어 멤버십이 늘 연속 밴드의 합집합이다 —

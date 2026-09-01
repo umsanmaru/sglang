@@ -47,12 +47,25 @@ class LinearColdStaging:
         # partial은 bf16 (계약 ⑤: wire dtype = bf16, kt `to_mat` 재사용).
         self._out = torch.empty(max_tokens, top_k, out_cols, dtype=torch.bfloat16, **kw)
         # 슬롯 신원 = expert id. 값이 로드 타임에 확정되므로 여기서 굳힌다.
-        self._ids = torch.arange(num_experts, dtype=torch.int64).contiguous()
+        #
+        # **모양이 `[E, max_tokens]`인 이유**: kt는 `expert_ids[i·k + j]`를
+        # `i ∈ [0, qlen)`로 읽는다 (`prepare_prefill_routing`, `export_*_partial`).
+        # 즉 **토큰마다 한 칸**이 필요하다. `[E]` 한 칸만 주면 qlen>1에서 kt가 이웃
+        # expert id들을 읽어 토큰마다 다른 layer의 weight로 계산한다 — decode(qlen=1)
+        # 는 멀쩡하고 prefill만 조용히 틀린다 (2026-09-01 실모델에서 그렇게 나왔다:
+        # "The capital of France is" → "复数形式").
+        #
+        # 행 e를 전부 e로 채워 두면 어느 토큰이든 같은 슬롯을 가리키고, 값이 로드
+        # 타임에 고정이라 step마다 쓸 것이 없다 (계약 ④ dense 고유).
+        ids = torch.arange(num_experts, dtype=torch.int64).unsqueeze(1).expand(
+            num_experts, max_tokens).contiguous()
         if pin_memory:
-            pinned = torch.empty(num_experts, dtype=torch.int64, pin_memory=True)
-            pinned.copy_(self._ids)
-            self._ids = pinned
-        self._ids_stride = self._ids.element_size()
+            pinned = torch.empty(num_experts, max_tokens, dtype=torch.int64,
+                                 pin_memory=True)
+            pinned.copy_(ids)
+            ids = pinned
+        self._ids = ids
+        self._ids_row_bytes = max_tokens * ids.element_size()
 
     # ── 포인터 (kt는 정수 주소만 받는다) ─────────────────────────────────
     def x_ptr(self) -> int:
@@ -62,10 +75,15 @@ class LinearColdStaging:
         return self._out.data_ptr()
 
     def expert_ids_ptr(self, expert: int) -> int:
-        """`[expert]` 한 칸의 주소. top_k=1이라 kt는 여기서 int64 하나만 읽는다."""
-        if not 0 <= expert < int(self._ids.numel()):
-            raise IndexError(f"expert {expert} out of range 0..{int(self._ids.numel()) - 1}")
-        return self._ids.data_ptr() + expert * self._ids_stride
+        """`[max_tokens]`짜리 행 하나의 주소 — 전부 `expert`로 채워져 있다.
+
+        kt가 토큰마다 한 칸씩 읽으므로(`expert_ids[i·k + j]`, `i ∈ [0, qlen)`)
+        길이가 max_tokens여야 한다. 한 칸만 주면 prefill이 조용히 틀린다.
+        """
+        e = int(self._ids.shape[0])
+        if not 0 <= expert < e:
+            raise IndexError(f"expert {expert} out of range 0..{e - 1}")
+        return self._ids.data_ptr() + expert * self._ids_row_bytes
 
     # ── 내용 (in-place만) ────────────────────────────────────────────────
     def fill_x(self, x: torch.Tensor, *, non_blocking: bool = True) -> None:

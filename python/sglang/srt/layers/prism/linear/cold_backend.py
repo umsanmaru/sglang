@@ -298,11 +298,14 @@ class KtLinearColdBackend:
             group.freeze()
             self._check_group(group)
         self._build_calls()
+        # 통계를 **로드 전에** 뽑는다 — `_load_group`이 pack 뒤에 `unit.colds`를
+        # 비우므로(계약 ③) 나중에 읽으면 전부 0이 나온다.
+        stats = {g.key: _row_stats(g) for g in self._groups.values()}
         for group in self._groups.values():
             self._load_group(group)
-        self._log_summary()
+        self._log_summary(stats)
 
-    def _log_summary(self) -> None:
+    def _log_summary(self, stats) -> None:
         """그룹 구성과 **패딩 낭비**를 로드 타임에 보이게 한다.
 
         유령 밴드는 게이트가 죽이지만 "타일을 조금 넘긴" 밴드는 정상이면서도
@@ -310,11 +313,7 @@ class KtLinearColdBackend:
         숫자로 보여준다 — 안 보이면 아무도 안 고친다.
         """
         for g in sorted(self._groups.values(), key=lambda g: -g.num_experts):
-            real = pad = 0
-            for u in g.units:
-                for c in u.colds:
-                    real += c.real_rows
-                    pad += c.k_pad
+            real, pad = stats[g.key]
             waste = 100.0 * (pad - real) / pad if pad else 0.0
             logger.info(
                 "[prism-linear] cold %s: E=%d out_cols=%d rows=%d(+%d 패딩 %.1f%%)",
@@ -550,6 +549,16 @@ class KtLinearColdBackend:
 # ---------------------------------------------------------------------------
 # 텐서 조립
 # ---------------------------------------------------------------------------
+
+
+def _row_stats(group: ColdGroup) -> Tuple[int, int]:
+    """(실제 행 수, 패딩 포함 행 수). `_load_group`이 참조를 놓기 전에 불러야 한다."""
+    real = pad = 0
+    for u in group.units:
+        for c in u.colds:
+            real += c.real_rows
+            pad += c.k_pad
+    return real, pad
 
 
 def _set_kindex(dst, shards: Sequence[LinearColdShard]) -> None:

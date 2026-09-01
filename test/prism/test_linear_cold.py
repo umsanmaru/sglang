@@ -71,7 +71,7 @@ def _plan_dict(hot, warm, *, kernel="kt_amx_bf16", raw_bands=None, shards=None):
     }
 
 
-def _exact_weights(seed=0):
+def _exact_weights(seed=0, m=1):
     """정확히 표현 가능한 값 — bf16 라운딩이 무손실이라야 티어 배치가 비트일치한다.
 
     x는 8개만 ±1이고 W는 [-2, 2] 정수이므로 부분합의 절댓값이 16을 넘지 않는다.
@@ -84,9 +84,10 @@ def _exact_weights(seed=0):
             w[(layer, name)] = torch.randint(-2, 3, (n, k), generator=g).to(torch.bfloat16)
     xs = {}
     for name, k in (("mlp.gate_up_proj", H), ("mlp.down_proj", I)):
-        x = torch.zeros(1, k)
-        idx = torch.randperm(k, generator=g)[:8]
-        x[0, idx] = torch.randint(0, 2, (8,), generator=g).float() * 2 - 1
+        x = torch.zeros(m, k)
+        for row in range(m):
+            idx = torch.randperm(k, generator=g)[:8]
+            x[row, idx] = torch.randint(0, 2, (8,), generator=g).float() * 2 - 1
         xs[name] = x.to(torch.bfloat16).cuda()
     return w, xs
 
@@ -102,10 +103,10 @@ def _run_all(plan_dict, weights, xs):
                    for pp in plan.projs.values())
     cold = res = None
     if has_cold:
-        cold = KtLinearColdBackend(plan, max_tokens=8, num_numa_nodes=NODES,
+        cold = KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES,
                                    cpuinfer_threads=8)
-        res = LinearColdResources(max_tokens=8)
-    ex = LinearExecutor(max_tokens=8, device=dev, cold=cold, resources=res)
+        res = LinearColdResources(max_tokens=32)
+    ex = LinearExecutor(max_tokens=32, device=dev, cold=cold, resources=res)
     ex.warmup(dev)
     for (layer, name), w in weights.items():
         ex.register(layer, name,
@@ -119,16 +120,24 @@ def _run_all(plan_dict, weights, xs):
     return out
 
 
+@pytest.mark.parametrize("m", [1, 2, 5, 17])
 @pytest.mark.parametrize("hot,warm", [(1.0, 0.0), (0.0, 1.0), (0.0, 0.0),
                                       (0.25, 0.25), (0.5, 0.25)])
-def test_tier_placement_is_bitwise(hot, warm):
+def test_tier_placement_is_bitwise(hot, warm, m):
     """티어를 어디에 두든 **비트일치** (계약 ⑤-5).
 
     안 잡으면: 한 티어가 자기 K행을 빠뜨리거나 두 티어가 같은 행을 더해도 값이
     "그럴듯하게" 나온다. 정확도 테스트는 tolerance라 통과하고, 서버도 통과하고,
     벤치 결론만 틀린다.
+
+    **M을 파라미터로 도는 것이 핵심이다.** kt는 `qlen == 1`과 `qlen > 1`이 서로
+    다른 경로다(decode 빠른 경로 vs prefill 토큰 그룹핑). M=1만 보면 prefill이
+    조용히 틀려도 통과한다 — 2026-09-01에 실제로 그랬다: `expert_ids`를 슬롯당
+    한 칸만 줬는데 kt는 `expert_ids[i·k + j]`를 토큰마다 읽어서, prefill이 토큰
+    n을 슬롯 e+n의 weight로 계산했다. decode는 멀쩡했고 실모델 첫 응답이
+    "The capital of France is" → "复数形式"였다.
     """
-    weights, xs = _exact_weights()
+    weights, xs = _exact_weights(m=m)
     ref = _run_all(_plan_dict(1.0, 0.0), weights, xs)     # all-hot 기준
     got = _run_all(_plan_dict(hot, warm), weights, xs)
     for key in ref:
@@ -155,7 +164,7 @@ def test_layers_merge_into_one_instance():
     """
     plan = parse_plan(_plan_dict(0.0, 0.0))
     validate_static(plan)
-    cold = KtLinearColdBackend(plan, max_tokens=8, num_numa_nodes=NODES,
+    cold = KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES,
                                cpuinfer_threads=8)
     torch.manual_seed(0)
     for layer in range(LAYERS):
@@ -188,7 +197,7 @@ def test_mismatched_shards_split_into_two_groups():
     plan_a, plan_b = parse_plan(base), parse_plan(skew)
     validate_static(plan_a)
     validate_static(plan_b)
-    cold = KtLinearColdBackend(plan_a, max_tokens=8, num_numa_nodes=NODES,
+    cold = KtLinearColdBackend(plan_a, max_tokens=32, num_numa_nodes=NODES,
                                cpuinfer_threads=8)
     w = torch.zeros(H, I, dtype=torch.bfloat16)
     cold.register(0, "mlp.down_proj",
@@ -212,7 +221,7 @@ def test_sparse_plan_is_rejected():
             part.update({"calib": "g", "p": 0.5, "lambda": 0.0})
     plan = parse_plan(d)
     with pytest.raises(NotImplementedError, match="sparse"):
-        KtLinearColdBackend(plan, max_tokens=8, num_numa_nodes=NODES)
+        KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES)
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +294,7 @@ def test_ghost_cold_band_is_rejected():
 
     plan = parse_plan(_plan_dict(0, 0, raw_bands=bands))
     validate_static(plan)
-    cold = KtLinearColdBackend(plan, max_tokens=8, num_numa_nodes=NODES,
+    cold = KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES,
                                cpuinfer_threads=8)
     w = torch.zeros(H, I, dtype=torch.bfloat16)
     cold.register(0, "mlp.down_proj",
@@ -303,7 +312,7 @@ def test_all_hot_proj_costs_nothing():
     """
     plan = parse_plan(_plan_dict(1.0, 0.0))          # 전부 hot
     validate_static(plan)
-    cold = KtLinearColdBackend(plan, max_tokens=8, num_numa_nodes=NODES,
+    cold = KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES,
                                cpuinfer_threads=8)
     dev = torch.device("cuda")
     for name, k, n in (("mlp.gate_up_proj", H, 2 * I), ("mlp.down_proj", I, H)):

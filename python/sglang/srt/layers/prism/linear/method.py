@@ -43,6 +43,10 @@ _ENV_MAX_TOKENS = "SGLANG_PRISM_LINEAR_MAX_TOKENS"
 # cold CPU 스레드 수. 벤치는 28이 최적이었지만(물리 16코어 = 8×2소켓; 14→28은 7%
 # 개선, 56은 9배 악화) 실서버는 GPU 스트림·스케줄러와 경합하므로 재측정 대상이다.
 _ENV_COLD_THREADS = "SGLANG_PRISM_LINEAR_COLD_THREADS"
+# MoE와 공유하는 이름. dense 전용 값이 없으면 이쪽을 본다 — 실행
+# 스크립트가 이미 이 이름을 내보내고 있어서, 안 맞추면 지정한 스레드
+# 수가 조용히 무시되고 기본값 28로 돈다.
+_ENV_CPUINFER = "SGLANG_PRISM_CPUINFER_THREADS"
 
 # 래핑이 **로더 선택을 바꾸는** 메서드들. `ColumnParallelLinear.__init__`이
 # `self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED`로 v1/v2
@@ -102,7 +106,8 @@ class _LinearRuntime:
         from sglang.srt.layers.prism.numa import numa_node_count
 
         nodes = numa_node_count()
-        threads = int(os.environ.get(_ENV_COLD_THREADS, "28"))
+        threads = int(os.environ.get(_ENV_COLD_THREADS,
+                             os.environ.get(_ENV_CPUINFER, "28")))
         logger.info("[prism-linear] cold backend: %d NUMA nodes, %d CPUInfer threads",
                     nodes, threads)
         return (

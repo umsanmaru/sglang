@@ -216,6 +216,13 @@ class LinearExecutor:
         st = self._projs.get((layer_idx, name))
         if st is None:
             raise KeyError(f"layer {layer_idx} proj '{name}' is not registered")
+        if self._cold is not None and not self._finalized:
+            # `cold_calls`가 finalize에서 채워지므로, 그 전에 돌면 cold 행이 계산에서
+            # **조용히 빠진다** — 예외 없이 값만 틀린다.
+            raise RuntimeError(
+                f"layer {layer_idx} proj '{name}': finalize() before run() — "
+                f"cold 호출 테이블이 아직 비어 있다"
+            )
         prep = st.prepared
         m = x.shape[0]
         if x.shape[1] != prep.k:
