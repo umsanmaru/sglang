@@ -65,7 +65,7 @@ def _ref(x, ids, wref, kidx_cpu, row_off_cpu, pair):
 @pytest.mark.parametrize("pair", [False, True])
 @pytest.mark.parametrize("exact", [False, True])
 def test_gemv_mxfp4_matches_reference(pair, exact):
-    from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed
+    from sglang.kernels.ops.moe.prism_gemv_mxfp4 import gemv_mxfp4_indexed
 
     N, K, k_rows, M = 160, 256, 128, 3
     codes, scales, row_off, kidx, wref = _store(N, K, k_rows, exact, seed=1)
@@ -83,7 +83,7 @@ def test_gemv_mxfp4_matches_reference(pair, exact):
 
 @cuda_required
 def test_gemv_mxfp4_pinned_bitwise_and_offset():
-    from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_pinned
+    from sglang.kernels.ops.moe.prism_gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_pinned
 
     N, K, k_rows, M = 128, 512, 256, 2
     codes, scales, row_off, kidx, _ = _store(N, K, k_rows, False, seed=3)
@@ -101,7 +101,7 @@ def test_gemv_mxfp4_pinned_bitwise_and_offset():
 
 @cuda_required
 def test_gemv_mxfp4_gateup_fused_bitwise():
-    from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_gateup
+    from sglang.kernels.ops.moe.prism_gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_gateup
 
     N, K, k_rows, M = 128, 256, 128, 1
     c1, s1, ro1, ki1, _ = _store(N, K, k_rows, False, seed=5)
@@ -127,7 +127,7 @@ def test_gemv_mxfp4_wide_tile_bitwise():
     융합/단일 launch가 서로 다른 kNY를 고르면 일반 입력에서 여기서 비트가 갈린다.
     위 테스트들은 k_rows가 작아(≤ 512) 넓은 분기(kNY=64)를 한 번도 타지 않는다.
     """
-    from sglang.jit_kernel.prism_gemv_mxfp4 import (
+    from sglang.kernels.ops.moe.prism_gemv_mxfp4 import (
         gemv_mxfp4_indexed, gemv_mxfp4_indexed_gateup, gemv_mxfp4_indexed_pinned,
     )
 
@@ -158,7 +158,7 @@ def test_gemv_mxfp4_wide_tile_bitwise():
 @cuda_required
 def test_gemv_mxfp4_sparse_thr0_bitwise_and_masked():
     """thr=0(전부 keep) ↔ dense 비트일치; thr>0 ↔ 마스크 적용 참조."""
-    from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_sparse
+    from sglang.kernels.ops.moe.prism_gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_sparse
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
     N, K, k_rows, M = 128, 256, 128, 2
@@ -213,8 +213,8 @@ def test_gemv_mxfp4_sparse_thr0_bitwise_and_masked():
 @pytest.mark.parametrize("exact", [False, True])
 @pytest.mark.parametrize("m", [8, 300])
 def test_grouped_mxfp4_matches_gemv(pair, exact, m):
-    from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed
-    from sglang.jit_kernel.prism_grouped_mxfp4 import grouped_mxfp4_indexed, grouped_mxfp4_indexed_pinned
+    from sglang.kernels.ops.moe.prism_gemv_mxfp4 import gemv_mxfp4_indexed
+    from sglang.kernels.ops.moe.prism_grouped_mxfp4 import grouped_mxfp4_indexed, grouped_mxfp4_indexed_pinned
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows = 144, 320, 96   # kr=96: 64 배수 아님 → 마지막 K 타일 절반 유효 경로
@@ -244,7 +244,7 @@ def test_grouped_mxfp4_matches_gemv(pair, exact, m):
 
 @cuda_required
 def test_grouped_mxfp4_gateup_fused():
-    from sglang.jit_kernel.prism_grouped_mxfp4 import grouped_mxfp4_indexed, grouped_mxfp4_indexed_gateup
+    from sglang.kernels.ops.moe.prism_grouped_mxfp4 import grouped_mxfp4_indexed, grouped_mxfp4_indexed_gateup
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows, m = 128, 256, 128, 40
@@ -271,7 +271,7 @@ def test_grouped_mxfp4_cold_slab_matches_pairrow(m):
     host 텐서(pinned)이고 blk_off는 바이트 오프셋."""
     from types import SimpleNamespace
 
-    from sglang.jit_kernel.prism_grouped_mxfp4 import grouped_mxfp4_cold, grouped_mxfp4_indexed
+    from sglang.kernels.ops.moe.prism_grouped_mxfp4 import grouped_mxfp4_cold, grouped_mxfp4_indexed
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows = 96, 256, 96          # kr=96: 64 배수 아님
@@ -316,7 +316,7 @@ def test_grouped_mxfp4_cold_tile_slab_matches_pairrow(m):
     from types import SimpleNamespace
 
     from mxfp4_ref import tile_block
-    from sglang.jit_kernel.prism_grouped_mxfp4 import grouped_mxfp4_cold, grouped_mxfp4_indexed
+    from sglang.kernels.ops.moe.prism_grouped_mxfp4 import grouped_mxfp4_cold, grouped_mxfp4_indexed
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows = 256, 256, 96          # kr=96: 64 배수 아님 (마지막 GPU 타일 절반 유효)

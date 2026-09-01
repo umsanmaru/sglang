@@ -355,7 +355,7 @@ def _wres_k_max(*shards) -> int:
     k_max는 32의 배수여야 한다 (커널 K 스텝) — 로더가 그렇게 굽지 않은 스토어(밴드
     퇴화형에서 임의 k)는 32로 올린다. (bf16 cold/packed slab용 — GPU 티어 스토어는
     `shard.fmt.wres_k_max`가 같은 규칙을 포맷별로 준다.)"""
-    from sglang.jit_kernel import prism_grouped
+    from sglang.kernels.ops.moe import prism_grouped
 
     if not prism_grouped.WRES_PCIE:
         return 0
@@ -366,7 +366,7 @@ def _wres_k_max(*shards) -> int:
 def _warm_max_blocks() -> int:
     """PCIe launch의 블록 수 상한 — 호출 시점에 모듈 값을 읽는다 (벤치가 스윕할 수
     있게). 0 = 상한 없음. 근거는 prism_grouped.WARM_MAX_BLOCKS 주석."""
-    from sglang.jit_kernel import prism_grouped
+    from sglang.kernels.ops.moe import prism_grouped
 
     return int(prism_grouped.WARM_MAX_BLOCKS)
 
@@ -495,8 +495,8 @@ class PackedWarmTier:
 
     def run(self, x2d, topk_ids, topk_weights, out3d, out_col_off, *,
             x_row_is_pair, masking, grouping=None) -> None:
-        from sglang.jit_kernel.prism_gemv_packed import gemv_packed, gemv_packed_sparse
-        from sglang.jit_kernel.prism_grouped import grouped_gemm_cold
+        from sglang.kernels.ops.moe.prism_gemv_packed import gemv_packed, gemv_packed_sparse
+        from sglang.kernels.ops.moe.prism_grouped import grouped_gemm_cold
 
         stream = torch.cuda.current_stream()
         if grouping is not None:
@@ -523,10 +523,10 @@ class PackedWarmGateUp:
 
     def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking,
             grouping=None) -> None:
-        from sglang.jit_kernel.prism_gemv_packed import (
+        from sglang.kernels.ops.moe.prism_gemv_packed import (
             gemv_packed_gateup, gemv_packed_sparse_gateup,
         )
-        from sglang.jit_kernel.prism_grouped import grouped_gemm_cold_gateup
+        from sglang.kernels.ops.moe.prism_grouped import grouped_gemm_cold_gateup
 
         stream = torch.cuda.current_stream()
         if grouping is not None:

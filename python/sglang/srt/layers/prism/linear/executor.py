@@ -190,7 +190,7 @@ class LinearExecutor:
     def _grouping(self, m: int, device):
         """E=1의 자명한 Grouping. pair p = m·1 + 0 = m 이라 정렬이 항등이다."""
         from sglang.srt.layers.moe.prism.grouping import Grouping
-        from sglang.jit_kernel.prism_grouped import TILE_M
+        from sglang.kernels.ops.moe.prism_grouped import TILE_M
 
         g = self._group_cache.get(m)
         if g is None:

@@ -638,7 +638,7 @@ class PrismExecutor:
                                                 cuda_stream=sarg, weights_ptr=0)
             res.cold_seq += 1
             self._cold.submit_signal(sarg, res.cold_flag.data_ptr(), res.cold_seq)
-            from sglang.jit_kernel.prism_grouped import wait_flag
+            from sglang.kernels.ops.moe.prism_grouped import wait_flag
             wait_flag(res.cold_flag, res.cold_seq, cs)
             dev = x_or_act.device
             if phase == "gateup":

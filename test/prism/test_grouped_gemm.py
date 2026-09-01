@@ -42,8 +42,8 @@ def _inputs(m, kx, exact, pair, seed):
 
 
 def _run_pair(m, exact, pair, pinned, fused):
-    from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed
-    from sglang.jit_kernel.prism_grouped import (
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist_indexed
+    from sglang.kernels.ops.moe.prism_grouped import (
         grouped_gemm_indexed, grouped_gemm_indexed_gateup,
         grouped_gemm_indexed_pinned, grouped_gemm_indexed_pinned_gateup,
     )
@@ -95,7 +95,7 @@ def test_grouped_matches_worklist_tolerance(m, pair):
 def test_grouping_tensors():
     """pair_off/tile_off의 정의 — count>TILE_M인 expert는 타일이 여러 개, 0인
     expert는 구간이 비어야 한다. host sync 없이 device에서 만들어진다."""
-    from sglang.jit_kernel.prism_grouped import TILE_M
+    from sglang.kernels.ops.moe.prism_grouped import TILE_M
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     ids = torch.randint(0, E, (300, K)).cuda()

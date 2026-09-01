@@ -36,7 +36,7 @@ def _mk(M=2, k=4, E=16, k_rows=64, N=96, Kx=128, exact=False, x_row_is_pair=Fals
 @pytest.mark.parametrize("x_row_is_pair", [False, True])
 @pytest.mark.parametrize("ids_dtype", [torch.int32, torch.int64])
 def test_gemv_worklist_device_tolerance(x_row_is_pair, ids_dtype):
-    from sglang.jit_kernel.prism_gemv import gemv_worklist
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist
     x, w, ids = _mk(x_row_is_pair=x_row_is_pair)
     xd, wd = x.cuda(), w.cuda()
     idsd = ids.to(ids_dtype).cuda()
@@ -49,7 +49,7 @@ def test_gemv_worklist_device_tolerance(x_row_is_pair, ids_dtype):
 
 @cuda_required
 def test_gemv_worklist_device_exact_ints_bitwise():
-    from sglang.jit_kernel.prism_gemv import gemv_worklist
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist
     x, w, ids = _mk(exact=True)
     out = torch.zeros(2, 4, 96, dtype=torch.bfloat16, device="cuda")
     gemv_worklist(x.cuda(), ids.int().cuda(), w.cuda(), out, 0, 0, False,
@@ -62,7 +62,7 @@ def test_gemv_worklist_device_exact_ints_bitwise():
 @cuda_required
 def test_gemv_worklist_out_col_offset_slice():
     """gate/up이 [M,k,2I]의 열 반쪽에 각자 쓰는 시나리오."""
-    from sglang.jit_kernel.prism_gemv import gemv_worklist
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist
     x, w, ids = _mk(exact=True, N=96)
     I = 96
     gu = torch.zeros(2, 4, 2 * I, dtype=torch.bfloat16, device="cuda")
@@ -78,7 +78,7 @@ def test_gemv_worklist_out_col_offset_slice():
 @cuda_required
 def test_gemv_worklist_pinned_matches_device():
     """W가 pinned CPU(UVA)여도 device 변형과 비트 동일 — warm 티어 경로."""
-    from sglang.jit_kernel.prism_gemv import gemv_worklist, gemv_worklist_pinned
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist, gemv_worklist_pinned
     x, w, ids = _mk(exact=True)
     out_d = torch.zeros(2, 4, 96, dtype=torch.bfloat16, device="cuda")
     out_p = torch.zeros_like(out_d)
@@ -91,7 +91,7 @@ def test_gemv_worklist_pinned_matches_device():
 
 @cuda_required
 def test_gemv_worklist_pinned_rejects_device_src():
-    from sglang.jit_kernel.prism_gemv import gemv_worklist_pinned
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist_pinned
     x, w, ids = _mk()
     out = torch.zeros(2, 4, 96, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(Exception):
@@ -104,7 +104,7 @@ def test_gemv_worklist_perf_smoke():
     """35B h375 hot gate 치수(g=8, 768x512)에서 (gather+bmm) 대비 과도한
     회귀가 없는지 — 상한 2배의 러프 가드 (튜닝 회귀 감지용, 마이크로벤치 아님)."""
     import time
-    from sglang.jit_kernel.prism_gemv import gemv_worklist
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist
     E, k_rows, N, M, k = 64, 768, 512, 1, 8
     w = torch.randn(E, k_rows, N).to(torch.bfloat16).cuda()
     x = torch.randn(M, 2048).to(torch.bfloat16).cuda()
@@ -184,7 +184,7 @@ def test_indexed_contiguous_matches_band_bitwise(x_row_is_pair, ids_dtype):
     같은 원소를 같은 순서로 누산하므로 성립한다 — 이 등호가 있어야 S5~S7이
     밴드 경로를 기준으로 검증될 수 있다.
     """
-    from sglang.jit_kernel.prism_gemv import gemv_worklist, gemv_worklist_indexed
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist, gemv_worklist_indexed
     E, kr, N, Kx, M, k, off = 8, 64, 96, 128, 2, 4, 32
     x, w, ids = _mk(M=M, k=k, E=E, k_rows=kr, N=N, Kx=Kx, exact=True,
                     x_row_is_pair=x_row_is_pair)
@@ -207,7 +207,7 @@ def test_indexed_contiguous_matches_band_bitwise(x_row_is_pair, ids_dtype):
 @pytest.mark.parametrize("x_row_is_pair", [False, True])
 def test_indexed_shuffled_matches_reference(x_row_is_pair):
     """셔플 인덱스 — 밴드로는 표현 불가능한 구성. 좌표가 뒤섞이면 여기서 걸린다."""
-    from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist_indexed
     x, w_flat, row_off, kidx, ids = _mk_indexed(
         [64] * 8, x_row_is_pair=x_row_is_pair)
     out = torch.zeros(2, 4, 96, dtype=torch.bfloat16, device="cuda")
@@ -222,7 +222,7 @@ def test_indexed_shuffled_matches_reference(x_row_is_pair):
 @cuda_required
 def test_indexed_variable_k_per_expert():
     """expert마다 행 수가 다른 구성 — 가변 K가 이 표현의 존재 이유다."""
-    from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist_indexed
     k_per = [8, 64, 32, 128, 16, 64, 96, 4]
     x, w_flat, row_off, kidx, ids = _mk_indexed(k_per)
     out = torch.zeros(2, 4, 96, dtype=torch.bfloat16, device="cuda")
@@ -238,7 +238,7 @@ def test_indexed_variable_k_per_expert():
 def test_indexed_zero_rows_writes_zero():
     """k[e] == 0은 특례가 아니다 — 루프가 0회 돌고 0을 쓰는데, 그게 그 티어의
     정확한 부분합이다 ("이 expert는 이 티어에 없음")."""
-    from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist_indexed
     k_per = [0, 64, 0, 32]
     x, w_flat, row_off, kidx, _ = _mk_indexed(k_per)
     ids = torch.tensor([[0, 1, 2, 3]])  # expert 0, 2가 빈 티어
@@ -262,7 +262,7 @@ def test_indexed_wide_tile_bitwise():
     hot(device)/warm(pinned)이나 융합/단일 launch가 서로 다른 NY를 고르면 일반 입력에서
     여기서 비트가 갈린다. 위 테스트들은 expert당 행이 작아(≤ 96) 넓은 NY 분기를 타지 않는다.
     """
-    from sglang.jit_kernel.prism_gemv import (
+    from sglang.kernels.ops.moe.prism_gemv import (
         gemv_worklist_indexed, gemv_worklist_indexed_gateup, gemv_worklist_indexed_pinned,
     )
 
@@ -292,7 +292,7 @@ def test_indexed_wide_tile_bitwise():
 @cuda_required
 def test_indexed_pinned_matches_device():
     """W가 pinned여도 device 변형과 비트 동일 — warm 티어의 제자리 UVA 읽기."""
-    from sglang.jit_kernel.prism_gemv import (
+    from sglang.kernels.ops.moe.prism_gemv import (
         gemv_worklist_indexed, gemv_worklist_indexed_pinned,
     )
     x, w_flat, row_off, kidx, ids = _mk_indexed([32, 64, 96, 16])
@@ -310,7 +310,7 @@ def test_indexed_pinned_matches_device():
 @cuda_required
 def test_indexed_out_col_offset_slice():
     """gate/up이 [M,k,2I]의 열 반쪽에 각자 쓰는 시나리오 — 인덱스도 서로 다르다."""
-    from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist_indexed
     I = 96
     xg, wg, og, kg, ids = _mk_indexed([64] * 8, N=I, seed=1)
     xu, wu, ou, ku, _ = _mk_indexed([48] * 8, N=I, seed=2)
@@ -331,7 +331,7 @@ def test_indexed_out_col_offset_slice():
 @pytest.mark.parametrize("broken", ["kidx_dtype", "kidx_len", "row_off_host", "row_off_short"])
 def test_indexed_guards(broken):
     """오프셋 테이블과 스토어가 어긋나면 조용히 남의 행을 읽는다 — 즉사시킨다."""
-    from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed
+    from sglang.kernels.ops.moe.prism_gemv import gemv_worklist_indexed
     x, w_flat, row_off, kidx, ids = _mk_indexed([32, 64])
     xd, idsd = x.cuda(), ids.int().cuda()
     wd, ro, ki = w_flat.cuda(), row_off.cuda(), kidx.cuda()
@@ -358,7 +358,7 @@ def test_gemv_gateup_fusion_all_four_bitwise(pinned, sparse):
     warm dense와 hot sparse는 2026-08-29에 채운 조합이다 — 그 전에는 `gemv_gateup`이
     None을 돌려주어 같은 스텝이 조용히 2회 launch로 떨어졌다 (mxfp4/fp8은 네 개 다 있었다).
     """
-    from sglang.jit_kernel import prism_gemv as k
+    from sglang.kernels.ops.moe import prism_gemv as k
     from sglang.srt.layers.moe.prism.formats import BF16
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 

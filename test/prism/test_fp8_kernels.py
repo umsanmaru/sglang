@@ -65,7 +65,7 @@ def _ref(x, ids, wref, kidx_cpu, row_off_cpu, pair):
 @pytest.mark.parametrize("pair", [False, True])
 @pytest.mark.parametrize("exact", [False, True])
 def test_gemv_fp8_matches_reference(pair, exact):
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed
+    from sglang.kernels.ops.moe.prism_gemv_fp8 import gemv_fp8_indexed
 
     N, K, k_rows, M = 256, 512, 256, 3
     codes, scales, row_off, kidx, wref = _store(N, K, k_rows, exact, seed=1)
@@ -83,7 +83,7 @@ def test_gemv_fp8_matches_reference(pair, exact):
 
 @cuda_required
 def test_gemv_fp8_pinned_bitwise_and_offset():
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed, gemv_fp8_indexed_pinned
+    from sglang.kernels.ops.moe.prism_gemv_fp8 import gemv_fp8_indexed, gemv_fp8_indexed_pinned
 
     N, K, k_rows, M = 128, 512, 256, 2
     codes, scales, row_off, kidx, _ = _store(N, K, k_rows, False, seed=3)
@@ -103,7 +103,7 @@ def test_gemv_fp8_pinned_bitwise_and_offset():
 @pytest.mark.parametrize("pinned", [False, True])
 def test_gemv_fp8_gateup_fused_bitwise(pinned):
     """융합 진입점 4개(= {device, pinned} × {dense, sparse})가 2회 launch와 비트일치."""
-    from sglang.jit_kernel.prism_gemv_fp8 import (
+    from sglang.kernels.ops.moe.prism_gemv_fp8 import (
         gemv_fp8_indexed, gemv_fp8_indexed_gateup,
         gemv_fp8_indexed_pinned, gemv_fp8_indexed_pinned_gateup,
     )
@@ -145,7 +145,7 @@ def test_gemv_fp8_wide_tile_bitwise():
     융합/단일 launch가 서로 다른 kNY를 고르면 일반 입력에서 여기서 비트가 갈린다.
     위 테스트들은 k_rows가 작아(≤ 512) 넓은 분기(kNY=64, fp8은 kV=8도)를 한 번도 타지 않는다.
     """
-    from sglang.jit_kernel.prism_gemv_fp8 import (
+    from sglang.kernels.ops.moe.prism_gemv_fp8 import (
         gemv_fp8_indexed, gemv_fp8_indexed_gateup, gemv_fp8_indexed_pinned,
     )
 
@@ -178,7 +178,7 @@ def test_gemv_fp8_wide_tile_bitwise():
 @cuda_required
 def test_gemv_fp8_sparse_thr0_bitwise_and_masked():
     """thr=0(전부 keep) ↔ dense 비트일치; thr>0 ↔ 마스크 적용 참조."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed, gemv_fp8_indexed_sparse
+    from sglang.kernels.ops.moe.prism_gemv_fp8 import gemv_fp8_indexed, gemv_fp8_indexed_sparse
 
     N, K, k_rows, M = 128, 256, 128, 2
     codes, scales, row_off, kidx, wref = _store(N, K, k_rows, False, seed=8)
@@ -224,7 +224,7 @@ def test_gemv_fp8_sparse_thr0_bitwise_and_masked():
 @cuda_required
 def test_gemv_fp8_sparse_gateup_fused_bitwise():
     """sparse 융합(warm의 실제 경로) ↔ sparse 2회 launch 비트일치, device/pinned 양쪽."""
-    from sglang.jit_kernel.prism_gemv_fp8 import (
+    from sglang.kernels.ops.moe.prism_gemv_fp8 import (
         gemv_fp8_indexed_pinned_sparse, gemv_fp8_indexed_pinned_sparse_gateup,
         gemv_fp8_indexed_sparse, gemv_fp8_indexed_sparse_gateup,
     )
@@ -260,8 +260,8 @@ def test_gemv_fp8_sparse_gateup_fused_bitwise():
 def test_grouped_fp8_matches_gemv(pair, exact, m):
     """grouped ↔ GEMV: 배율이 2의 거듭제곱이라 `bf16(code·scale)`이 정확 →
     정확표현 입력에서는 비트일치, 랜덤 입력에서는 누산 순서만큼의 tolerance."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed
-    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_indexed, grouped_fp8_indexed_pinned
+    from sglang.kernels.ops.moe.prism_gemv_fp8 import gemv_fp8_indexed
+    from sglang.kernels.ops.moe.prism_grouped_fp8 import grouped_fp8_indexed, grouped_fp8_indexed_pinned
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows = 256, 512, 256
@@ -291,7 +291,7 @@ def test_grouped_fp8_matches_gemv(pair, exact, m):
 
 @cuda_required
 def test_grouped_fp8_gateup_fused():
-    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_indexed, grouped_fp8_indexed_gateup
+    from sglang.kernels.ops.moe.prism_grouped_fp8 import grouped_fp8_indexed, grouped_fp8_indexed_gateup
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows, m = 128, 256, 128, 40
@@ -314,8 +314,8 @@ def test_grouped_fp8_gateup_fused():
 @pytest.mark.parametrize("exact", [True, False])
 def test_grouped_fp8_cold_tile_matches_gemv(exact):
     """KT_TILE8 로더: kt `GemmKernelTileK2FP8B128::BufferB` slab을 제자리 읽어 GEMV와 일치."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed
-    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_cold
+    from sglang.kernels.ops.moe.prism_gemv_fp8 import gemv_fp8_indexed
+    from sglang.kernels.ops.moe.prism_grouped_fp8 import grouped_fp8_cold
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     sys.path.insert(0, os.path.dirname(__file__))

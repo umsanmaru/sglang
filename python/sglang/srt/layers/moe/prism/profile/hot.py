@@ -307,7 +307,7 @@ def dense_gemv(k: int, n: int, *, m: int = 1, vec: int = 0, reps: int = 100,
     `hot_dense_gemv(shape, ...)`에 실제 `experts`를 주면 된다 — 그쪽은 회전을
     자동으로 한다. `experts`/`topk` 인자로 이 helper에서도 풀을 키울 수 있다.
     """
-    from sglang.jit_kernel.prism_gemv import warmup_jit  # noqa: F401  (bf16 JIT 선행)
+    from sglang.kernels.ops.moe.prism_gemv import warmup_jit  # noqa: F401  (bf16 JIT 선행)
 
     store = store_of(dtype)
     store.fmt.warmup()

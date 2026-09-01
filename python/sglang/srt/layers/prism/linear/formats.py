@@ -177,7 +177,7 @@ class Bf16LinearFormat(LinearStoreFormat):
         return _pad_ckpt(weight, rows, k_pad, 0), None, _pad_index(rows, k_pad), real
 
     def gemv(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv as k
+        from sglang.kernels.ops.moe import prism_gemv as k
 
         return {
             (False, False): k.gemv_worklist_indexed,
@@ -187,13 +187,13 @@ class Bf16LinearFormat(LinearStoreFormat):
         }[(pinned, sparse)]
 
     def grouped(self, *, pinned):
-        from sglang.jit_kernel import prism_grouped as k
+        from sglang.kernels.ops.moe import prism_grouped as k
 
         return k.grouped_gemm_indexed_pinned if pinned else k.grouped_gemm_indexed
 
     def warmup(self) -> None:
-        from sglang.jit_kernel.prism_gemv import warmup_jit
-        from sglang.jit_kernel.prism_grouped import warmup_jit as warmup_grouped
+        from sglang.kernels.ops.moe.prism_gemv import warmup_jit
+        from sglang.kernels.ops.moe.prism_grouped import warmup_jit as warmup_grouped
 
         warmup_jit()
         warmup_grouped()
@@ -268,7 +268,7 @@ class Fp8LinearFormat(LinearStoreFormat):
         return codes, s, _pad_index(rows, k_pad), real
 
     def gemv(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_fp8 as k
+        from sglang.kernels.ops.moe import prism_gemv_fp8 as k
 
         return {
             (False, False): k.gemv_fp8_indexed,
@@ -278,13 +278,13 @@ class Fp8LinearFormat(LinearStoreFormat):
         }[(pinned, sparse)]
 
     def grouped(self, *, pinned):
-        from sglang.jit_kernel import prism_grouped_fp8 as k
+        from sglang.kernels.ops.moe import prism_grouped_fp8 as k
 
         return k.grouped_fp8_indexed_pinned if pinned else k.grouped_fp8_indexed
 
     def warmup(self) -> None:
-        from sglang.jit_kernel.prism_gemv_fp8 import warmup_jit
-        from sglang.jit_kernel.prism_grouped_fp8 import warmup_jit as warmup_grouped
+        from sglang.kernels.ops.moe.prism_gemv_fp8 import warmup_jit
+        from sglang.kernels.ops.moe.prism_grouped_fp8 import warmup_jit as warmup_grouped
 
         warmup_jit()
         warmup_grouped()

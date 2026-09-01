@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.prism_grouped import TILE_M  # noqa: F401  (그룹핑 타일 크기 공유)
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernels.ops.moe.prism_grouped import TILE_M  # noqa: F401  (그룹핑 타일 크기 공유)
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
