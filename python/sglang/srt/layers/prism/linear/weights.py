@@ -47,6 +47,7 @@ from sglang.srt.layers.prism.kernels import (
     resolve_cpu_kernel,
     resolve_gpu_kernel,
 )
+from sglang.srt.layers.prism.linear.calib import LinearCalibShard, LinearCalibTables
 from sglang.srt.layers.prism.linear.formats import BF16, LinearStoreFormat, store_format
 from sglang.srt.layers.prism.linear.plan import (
     LinearPlan,
@@ -80,6 +81,10 @@ class LinearTierShard:
     # 수 있는지의 판정이라 host에서 로드 시 1회 계산해 둔다 — 스토어가 device로 간
     # 뒤에 인덱스 값을 읽는 것은 곧 동기화다.
     k_start: Optional[int] = None
+    # sparse 티어의 점수 재료 — `k_index`와 **같은 순서**로 gather된 것.
+    # plan에 sparsity가 없거나 이 조각이 `sparse: false`면 None이고, 그때
+    # `tiers.py`가 dense 커널을 부른다 (spec=None).
+    calib: Optional[LinearCalibShard] = None
 
     @property
     def k_rows(self) -> int:
@@ -111,6 +116,9 @@ class LinearColdShard:
     fmt: LinearStoreFormat = BF16
     # fp8만: fp32 scale_inv [N/128, k_pad/128] — 패딩 블록은 1.0.
     s_flat: Optional[torch.Tensor] = None
+    # sparse 점수 재료. `k_index`(패딩 포함)와 같은 순서이고 패딩 구간은 0이다 —
+    # weight도 0이라 수치 기여가 없고 kt가 tail 비트를 끈다 (`real_rows`).
+    calib: Optional[LinearCalibShard] = None
 
     @property
     def k_pad(self) -> int:
@@ -135,6 +143,13 @@ class PreparedPart:
     hot: Optional[LinearTierShard]
     warm: Optional[LinearTierShard]
     cold: Optional[LinearColdShard]
+    # `[ng]` fp32 threshold 곡선 — 밴드와 무관해 티어별이 아니라 조각별이다.
+    # 소비자가 `[E, ng]`로 복원한다 (GPU는 E=1, kt cold는 unit 축으로 스택).
+    thr: Optional[torch.Tensor] = None
+    # 이 조각의 예산. plan에서 온 그대로 나른다 — 티어마다 같고, 소비자(GPU spec /
+    # kt config)가 각자의 어휘로 옮긴다.
+    sparsity_p: Optional[float] = None
+    sparsity_lambda: Optional[float] = None
 
     @property
     def n(self) -> int:
@@ -264,6 +279,7 @@ def prepare_linear_weights(
     device: Optional[torch.device] = None,
     warm_node: Optional[int] = None,
     pin_memory: bool = True,
+    calib: Optional[LinearCalibTables] = None,
 ) -> PreparedLinear:
     """한 linear의 full weight를 Plan대로 절단·배치한다.
 
@@ -285,7 +301,17 @@ def prepare_linear_weights(
     device는 HOT 밴드가 있을 때만 필요하다. warm_node는 warm pinned store가
     상주해야 하는 NUMA 노드이고(계약 ③), 값을 정하는 것은 조립 지점의 몫이다.
     pin_memory=False는 CUDA 없는 테스트용 탈출구다.
+
+    calib은 plan에 sparsity가 있을 때 **필수**다. 없이 부르면 즉사한다 — 조용히
+    dense로 절단하면 마스킹이 사라진 채 sparse 벤치 결론이 나온다 (calib.py
+    docstring의 무증상 실패와 같은 종류). 점수 재료는 weight와 같은 gather 순서로
+    같은 자리에서 만들어야 하므로 이 함수가 맡는다: 인덱스가 여기서만 존재한다.
     """
+    if plan.sparsity is not None and calib is None:
+        raise PlanError(
+            f"layer {layer_idx} proj '{name}': plan has sparsity but no calib "
+            f"tables were passed — 마스킹이 조용히 사라진다"
+        )
     pp = plan.get(layer_idx, name)
     if pp is None:
         raise PlanError(f"layer {layer_idx} proj '{name}' is not in the plan")
@@ -319,7 +345,7 @@ def prepare_linear_weights(
 
     parts = tuple(
         _prepare_part(part, weight, scale, fmt, where, idx_device, device,
-                      warm_node, pin_memory, tile)
+                      warm_node, pin_memory, tile, layer_idx, calib)
         for part in pp.parts
     )
     return PreparedLinear(
@@ -329,7 +355,8 @@ def prepare_linear_weights(
 
 def _prepare_part(part: ProjPart, weight, scale, fmt: LinearStoreFormat, where: str,
                   idx_device, device, warm_node, pin_memory: bool,
-                  tile: int) -> PreparedPart:
+                  tile: int, layer_idx: int = 0,
+                  calib: Optional[LinearCalibTables] = None) -> PreparedPart:
     """조각 하나: N축 슬라이스 → 티어별 K-split.
 
     N 슬라이스가 먼저인 이유는 조각마다 밴딩이 다를 수 있어서다 — 합쳐 두면 두
@@ -353,12 +380,29 @@ def _prepare_part(part: ProjPart, weight, scale, fmt: LinearStoreFormat, where: 
             fmt.check_rows(built[0], f"{sub} {tier.value}")
         return built
 
+    # 이 조각을 마스킹하는가 — plan에 sparsity가 있고, 조각이 끄지 않았고,
+    # calib 키를 말했을 때만이다. 셋 중 하나라도 없으면 dense로 돈다.
+    masking = calib is not None and part.sparse and part.calib is not None
+    # 함수 안에서 가져온다: `tiers`가 이 모듈을 import하므로 모듈 레벨은 순환이다.
+    # 집합을 여기 복제하면 "어느 티어가 마스킹하는가"의 정의점이 둘이 된다.
+    from sglang.srt.layers.prism.linear.tiers import SPARSE_TIERS
+
     def gpu_shard(tier: Tier, place) -> Optional[LinearTierShard]:
         built = rows_of(tier)
         if built is None:
             return None
         rows, contiguous, k_start = built
         w_flat, s_flat = fmt.gather(w, s, rows, contiguous, k_start)
+        # 점수 재료는 SPARSE_TIERS(=WARM)에만 싣는다. hot은 마스킹하지 않으므로
+        # (`tiers.SPARSE_TIERS`) a/c를 VRAM에 올리는 것이 순손실이다.
+        # 점수 재료는 **device 상주**다 — warm의 weight가 pinned host여도 점수는
+        # GPU 커널이 읽는다 (MoE `_slab_sparse_spec`과 같은 거처). `k_index`와 같은
+        # device에 둔다: 둘은 항상 같은 순서로 함께 읽힌다.
+        cal = None
+        if masking and tier in SPARSE_TIERS:
+            cal = calib.gather(layer_idx, part.calib, rows, where=sub)
+            cal = LinearCalibShard(wn=cal.wn.to(idx_device),
+                                   pair_dot=cal.pair_dot.to(idx_device))
         return LinearTierShard(
             w_flat=place(w_flat),
             k_index=rows.to(idx_device),
@@ -366,6 +410,7 @@ def _prepare_part(part: ProjPart, weight, scale, fmt: LinearStoreFormat, where: 
             fmt=fmt,
             s_flat=None if s_flat is None else place(s_flat),
             k_start=k_start,
+            calib=cal,
         )
 
     def place_warm(t: torch.Tensor) -> torch.Tensor:
@@ -384,9 +429,26 @@ def _prepare_part(part: ProjPart, weight, scale, fmt: LinearStoreFormat, where: 
     if built is not None:
         rows, contiguous, _ = built
         w_flat, s_flat, idx, real = fmt.cold_flat(w, s, rows, tile)
+        # cold의 점수 재료는 **패딩된** k_index 순서다 — packed 타일의 행 순서가
+        # 그것이고, 마스크 비트가 그 순서를 따른다. host에 남긴다: kt가 host
+        # memcpy로 읽으므로 device 포인터를 넘기면 segfault다.
+        cal = None
+        if masking:
+            cal = calib.gather(layer_idx, part.calib, idx, real_rows=real, where=sub)
         cold = LinearColdShard(
             w_flat=w_flat, k_index=idx, real_rows=real, contiguous=contiguous,
-            fmt=fmt, s_flat=s_flat)
+            fmt=fmt, s_flat=s_flat, calib=cal)
+
+    thr = None
+    if masking:
+        thr = calib.thr(layer_idx, part.calib)
+        if part.sparsity_p is None or part.sparsity_lambda is None:
+            raise PlanError(
+                f"{sub}: plan has sparsity and this part is masked but carries no "
+                f"p/lambda — plan.py가 조각마다 요구한다"
+            )
 
     return PreparedPart(name=part.name, n_start=part.n_start, n_end=part.n_end,
-                        hot=hot, warm=warm, cold=cold)
+                        hot=hot, warm=warm, cold=cold, thr=thr,
+                        sparsity_p=part.sparsity_p,
+                        sparsity_lambda=part.sparsity_lambda)

@@ -211,17 +211,130 @@ def test_mismatched_shards_split_into_two_groups():
     assert all(g.num_experts == 1 for g in groups)
 
 
-def test_sparse_plan_is_rejected():
-    """sparse plan은 아직 배선되지 않았다 — 조용히 dense로 돌면 안 된다."""
+def _sparse_plan_dict(p_budget=0.5, calib_key="g"):
     d = _plan_dict(0.0, 0.0)
     d["sparsity"] = {"score": "k2wl2", "calib": {"path": "/x", "sha256": "0" * 64},
                      "pmax": 0.9, "grid": 0.005, "ng": 201, "renorm_it": 3}
     for proj in d["projs"].values():
         for part in proj.get("parts", [proj]):
-            part.update({"calib": "g", "p": 0.5, "lambda": 0.0})
-    plan = parse_plan(d)
-    with pytest.raises(NotImplementedError, match="sparse"):
-        KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES)
+            part.update({"calib": calib_key, "p": p_budget, "lambda": 0.0})
+    return d
+
+
+def _sparse_calib(k_max):
+    """합성 calib — 실물 자산 없이 같은 불변식을 본다 (test_linear_calib과 같은 형태)."""
+    from sglang.srt.layers.prism.geometry import PAIR_GROUP
+    from sglang.srt.layers.prism.linear.calib import LinearCalibTables
+
+    torch.manual_seed(0)
+    t = {}
+    for key in ("g", "u", "d"):
+        t[f"wn_{key}"] = torch.rand(LAYERS, 1, k_max) + 0.5
+        t[f"c{key}"] = torch.randn(LAYERS, 1, k_max // PAIR_GROUP)
+        t[f"t{key}2l"] = torch.rand(LAYERS, 1, 201)
+    return LinearCalibTables(t, "k2wl2", 201)
+
+
+def _register_all(cold, plan, cal):
+    torch.manual_seed(0)
+    for layer in range(LAYERS):
+        for name, k, n in (("mlp.gate_up_proj", H, 2 * I), ("mlp.down_proj", I, H)):
+            w = torch.randint(-2, 3, (n, k)).to(torch.bfloat16)
+            cold.register(layer, name,
+                          prepare_linear_weights(layer, name, w, plan,
+                                                 pin_memory=False, calib=cal))
+
+
+def _capture_configs(cold, plan, cal):
+    """load **전에** config와 테이블을 가로챈다.
+
+    `finalize()`가 `_load_group`까지 돌리고 그때 `unit.colds`를 비우므로(계약 ③)
+    끝난 뒤에 `_config`를 부르면 IndexError다. kt 인스턴스를 만들지 않으므로
+    이 검사는 CPUInfer 없이도 돈다.
+    """
+    _register_all(cold, plan, cal)
+    got = []
+    def spy(group):
+        cfg = cold._config(group)
+        got.append((group, cfg, cold._sparsity_tables(group, cfg, TILE)))
+    cold._load_group = spy
+    cold.finalize()
+    return got
+
+
+def test_sparse_plan_is_accepted():
+    """sparse plan이 이제 배선됐다 — 생성 자체가 거부되지 않는다."""
+    plan = parse_plan(_sparse_plan_dict())
+    cold = KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES,
+                               cpuinfer_threads=8)
+    assert cold is not None
+
+
+def test_prepare_without_calib_dies():
+    """sparse plan인데 calib 없이 절단하면 마스킹이 조용히 사라진다."""
+    plan = parse_plan(_sparse_plan_dict())
+    w = torch.zeros(2 * I, H, dtype=torch.bfloat16)
+    with pytest.raises(PlanError, match="calib"):
+        prepare_linear_weights(0, "mlp.gate_up_proj", w, plan, pin_memory=False)
+
+
+def test_cold_shard_carries_scores_in_store_order():
+    """cold 점수 재료는 **패딩된** k_index 순서 — packed 타일의 행 순서가 그것이다."""
+    plan = parse_plan(_sparse_plan_dict())
+    cal = _sparse_calib(max(H, I))
+    w = torch.zeros(H, I, dtype=torch.bfloat16)
+    pr = prepare_linear_weights(0, "mlp.down_proj", w, plan, pin_memory=False, calib=cal)
+    part = pr.parts[0]
+    assert part.cold is not None and part.cold.calib is not None
+    assert part.cold.calib.wn.numel() == part.cold.k_pad
+    assert part.thr is not None and part.thr.numel() == 201
+    want = cal.gather(0, "g", part.cold.k_index, real_rows=part.cold.real_rows)
+    assert torch.equal(part.cold.calib.wn, want.wn)
+
+
+def test_dummy_slot_budget_is_zero():
+    """더미 슬롯에 p>0을 주면 kt가 더미 행을 마스킹해 기하가 깨진다.
+
+    실물만 plan의 예산을 받고 더미는 0이어야 한다 — 이 대응이 dense 매핑의
+    유일한 sparsity 계약이다 (cold_backend 모듈 docstring).
+    """
+    plan = parse_plan(_sparse_plan_dict(0.5))
+    validate_static(plan)
+    cold = KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES,
+                               cpuinfer_threads=8)
+    caught = _capture_configs(cold, plan, _sparse_calib(max(H, I)))
+    seen = 0
+    for g, cfg, _tables in caught:
+        sp = cfg.partial.sparsity
+        real = ("gate", "up") if g.key.entry == "gateup" else ("down",)
+        for slot in ("gate", "up", "down"):
+            got, want = getattr(sp, f"p_{slot}"), (0.5 if slot in real else 0.0)
+            assert got == pytest.approx(want), (
+                f"{g.key.label} {slot}: p={got}, 기대 {want} (entry={g.key.entry})")
+        assert sp.ng == 201 and sp.grid == pytest.approx(0.005)
+        seen += 1
+    assert seen == 2, f"gateup/down 두 그룹이어야 한다: {seen}"
+
+
+def test_sparsity_tables_have_all_nine_keys_and_sizes():
+    """kt는 9개 키 전부를 요구하고 원소 수로 검증한다 (`experts_partial.py:111`).
+
+    더미 슬롯도 zeros를 받아야 한다 — 빠지면 `missing keys`로 죽는다.
+    """
+    plan = parse_plan(_sparse_plan_dict(0.5))
+    cold = KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES,
+                               cpuinfer_threads=8)
+    for g, cfg, tables in _capture_configs(cold, plan, _sparse_calib(max(H, I))):
+        assert set(tables) == {
+            f"{s}_{w}" for s in ("gate", "up", "down")
+            for w in ("wn_sq", "pair_dot")} | {f"thr_{s}" for s in ("gate", "up", "down")}
+        for name, t in tables.items():
+            assert t.dtype is torch.float32 and t.is_contiguous()
+            assert t.device.type == "cpu", f"{name}: kt는 host memcpy로 읽는다"
+        for slot in ("gate", "up", "down"):
+            assert tables[f"thr_{slot}"].numel() == g.num_experts * 201
+            assert (tables[f"{slot}_wn_sq"].numel()
+                    == 2 * tables[f"{slot}_pair_dot"].numel())
 
 
 # ---------------------------------------------------------------------------

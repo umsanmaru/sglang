@@ -122,13 +122,45 @@ class LinearGpuTier:
         )
 
 
-def build_part_tiers(part: PreparedPart, specs=None) -> dict:
+def build_part_specs(part: PreparedPart, sparsity) -> dict:
+    """조각이 나르는 재료 → `{Tier: SparseSpec}`. 마스킹하지 않으면 빈 dict.
+
+    `SparseSpec`은 MoE 것을 그대로 쓴다 — 커널이 같은 필드를 읽으므로 타입을 둘로
+    두면 정의점이 갈린다 (`linear/executor.py`가 `moe.prism.grouping`을 가져오는
+    것과 같은 선례). 지연 import: `moe.prism.tiers`는 무겁고 이 경로에서만 필요하다.
+
+    `thr`은 `[1, ng]`로 복원한다 — 커널이 `[E, ng]`를 기대하고 dense는 E=1이다.
+    패딩 행은 a=0, c=0이라 energy 0이고 weight도 0이라 어느 쪽이든 무해하다.
+    """
+    from sglang.srt.layers.moe.prism.tiers import SparseSpec
+
+    if sparsity is None or part.thr is None:
+        return {}
+    out = {}
+    for tier in SPARSE_TIERS:
+        shard = part.tier(tier)
+        if shard is None or getattr(shard, "calib", None) is None:
+            continue
+        dev = shard.k_index.device
+        out[tier] = SparseSpec(
+            a=shard.calib.wn_sq.to(dev, torch.float32),
+            c=shard.calib.pair_dot.to(dev, torch.float32),
+            thr=part.thr.to(dev, torch.float32).unsqueeze(0),
+            p=float(part.sparsity_p), lam=float(part.sparsity_lambda),
+            pmax=sparsity.pmax, grid=sparsity.grid, ng=sparsity.ng,
+            renorm_it=sparsity.renorm_it,
+        )
+    return out
+
+
+def build_part_tiers(part: PreparedPart, specs=None, sparsity=None) -> dict:
     """한 조각의 GPU 티어들 (`{Tier: LinearGpuTier}`). cold는 포함하지 않는다.
 
-    `specs`는 `{Tier: SparseSpec}` — 없으면 dense로만 돈다. SPARSE_TIERS 밖의
+    `specs`는 `{Tier: SparseSpec}` — 명시로 주면 그것을 쓰고(테스트용 우회), 없으면
+    `sparsity`로 조각에서 조립한다. 둘 다 없으면 dense로만 돈다. SPARSE_TIERS 밖의
     티어에는 spec을 달지 않는다 (hot에 spec을 달면 조용히 마스킹된다).
     """
-    specs = specs or {}
+    specs = specs if specs else build_part_specs(part, sparsity)
     out = {}
     for tier, pinned in ((Tier.HOT, False), (Tier.WARM, True)):
         shard = part.tier(tier)

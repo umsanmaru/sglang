@@ -98,7 +98,7 @@ class LinearExecutor:
 
     # ── 등록 ─────────────────────────────────────────────────────────────
     def register(self, layer_idx: int, name: str, prepared: PreparedLinear,
-                 specs: Optional[Mapping] = None) -> None:
+                 specs: Optional[Mapping] = None, sparsity=None) -> None:
         key = (layer_idx, name)
         if key in self._projs:
             raise RuntimeError(f"{key} already registered")
@@ -113,7 +113,7 @@ class LinearExecutor:
             self._cold.register(layer_idx, name, prepared)
         per_tier: dict[Tier, list] = {}
         for part in prepared.parts:
-            for tier, adapter in build_part_tiers(part, specs).items():
+            for tier, adapter in build_part_tiers(part, specs, sparsity).items():
                 per_tier.setdefault(tier, []).append(adapter)
         if not per_tier and not has_cold:
             raise PlanError(

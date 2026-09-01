@@ -74,6 +74,26 @@ class _LinearRuntime:
         self.max_tokens = int(os.environ.get(_ENV_MAX_TOKENS, "4096"))
         self._executor = None
         self._checked = False
+        self._calib = None
+
+    @property
+    def calib(self):
+        """calib 자산 — plan에 sparsity가 없으면 None이고 열지도 않는다.
+
+        `check_plan`을 여기서 1회 돌린다: plan이 마스킹하겠다고 한 모든
+        (층, proj, 조각)이 자산에 실제로 있는지, 그리고 전부 0이 아닌지를 첫 층
+        prepare **전에** 확인해야 한다 — 42층을 다 채운 뒤 죽으면 5분을 버린다.
+        """
+        if self.plan.sparsity is None:
+            return None
+        if self._calib is None:
+            from sglang.srt.layers.prism.linear.calib import LinearCalibTables
+
+            self._calib = LinearCalibTables.load(self.plan.sparsity)
+            self._calib.check_plan(self.plan)
+            logger.info("[prism-linear] calib loaded: %s (score=%s)",
+                        self.plan.sparsity.calib.path, self.plan.sparsity.score)
+        return self._calib
 
     def executor(self, device: torch.device):
         if self._executor is None:
@@ -258,9 +278,11 @@ class PrismLinearMethod:
         prepared = prepare_linear_weights(
             self.layer_idx, self.name, w, rt.plan,
             device=device, warm_node=gpu_numa_node(device), pin_memory=True,
+            calib=rt.calib,
         )
         del w
-        rt.executor(device).register(self.layer_idx, self.name, prepared)
+        rt.executor(device).register(self.layer_idx, self.name, prepared,
+                                     sparsity=rt.plan.sparsity)
 
         # full 텐서 소멸 (계약 ③) — host RAM 회수
         layer.weight.data = torch.empty(0, dtype=layer.weight.dtype)
