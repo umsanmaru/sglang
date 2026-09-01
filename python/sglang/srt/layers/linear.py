@@ -175,6 +175,24 @@ class LinearBase(torch.nn.Module):
         else:
             self.quant_method = quant_config.get_quant_method(self, prefix=prefix)
 
+        # --- prism: dense K-split 오프로드의 래퍼 슬롯. `FusedMoE.__init__`의
+        # `maybe_wrap_moe_quant_method`와 같은 자리다. 이 줄이 base ctor의 마지막이라
+        # quant_method가 정해진 뒤이면서 **서브클래스의 `create_weights()` 전**인데,
+        # 그 사이가 래퍼가 파라미터의 거처를 정할 수 있는 유일한 창이다. `prefix`를
+        # 명시로 넘기는 이유는 LinearBase에 layer_id가 없어서고, tp_rank/tp_size는
+        # 서브클래스가 이 함수 반환 후에 대입하므로 아직 읽을 수 없다.
+        # import를 함수 안에 두는 것은 registry가 prism 소유 파일이기 때문이다 —
+        # 그 파일이 없는 트리에서도 linear.py 자체는 import돼야 한다.
+        # 등록이 없으면 no-op이다 (빈 registry 빠른 경로).
+        from sglang.srt.layers.linear_method_registry import (
+            maybe_wrap_linear_quant_method,
+        )
+
+        self.quant_method = maybe_wrap_linear_quant_method(
+            self, self.quant_method, prefix
+        )
+        # --- prism end ---
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
 
