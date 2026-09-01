@@ -51,11 +51,11 @@ def _bands(k, hot, warm):
     return out
 
 
-def _plan_dict(hot, warm, *, kernel="kt_amx_bf16"):
+def _plan_dict(hot, warm, *, kernel="kt_amx_bf16", raw_bands=None, shards=None):
     def part(k, n, name=None):
-        d = {"bands": _bands(k, hot, warm)}
+        d = {"bands": raw_bands(k) if raw_bands else _bands(k, hot, warm)}
         if any(b[2] == "cold" for b in d["bands"]):
-            d["cold_shards"] = _shards(n)
+            d["cold_shards"] = shards(n) if shards else _shards(n)
         return {"name": name, "n": n, **d} if name else d
 
     return {
@@ -213,3 +213,57 @@ def test_sparse_plan_is_rejected():
     plan = parse_plan(d)
     with pytest.raises(NotImplementedError, match="sparse"):
         KtLinearColdBackend(plan, max_tokens=8, num_numa_nodes=NODES)
+
+
+# ---------------------------------------------------------------------------
+# 32의 배수가 아닐 때 — K축은 패딩, N축은 거부
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("hot_rows", [2, 34, 254])
+def test_unaligned_cold_rows_are_padded(hot_rows):
+    """cold 행 수가 타일(32)의 배수가 아니어도 **비트일치**.
+
+    `formats.cold_flat`이 0 행으로 타일까지 올리고 패딩 인덱스는 0행을 가리킨다
+    (`_pad_index`) — weight가 0이라 dense 계산에 무해하고, `real_rows`가 패딩 전
+    행 수를 kt에 전한다. kt는 그 값으로 sparse 마스크의 tail만 끈다.
+
+    안 잡으면: 패딩 행이 0이 아니거나 인덱스가 축 밖을 가리키면 **cold 부분합에
+    쓰레기가 더해진다**. 값이 조금 틀릴 뿐이라 tolerance 테스트는 통과한다.
+    """
+    def bands(k):
+        return [[0, hot_rows, "hot"], [hot_rows, k, "cold"]]
+
+    weights, xs = _exact_weights(seed=7)
+    ref = _run_all(_plan_dict(1.0, 0.0), weights, xs)
+    got = _run_all(_plan_dict(0, 0, raw_bands=bands), weights, xs)
+    # 실제로 패딩이 생겼는지 확인 (안 생겼으면 이 테스트는 아무것도 안 본다)
+    assert (H - hot_rows) % TILE or (I - hot_rows) % TILE, "이 hot_rows는 패딩을 만들지 않는다"
+    for key in ref:
+        assert torch.equal(got[key], ref[key]), (
+            f"{key}: cold {hot_rows}행 오프셋에서 패딩이 결과를 바꿨다 "
+            f"(max diff {(got[key] - ref[key]).abs().max().item()})")
+
+
+def test_unaligned_node_shard_is_rejected():
+    """노드 N shard가 정렬의 배수가 아니면 즉사 — **plan 검증에서** (계약 ①).
+
+    K축과 달리 N축은 패딩하지 않는다. 출력 열이라 패딩하면 그 열이 어디로 가는지를
+    호출자가 알아야 하고, 그건 계약을 하나 더 만드는 일이다. 그래서 거부한다.
+
+    거부는 두 층에 있다:
+      · `plan.validate_static` — `geometry.COL_GROUP = 32`. 커널과 무관한 하한이다.
+      · `cold_backend._check_group` — `kernels.cold_n_align(키)`. 커널이 더 센
+        정렬을 요구할 때만 (tile mxfp4/fp8은 256) 추가로 조인다. bf16 키에서는
+        둘이 같은 값이라 plan 쪽이 먼저 잡는다 — 지금 이 테스트가 보는 것이 그것이고,
+        아래쪽은 양자화 cold 커널이 배선될 때 살아난다.
+
+    안 잡으면: kt가 예외를 내지 않는다. 정렬 **미만** N은 segfault이고(실측,
+    `cold_backend._config`의 하한 검사 참조) 정렬 안 맞는 배수는 커널이 조용히
+    어긋난 열에 쓴다.
+    """
+    from sglang.srt.layers.prism.linear.plan import validate_static as _vs
+
+    bad = _plan_dict(0.0, 0.0, shards=lambda n: [[0, 0, 40], [1, 40, n]])
+    with pytest.raises(PlanError, match="COL_GROUP"):
+        _vs(parse_plan(bad))

@@ -346,6 +346,10 @@ class KtLinearColdBackend:
         for node, s, e in sorted(key.shards, key=lambda t: t[1]):
             if s != cur:
                 raise PlanError(f"{where}: cold_shards에 구멍 [{cur}, {s})")
+            # 커널이 요구하는 정렬. `plan.validate_static`이 이미 `COL_GROUP = 32`로
+            # 거르므로 bf16 키에서는 여기가 안 걸린다 — 이 검사가 사는 자리는
+            # tile mxfp4/fp8(256)처럼 **커널이 더 세게 조일 때**다. plan.py는 순수
+            # stdlib이라 커널 키가 함의하는 정렬을 모른다.
             if (e - s) % align:
                 raise PlanError(
                     f"{where}: node {node} shard rows {e - s} is not a multiple of "
