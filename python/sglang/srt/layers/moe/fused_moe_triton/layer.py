@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/a6221a144af772fd1a68fe7e627935dc53e81738/vllm/model_executor/layers/fused_moe/layer.py
 
 import logging
+import os
 from enum import Enum
 from functools import cached_property
 from typing import Dict, List, Optional, Tuple
@@ -383,6 +384,18 @@ class FusedMoE(torch.nn.Module):
                     self.use_flashinfer_trtllm_moe,
                     self.use_deep_gemm,
                 )
+        # --- prism: K-split hot/warm/cold MoE 오프로드. env SGLANG_PRISM_PLAN 로만 활성화된다.
+        if os.environ.get("SGLANG_PRISM_PLAN"):
+            from sglang.srt.layers.moe.quant_method_registry import (
+                maybe_wrap_moe_quant_method,
+            )
+
+            if getattr(self, "layer_id", None) is None:
+                self.layer_id = layer_id
+            self.quant_method = maybe_wrap_moe_quant_method(
+                self, self.quant_method, server_args
+            )
+        # --- prism end ---
         _validate_hpc_ops_quant_method(self.quant_method)
         self.supports_deferred_finalize = (
             envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.get()
