@@ -459,6 +459,8 @@ def sparse_attention_fwd_kernel_v2(
     kv_group: int = 1,
     sm_scale: Optional[float] = None,
     block_I: int = 64,
+    threads: int = 384,
+    num_stages: int = 2,
     return_lse: bool = False,
 ):
     assert dim == tilelang.math.next_power_of_2(
@@ -474,7 +476,6 @@ def sparse_attention_fwd_kernel_v2(
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
         sm_scale = sm_scale * 1.44269504  # log2(e)
-    threads = 384
 
     batch = T.symbolic("batch")
     qo_len = T.symbolic("seq_len")
@@ -1418,8 +1419,28 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
+        # prism sm120 tile: sm_120(RTX 5090 / RTX PRO 6000)의 optin shared memory는 ~100 KB인데
+        # 기본 타일(block_I=64, num_stages=2, threads=256/384)은 151~207 KB를 요구해 tilelang이
+        # "Failed to set the allowed dynamic shared memory size"로 죽는다. block_I만 내리면
+        # "Layout infer conflict between m_i and alpha"가 나므로 셋을 함께 내린다.
+        _props = torch.cuda.get_device_properties(q.device)
+        _optin = getattr(_props, "shared_memory_per_block_optin", 1 << 20)
+        # RTX 5090(optin 101,376 B)에서 실측한 조합 (2026-08-31, 실제 launch까지 확인):
+        #   block_I=32 stages=1 threads=128 -> 103,424 B 요구 (초과)
+        #   block_I=32 stages=1 threads=64  -> 102,912 B 요구 (초과)
+        #   block_I=16 stages=1 threads=128 -> "Layout infer conflict between m_i and alpha"
+        #   block_I=16 stages=1 threads=64  -> OK
+        _tile = (
+            dict(block_I=16, num_stages=1, threads=64) if _optin < 120 * 1024 else {}
+        )
         kernel = kernel_factory(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, return_lse=return_lse
+            num_heads,
+            d_v,
+            tail_dim,
+            topk,
+            sm_scale=sm_scale,
+            return_lse=return_lse,
+            **_tile,
         )
         # Caller-allocated LSE (in-place kernel arg): written only by kernels
         # traced with return_lse=True, but the prim_func signature always has it.
