@@ -1,0 +1,111 @@
+{
+ "schema_version": 1,
+ "model_id": "DeepSeek-V4-Flash",
+ "dims": {
+  "hidden_size": 4096,
+  "intermediate_size": 2048,
+  "num_layers": 43,
+  "num_experts": 256,
+  "top_k": 6,
+  "dtype": "bfloat16"
+ },
+ "kernels": {
+  "gpu_warm": "gemv_worklist_mxfp4",
+  "cpu_cold": "kt_tile_k2_mxfp4"
+ },
+ "default": {
+  "gate": {
+   "bands": [
+    [
+     0,
+     512,
+     "hot"
+    ],
+    [
+     512,
+     1024,
+     "warm"
+    ],
+    [
+     1024,
+     4096,
+     "cold"
+    ]
+   ],
+   "cold_shards": [
+    [
+     0,
+     0,
+     1024
+    ],
+    [
+     1,
+     1024,
+     2048
+    ]
+   ]
+  },
+  "up": {
+   "bands": [
+    [
+     0,
+     512,
+     "hot"
+    ],
+    [
+     512,
+     1024,
+     "warm"
+    ],
+    [
+     1024,
+     4096,
+     "cold"
+    ]
+   ],
+   "cold_shards": [
+    [
+     0,
+     0,
+     1024
+    ],
+    [
+     1,
+     1024,
+     2048
+    ]
+   ]
+  },
+  "down": {
+   "bands": [
+    [
+     0,
+     256,
+     "hot"
+    ],
+    [
+     256,
+     512,
+     "warm"
+    ],
+    [
+     512,
+     2048,
+     "cold"
+    ]
+   ],
+   "cold_shards": [
+    [
+     0,
+     0,
+     2048
+    ],
+    [
+     1,
+     2048,
+     4096
+    ]
+   ]
+  }
+ }
+}

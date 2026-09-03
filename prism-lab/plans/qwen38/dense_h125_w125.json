@@ -1,0 +1,115 @@
+{
+ "schema_version": 1,
+ "model_id": "Qwen/Qwen3.8-27B",
+ "dims": {
+  "num_layers": 64,
+  "dtype": "bfloat16"
+ },
+ "kernels": {
+  "gpu_warm": "gemv_worklist",
+  "cpu_cold": "kt_tile_k2_bf16"
+ },
+ "projs": {
+  "mlp.gate_up_proj": {
+   "k": 5120,
+   "n": 34816,
+   "halves": {
+    "gate": {
+     "bands": [
+      [
+       0,
+       640,
+       "hot"
+      ],
+      [
+       640,
+       1280,
+       "warm"
+      ],
+      [
+       1280,
+       5120,
+       "cold"
+      ]
+     ],
+     "cold_shards": [
+      [
+       0,
+       0,
+       8704
+      ],
+      [
+       1,
+       8704,
+       17408
+      ]
+     ]
+    },
+    "up": {
+     "bands": [
+      [
+       0,
+       640,
+       "hot"
+      ],
+      [
+       640,
+       1280,
+       "warm"
+      ],
+      [
+       1280,
+       5120,
+       "cold"
+      ]
+     ],
+     "cold_shards": [
+      [
+       0,
+       0,
+       8704
+      ],
+      [
+       1,
+       8704,
+       17408
+      ]
+     ]
+    }
+   }
+  },
+  "mlp.down_proj": {
+   "k": 17408,
+   "n": 5120,
+   "bands": [
+    [
+     0,
+     2176,
+     "hot"
+    ],
+    [
+     2176,
+     4352,
+     "warm"
+    ],
+    [
+     4352,
+     17408,
+     "cold"
+    ]
+   ],
+   "cold_shards": [
+    [
+     0,
+     0,
+     2560
+    ],
+    [
+     1,
+     2560,
+     5120
+    ]
+   ]
+  }
+ }
+}

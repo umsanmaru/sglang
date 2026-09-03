@@ -1,0 +1,135 @@
+{
+ "schema_version": 1,
+ "model_id": "Qwen/Qwen3.8-27B",
+ "dims": {
+  "num_layers": 64,
+  "dtype": "bfloat16"
+ },
+ "kernels": {
+  "gpu_warm": "gemv_worklist",
+  "cpu_cold": "kt_tile_k2_bf16"
+ },
+ "projs": {
+  "mlp.gate_up_proj": {
+   "k": 5120,
+   "n": 34816,
+   "parts": [
+    {
+     "name": "gate",
+     "n": 17408,
+     "bands": [
+      [
+       0,
+       5120,
+       "warm"
+      ]
+     ],
+     "calib": "g",
+     "p": 0.5,
+     "lambda": 0.0
+    },
+    {
+     "name": "up",
+     "n": 17408,
+     "bands": [
+      [
+       0,
+       5120,
+       "warm"
+      ]
+     ],
+     "calib": "u",
+     "p": 0.5,
+     "lambda": 0.0
+    }
+   ]
+  },
+  "mlp.down_proj": {
+   "k": 17408,
+   "n": 5120,
+   "bands": [
+    [
+     0,
+     17408,
+     "warm"
+    ]
+   ],
+   "calib": "d",
+   "p": 0.5,
+   "lambda": 0.0
+  },
+  "self_attn.qkv_proj": {
+   "k": 5120,
+   "n": 14336,
+   "parts": [
+    {
+     "name": "q",
+     "n": 12288,
+     "bands": [
+      [
+       0,
+       5120,
+       "warm"
+      ]
+     ],
+     "calib": "q",
+     "p": 0.5,
+     "lambda": 0.0
+    },
+    {
+     "name": "k",
+     "n": 1024,
+     "bands": [
+      [
+       0,
+       5120,
+       "warm"
+      ]
+     ],
+     "calib": "k",
+     "p": 0.5,
+     "lambda": 0.0
+    },
+    {
+     "name": "v",
+     "n": 1024,
+     "bands": [
+      [
+       0,
+       5120,
+       "warm"
+      ]
+     ],
+     "calib": "v",
+     "p": 0.5,
+     "lambda": 0.0
+    }
+   ]
+  },
+  "self_attn.o_proj": {
+   "k": 6144,
+   "n": 5120,
+   "bands": [
+    [
+     0,
+     6144,
+     "warm"
+    ]
+   ],
+   "calib": "o",
+   "p": 0.5,
+   "lambda": 0.0
+  }
+ },
+ "sparsity": {
+  "score": "k2wl2",
+  "calib": {
+   "path": "/home/um3maru/prism-sglang/assets/qwen38_27b.pt",
+   "sha256": "ab97d91fd2b3cd53daaf1294cfef93e92b35ee018658825065d6a9cba6234659"
+  },
+  "pmax": 0.9,
+  "grid": 0.005,
+  "ng": 201,
+  "renorm_it": 3
+ }
+}
