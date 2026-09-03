@@ -10,7 +10,8 @@
   원시 포인터로 읽으므로** wrapper가 참조를 계속 들고 있어야 한다 —
   PartialMoEWrapper가 그 역할을 한다 (experts_partial.py 수명 규칙).
   sparsity 수식 자체는 kt에 있고 prism은 라우터 가중만 step마다 내려준다.
-- P0 실행 제약의 집행: gate == up (K 밴드·N shard), expert 간 균일 기하.
+- P0 실행 제약의 집행: gate == up (N shard), 층 전역 스칼라(N shard 테이블·
+  sparsity 예산)의 expert 간 일치. K 기하는 expert별로 갈려도 된다.
 
 인터페이스 `ColdBackend`는 구현 교체(테스트 mock, 미래의 다른 CPU 백엔드)를
 위한 추상이고, `KtColdBackend`가 kt-kernel 구현이다.
@@ -115,14 +116,27 @@ class KtColdBackend:
         """n_shards: {"gateup": (offsets, rows), "down": (offsets, rows)} — 주면 plan의
         cold_shards 대신 이 노드 테이블을 쓴다 (warm-kt: GPU-local 노드에 전량)."""
         plan, dims = self._plan, self._plan.dims
-        # P0: expert 간 균일 기하 (weights.py 로더와 같은 요구)
+        # 균일을 요구하는 것은 **kt config의 스칼라가 되는 것들뿐**이다: N shard
+        # 테이블과 sparsity 예산. K 기하(어느 행이 cold냐)는 expert별로 갈려도
+        # 되고 — row_off/idx로 내려간다 (계약 ③: flat + offset이라 균일성 요구가
+        # 없다) — 예산을 expert별로 쓰는 것이 이 스키마의 존재 이유다.
         ep = plan.expert(layer_idx, 0)
         for e in range(1, dims.num_experts):
             other = plan.expert(layer_idx, e)
-            if other is not ep and other != ep:
-                raise NotImplementedError(
-                    f"layer {layer_idx}: P0 cold backend requires uniform expert geometry"
-                )
+            if other is ep or other == ep:
+                continue
+            for proj in Proj:
+                a, b = ep.proj(proj), other.proj(proj)
+                if a.cold_shards != b.cold_shards:
+                    raise NotImplementedError(
+                        f"layer {layer_idx} {proj.value}: cold_shards differ between "
+                        f"experts 0 and {e} — N shard 테이블은 층 전역이다"
+                    )
+                if (a.sparsity_p, a.sparsity_lambda) != (b.sparsity_p, b.sparsity_lambda):
+                    raise NotImplementedError(
+                        f"layer {layer_idx} {proj.value}: sparsity budget differs "
+                        f"between experts 0 and {e} — (p, lambda)는 kt config의 스칼라다"
+                    )
         where = f"layer {layer_idx}"
         # N shard는 여전히 gate/up 공유다 (출력 축 — K 인덱스와 무관하다).
         if ep.gate.cold_shards != ep.up.cold_shards:
