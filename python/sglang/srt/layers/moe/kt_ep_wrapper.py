@@ -216,13 +216,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
         if self.tp_rank == 0:
+            # kt-kernel >= 0.7 takes a boolean [num_experts] mask of GPU-resident
+            # experts instead of a count (num_gpu_experts is SFT-only there). This
+            # wrapper keeps experts 0..num_gpu_experts-1 on the GPU (see
+            # mask_cpu_expert_ids), so the mask is the matching prefix.
+            gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
+            gpu_experts_mask[: self.num_gpu_experts] = True
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
                 num_experts=num_experts,
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
-                num_gpu_experts=self.num_gpu_experts,
+                gpu_experts_mask=gpu_experts_mask,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
                 weight_path=self.kt_config.weight_path,
