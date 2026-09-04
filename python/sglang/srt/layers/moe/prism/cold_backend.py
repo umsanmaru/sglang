@@ -10,7 +10,8 @@
   원시 포인터로 읽으므로** wrapper가 참조를 계속 들고 있어야 한다 —
   PartialMoEWrapper가 그 역할을 한다 (experts_partial.py 수명 규칙).
   sparsity 수식 자체는 kt에 있고 prism은 라우터 가중만 step마다 내려준다.
-- P0 실행 제약의 집행: gate == up (K 밴드·N shard), expert 간 균일 기하.
+- P0 실행 제약의 집행: gate == up (N shard), 층 전역 스칼라(N shard 테이블·
+  sparsity 예산)의 expert 간 일치. K 기하는 expert별로 갈려도 된다.
 
 인터페이스 `ColdBackend`는 구현 교체(테스트 mock, 미래의 다른 CPU 백엔드)를
 위한 추상이고, `KtColdBackend`가 kt-kernel 구현이다.
@@ -25,7 +26,7 @@ from typing import Optional, Protocol
 
 import torch
 
-from sglang.srt.layers.moe.prism.plan import Plan, PlanError, Proj
+from sglang.srt.layers.moe.prism.plan import Plan, PlanError, Proj, Tier
 from sglang.srt.layers.moe.prism.weights import PendingColdTensors
 
 
@@ -115,22 +116,52 @@ class KtColdBackend:
         """n_shards: {"gateup": (offsets, rows), "down": (offsets, rows)} — 주면 plan의
         cold_shards 대신 이 노드 테이블을 쓴다 (warm-kt: GPU-local 노드에 전량)."""
         plan, dims = self._plan, self._plan.dims
-        # P0: expert 간 균일 기하 (weights.py 로더와 같은 요구)
-        ep = plan.expert(layer_idx, 0)
-        for e in range(1, dims.num_experts):
-            other = plan.expert(layer_idx, e)
-            if other is not ep and other != ep:
-                raise NotImplementedError(
-                    f"layer {layer_idx}: P0 cold backend requires uniform expert geometry"
-                )
+        # 균일을 요구하는 것은 **kt config의 스칼라가 되는 것들뿐**이다: N shard
+        # 테이블과 sparsity 예산. K 기하(어느 행이 cold냐)는 expert별로 갈려도
+        # 되고 — row_off/idx로 내려간다 (계약 ③: flat + offset이라 균일성 요구가
+        # 없다) — 예산을 expert별로 쓰는 것이 이 스키마의 존재 이유다.
+        # 이 인스턴스가 계산하는 티어: plan shard를 쓰면 COLD, 호출자가 n_shards를
+        # 주면 warm-kt(WARM). 스칼라(N shard 테이블·sparsity 예산)의 기준 expert는
+        # **그 티어에 행이 있는 expert들 사이에서만** 고르고 비교한다 — 전량 GPU인
+        # expert는 cold_shards가 비어 있는 것이 정상이고(밴드가 없으면 shard도 없다,
+        # plan.validate_static), 그 부재를 불일치로 세면 안 된다.
         where = f"layer {layer_idx}"
-        # N shard는 여전히 gate/up 공유다 (출력 축 — K 인덱스와 무관하다).
-        if ep.gate.cold_shards != ep.up.cold_shards:
-            raise PlanError(f"{where}: gate and up must share cold N shards")
+        tier = Tier.COLD if n_shards is None else Tier.WARM
+        ref: dict = {}
+        for proj in Proj:
+            for e in range(dims.num_experts):
+                pp = plan.expert(layer_idx, e).proj(proj)
+                if not pp.has_tier(tier):
+                    continue
+                if proj not in ref:
+                    ref[proj] = pp
+                    continue
+                a = ref[proj]
+                if tier is Tier.COLD and a.cold_shards != pp.cold_shards:
+                    raise NotImplementedError(
+                        f"{where} {proj.value}: cold_shards differ across experts "
+                        f"(expert {e}) — N shard 테이블은 층 전역이다"
+                    )
+                if (a.sparsity_p, a.sparsity_lambda) != (pp.sparsity_p, pp.sparsity_lambda):
+                    raise NotImplementedError(
+                        f"{where} {proj.value}: sparsity budget differs across experts "
+                        f"(expert {e}) — (p, lambda)는 kt config의 스칼라다"
+                    )
+            if proj not in ref:
+                if n_shards is None:
+                    raise NotImplementedError(
+                        f"{where} {proj.value}: no expert has cold rows — "
+                        f"P0 cold backend requires cold rows on all projections"
+                    )
+                # warm-kt인데 이 proj에 warm 행이 없다: 예산값은 쓰이지 않으므로 expert 0으로.
+                ref[proj] = plan.expert(layer_idx, 0).proj(proj)
 
         if n_shards is None:
-            gu_off, gu_rows = _shard_tables(ep.gate.cold_shards, self._num_nodes, f"{where}.gateup")
-            dn_off, dn_rows = _shard_tables(ep.down.cold_shards, self._num_nodes, f"{where}.down")
+            # N shard는 여전히 gate/up 공유다 (출력 축 — K 인덱스와 무관하다).
+            if ref[Proj.GATE].cold_shards != ref[Proj.UP].cold_shards:
+                raise PlanError(f"{where}: gate and up must share cold N shards")
+            gu_off, gu_rows = _shard_tables(ref[Proj.GATE].cold_shards, self._num_nodes, f"{where}.gateup")
+            dn_off, dn_rows = _shard_tables(ref[Proj.DOWN].cold_shards, self._num_nodes, f"{where}.down")
         else:
             (gu_off, gu_rows), (dn_off, dn_rows) = n_shards["gateup"], n_shards["down"]
         # 커널 키가 요구하는 노드 N shard 정렬 (tile fp4 = 256) — kt init의 runtime_error보다 먼저, 이름으로.
@@ -164,9 +195,9 @@ class KtColdBackend:
             sp = cfg.partial.sparsity
             sp.pmax, sp.grid = spec.pmax, spec.grid
             sp.ng, sp.renorm_it = spec.ng, spec.renorm_it
-            sp.p_gate, sp.lam_gate = ep.gate.sparsity_p, ep.gate.sparsity_lambda
-            sp.p_up, sp.lam_up = ep.up.sparsity_p, ep.up.sparsity_lambda
-            sp.p_down, sp.lam_down = ep.down.sparsity_p, ep.down.sparsity_lambda
+            sp.p_gate, sp.lam_gate = ref[Proj.GATE].sparsity_p, ref[Proj.GATE].sparsity_lambda
+            sp.p_up, sp.lam_up = ref[Proj.UP].sparsity_p, ref[Proj.UP].sparsity_lambda
+            sp.p_down, sp.lam_down = ref[Proj.DOWN].sparsity_p, ref[Proj.DOWN].sparsity_lambda
         cfg.pool = self.cpuinfer.backend_
         return cfg
 
