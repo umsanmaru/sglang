@@ -929,7 +929,8 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
                      warm_node: Optional[int] = None,
                      x_row_is_pair: bool = False,
                      dtype: str = "bf16",
-                     experts: int = 1, topk: int = 1) -> SparseGemv:
+                     experts: int = 1, topk: int = 1,
+                     per_k: bool = False) -> SparseGemv:
     """[k, n] weight 하나의 warm sparse GEMV — shape과 sparsity만 받는다.
 
         warm_sparse_gemv(1792, 768, 0.9, device=1).us                       # 접힌 형태
@@ -938,6 +939,11 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
     `dense_gemv`의 sparse 짝이다: W는 pinned host에 두고 GPU가 UVA로 제자리 읽는다
     (`gemv_worklist_indexed_pinned_sparse` — `tiers.SparsePinnedGateUp`이 부르는 그
     커널). 죽은 페어의 로드를 발행하지 않으므로 건너뛴 만큼이 그대로 PCIe 절약이다.
+
+    `per_k=True`(score k1, fp8 전용)면 마스크가 페어가 아니라 **k 행 단위**다 —
+    가중치 통계(a/c)를 안 쓰므로 sparsity를 입력 x의 레벨과 expert별 thr(순서통계)로
+    실현하고 커널은 `*_sparsek1` 진입점으로 갈린다. 이때 x는 1이 아니라 레벨 값이라
+    마스킹이 빠지면 결과가 달라진다.
 
     `experts`/`topk`가 기본값(1, 1)이면 expert 풀과 활성 수를 1로 **접은** 커널
     상한이다. 실제 값을 주면 worklist가 `m × topk`개가 되고, iteration마다 다른
@@ -952,7 +958,8 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
     `WarmColdProfiler`로 잰다.
     """
     from sglang.srt.layers.moe.prism.numa import gpu_numa_node
-    from sglang.srt.layers.moe.prism.profile.common import Shape, sparse_tables
+    from sglang.srt.layers.moe.prism.profile.common import (
+        Shape, per_k_levels, per_k_thr, sparse_tables)
     from sglang.srt.layers.moe.prism.profile.hot import _ids as rotate_ids
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
@@ -971,15 +978,31 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
     # 이 티어가 K축 전체를 갖는 형태 — 인덱스는 항등이고 expert마다 반복된다.
     kidx = (torch.arange(k, dtype=torch.int32).to(torch.uint16)
             .repeat(experts).contiguous().to(dev))
-    a, c, thr, keep = sparse_tables(experts, k, sparsity, pattern=mask_pattern,
-                                    seed=seed)
-    spec = SparseSpec(a=a.to(dev), c=c.to(dev), thr=thr.to(dev),
-                      p=SPARSITY_P, lam=SPARSITY_LAM, pmax=PMAX, grid=GRID,
-                      ng=NG, renorm_it=RENORM_IT)
-    # x ≡ 1 — sparsity 합성이 x0=x1=1을 전제한다 (common.py의 역산).
-    # down은 x가 expert별 act라 행이 pair (m, j)다 (executor와 같은 규약).
-    x = torch.ones(m * topk if x_row_is_pair else m, k,
-                   dtype=torch.bfloat16, device=dev)
+    x_rows = m * topk if x_row_is_pair else m
+    if per_k:
+        # score k1: 마스크가 k 행 단위(|x_k| >= thr)다 — 가중치 통계(a/c)를 안 쓰므로
+        # sparsity를 **입력 x의 레벨 + expert별 thr(순서통계)** 로 실현한다 (WarmTier와 같은
+        # 방식). 커널은 SparseSpec.per_k를 보고 `*_sparsek1` 진입점으로 갈린다.
+        if store.name != "fp8":
+            raise ValueError(
+                f"per-k(score k1) warm 진입점은 fp8에만 있다, not {store.name}")
+        levels = per_k_levels(k, pattern=mask_pattern, seed=seed)
+        # 이 티어가 K축 전체를 가지므로 밴드는 expert마다 항등이다 (kidx와 같은 순서).
+        thr, _, keep = per_k_thr(levels, [torch.arange(k)] * experts, sparsity)
+        spec = SparseSpec(a=None, c=None, thr=thr.to(dev),
+                          p=SPARSITY_P, lam=SPARSITY_LAM, pmax=PMAX, grid=GRID,
+                          ng=NG, renorm_it=RENORM_IT, per_k=True)
+        # 죽인 행도 x ≠ 0이다 — 마스킹이 빠지면 값이 달라져 드러난다 (x ≡ 1과 다른 점).
+        x = levels.reshape(1, k).expand(x_rows, k).contiguous().to(dev)
+    else:
+        a, c, thr, keep = sparse_tables(experts, k, sparsity, pattern=mask_pattern,
+                                        seed=seed)
+        spec = SparseSpec(a=a.to(dev), c=c.to(dev), thr=thr.to(dev),
+                          p=SPARSITY_P, lam=SPARSITY_LAM, pmax=PMAX, grid=GRID,
+                          ng=NG, renorm_it=RENORM_IT)
+        # x ≡ 1 — sparsity 합성이 x0=x1=1을 전제한다 (common.py의 역산).
+        # down은 x가 expert별 act라 행이 pair (m, j)다 (executor와 같은 규약).
+        x = torch.ones(x_rows, k, dtype=torch.bfloat16, device=dev)
     ids = rotate_ids(Shape(experts=experts, topk=topk, hidden=k, inter=n),
                      m, reps, dev, seed + 1)
     tw = torch.full((m, topk), 1.0 / topk, dtype=torch.float32, device=dev)
@@ -992,7 +1015,7 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
                         x_row_is_pair, torch.cuda.current_stream()))
 
     try:
-        with nvtx("warm/sparse_gemv"):
+        with nvtx("warm/sparse_gemv" + ("/per_k" if per_k else "")):
             timing = graph_timing(launch, reps, replays=replays)
     finally:
         del parts, x, out, ids

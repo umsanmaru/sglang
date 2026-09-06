@@ -163,6 +163,26 @@ def test_cold_cpu_k1_realizes_sparsity_through_x():
     assert sparse.us < dense.us
 
 
+@cuda_required
+def test_warm_sparse_gemv_per_k_uses_the_sparsek1_entry():
+    """접힌 warm helper도 score k1을 탄다 — a/c 없이 x 레벨 + expert별 thr로 마스크를 실현한다.
+
+    (커널 정합은 `test_fp8_kernels.py`의 per-k 비트 대조가, 티어 정합은
+    `test_warm_cold_k1_matches_x_weighted_reference`가 본다. 여기서는 배관만.)"""
+    from sglang.srt.layers.moe.prism.profile import warm_sparse_gemv
+
+    kw = dict(device=0, reps=4, replays=2, dtype="fp8", experts=4, topk=2)
+    r = warm_sparse_gemv(1024, 512, 0.5, per_k=True, **kw)
+    assert r.us > 0 and abs(r.keep_frac - 0.5) < 1.0 / 512 + 1e-9
+    keep_all = warm_sparse_gemv(1024, 512, 0.0, per_k=True, **kw)
+    assert keep_all.keep_frac == 1.0 and keep_all.us > r.us   # 죽인 만큼 로드가 빠진다
+    # 페어 마스크와 실현 keep이 같아도 다른 경로다 (진입점이 갈린다)
+    pair = warm_sparse_gemv(1024, 512, 0.5, **kw)
+    assert abs(pair.keep_frac - 0.5) < 0.02
+    with pytest.raises(ValueError, match="fp8에만"):
+        warm_sparse_gemv(1024, 512, 0.5, per_k=True, device=0, dtype="bf16")
+
+
 @k1_required
 @cuda_required
 @pytest.mark.parametrize("group", ["gateup", "down"])

@@ -49,6 +49,14 @@ sparsity·티어 경계(full_layer)도 실현되며, 실현 keep은 레벨 동�
         p.check("gateup")   # 마스크 레퍼런스 대조 (rel err)
         p.footprint         # {'warm_pinned_mb': 151.0, 'cold_mb': 1057.0, ...}
 
+    # ②' warm만 — 두 갈래다. 티어 그대로 재려면 같은 프로파일러에서 변형만 좁힌다
+    #    (스토어는 둘 다 굽는다 — warm/cold가 K축 하나를 나눠 갖기 때문이다).
+    with WarmColdProfiler(shape, warm_frac=0.125, sparsity=0.9, device=1) as p:
+        p.measure("gateup", only=("warm_only",)).us("warm_only")     # 18.9
+    #    cold 스토어를 굽기 싫으면 접힌 helper — warm 행 수를 k로 준다 (2048*0.125=256).
+    #    dense는 정확하고 sparse는 ~17% 낙관이다 (thr 계산이 top_k에 비례해 사라진다).
+    warm_sparse_gemv(256, 768, 0.9, device=1, experts=128, topk=8).us
+
     # ③ cold만 (GPU 불필요)
     cold_cpu(shape, sparsity=0.9).us      # 103.5
 
@@ -91,6 +99,17 @@ from sglang.srt.layers.moe.prism.profile.cold_cpu import (
     cold_cpu,
     cold_cpu_sweep,
     cold_sparse_gemv,
+)
+from sglang.srt.layers.moe.prism.profile.dense_lane import (
+    KERNEL_TYPES,
+    TIERS,
+    DenseShape,
+    DenseTier,
+    dense_backends,
+    dense_cold,
+    dense_hot,
+    dense_sweep,
+    dense_warm,
 )
 from sglang.srt.layers.moe.prism.profile.full_layer import (
     FullLayerProfiler,
@@ -173,6 +192,9 @@ __all__ = [
     "WarmColdProfiler", "warm_cold_sparse", "single_expert_warm_cold",
     "ColdCpuProfiler", "cold_cpu", "cold_cpu_sweep",
     "warm_sparse_gemv", "cold_sparse_gemv",
+    # dense 레인 래퍼 (weight [k, n] 하나, 슬롯 회전)
+    "DenseShape", "DenseTier", "TIERS", "KERNEL_TYPES",
+    "dense_hot", "dense_warm", "dense_cold", "dense_sweep", "dense_backends",
     "FullLayerProfiler", "compare", "planner_model",
     # 구성 요소 (직접 조립할 때)
     "WarmTier", "ColdTier", "make_split", "footprint", "node_table",
