@@ -30,6 +30,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.layers.moe.prism.activation import Activation
 from sglang.srt.layers.moe.prism.plan import Plan, PlanError, Proj, Tier, parse_plan, validate_static
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
@@ -133,9 +134,10 @@ class _PrismRuntime:
         # 스토어 포맷 — plan의 GPU 커널 키가 함의한다 (계약 ①). 파라미터 등록·full 텐서
         # 인출·gather·커널 진입점이 전부 이 객체를 통한다 (formats.py).
         self.fmt = gpu_store_format(plan.kernels.gpu_warm)
-        # 모델의 SwiGLU clamp (DSV4-Flash swiglu_limit=10). create_moe_runner가 layer의
-        # MoeRunnerConfig에서 읽어 채운다 — 전 층 공통 값이라 프로세스 1벌.
-        self.swiglu_limit: Optional[float] = None
+        # 모델의 gate/up 활성화 (activation.py: silu[+clamp] | situ). create_moe_runner가 layer의
+        # MoeRunnerConfig에서 읽어 채운다 — 전 층 공통 값이라 프로세스 1벌. rejoin#1이 이걸로
+        # fp32 합에 활성화를 건다 (DSV4-Flash/GLM: silu limit=10, Qwen: silu, Kimi K3: situ 4/25).
+        self.activation: Optional[Activation] = None
         # 모델의 routed_scaling_factor (GLM-5.3 2.5 / DSV4-Flash 1.5). 이것도 create_moe_runner에서만
         # 보인다. 일반 경로에서는 **MoE 러너가** 곱하는데(moe_runner/triton.py:109·164·209,
         # triton_kernels.py:205, flashinfer_cutlass.py:151) prism은 apply를 전유해 러너를 안 쓴다.
@@ -182,7 +184,8 @@ class _PrismRuntime:
             from sglang.srt.layers.moe.prism.rejoin import warmup as warmup_rejoin
 
             d = self.plan.dims
-            warmup_rejoin(device, d.intermediate_size, d.hidden_size, d.top_k, self.swiglu_limit)
+            warmup_rejoin(device, d.intermediate_size, d.hidden_size, d.top_k,
+                          activation=self.activation)
             spec = ResourceSpec.from_plan(
                 self.plan, max_tokens=self.max_tokens, device=device)
             self._resources = ExecutionResources(spec)
@@ -306,14 +309,17 @@ class PrismMoEMethod(FusedMoEMethodBase):
     def create_moe_runner(self, layer, moe_runner_config):
         # base 클래스에 실체(raise NotImplementedError)가 있어 __getattr__이
         # 안 잡는다 — 명시적 위임 (runner는 gpu_method 것이 생성되지만
-        # apply를 우리가 전유하므로 사용되지 않음). 모델의 SwiGLU clamp는 여기서만
-        # 보이므로(MoeRunnerConfig.swiglu_limit) runtime에 적어 rejoin이 쓴다.
-        limit = getattr(moe_runner_config, "swiglu_limit", None)
+        # apply를 우리가 전유하므로 사용되지 않음). 모델의 활성화(activation / swiglu_limit /
+        # gemm1_alpha / gemm1_clamp_limit)는 여기서만 보이므로(MoeRunnerConfig) runtime에 적어
+        # rejoin이 쓴다. 모르는 활성화는 from_runner_config가 즉사시킨다 — 조용히 silu로 계산하면
+        # "돌아가는데 다른 모델"이 된다.
+        act = Activation.from_runner_config(moe_runner_config)
         runtime = _get_runtime()
-        if limit is not None:
-            if runtime.swiglu_limit is not None and runtime.swiglu_limit != limit:
-                raise PlanError(f"swiglu_limit differs across layers ({runtime.swiglu_limit} vs {limit})")
-            runtime.swiglu_limit = float(limit)
+        if runtime.activation is None:
+            logger.info("[prism] MoE activation = %s (rejoin#1에서 적용)", act)
+            runtime.activation = act
+        elif runtime.activation != act:
+            raise PlanError(f"MoE activation differs across layers ({runtime.activation} vs {act})")
         rsf = getattr(moe_runner_config, "routed_scaling_factor", None)
         if rsf is not None:
             if runtime.routed_scaling_factor is not None and runtime.routed_scaling_factor != rsf:
@@ -353,6 +359,12 @@ class PrismMoEMethod(FusedMoEMethodBase):
         # trap 방어 (weights.py docstring): gate-first w13 순서 가정 검증
         if getattr(self.gpu_method, "load_up_proj_weight_first", False):
             raise NotImplementedError("Prism assumes gate-first w13 ordering")
+        # mxfp4 파라미터 명명은 감싸는 GPU method가 정한다 (formats.Mxfp4Format 참조):
+        # DeepSeekMxfp4MoEMethod → *_weight_scale_inv fp32 / Mxfp4MoEMethod(K3, compressed-tensors)
+        # → *_weight_scale u8. 로더는 이름으로 채우므로 여기서 어긋나면 배율이 조용히 1.0으로 남는다.
+        from sglang.srt.layers.moe.prism.formats import Mxfp4Format
+
+        layer._prism_mxfp4_naming = Mxfp4Format.naming_for_method(self.gpu_method)
         runtime.fmt.create_params(layer, num_experts, hidden_size, inter_full, params_dtype,
                                   extra_weight_attrs)
 
@@ -433,9 +445,10 @@ class PrismMoEMethod(FusedMoEMethodBase):
         runtime = _get_runtime()
         out = runtime.executor(x.device).run_layer(
             self.layer_id, x, topk.topk_ids, topk.topk_weights,
-            swiglu_limit=runtime.swiglu_limit,
+            activation=runtime.activation,
         )
-        if runtime.swiglu_limit is not None:
+        if runtime.activation is not None and runtime.activation.kind == "silu" \
+                and runtime.activation.limit is not None:
             # DSV4 2604B 경로 체커: 모델이 "SwiGLU clamp를 적용하는 MoE 경로가 정확히 1회 돌았다"를
             # 층마다 단언한다 (deepseek_v4.py). prism은 clamp를 rejoin에서 적용하므로 같은 신호를 올린다.
             from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
