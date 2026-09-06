@@ -57,7 +57,7 @@ def main() -> None:
                    help="hot 비율의 expert별 편차 (행 수는 정렬 배수로 잘린다)")
     p.add_argument("--warm-spread", type=float, default=0.0)
     p.add_argument("--groups", default="gateup,down")
-    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8"))
+    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8", "fp8pt"))
     p.add_argument("--reps", type=int, default=50)
     p.add_argument("--replays", type=int, default=10)
     p.add_argument("--rounds", type=int, default=3,

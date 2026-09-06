@@ -14,6 +14,7 @@
   bf16     gemv_worklist_*       kt_tile_k2_bf16      2        w [Σk, N] bf16
   mxfp4    gemv_mxfp4_*          kt_tile_k2_mxfp4     32       codes [Σk/2, N] + E8M0 [Σk/32, N]
   fp8      gemv_fp8_*            kt_tile_k2_fp8b128   128      codes [Σk, N] + fp32 [Σk/128, N/128]
+  fp8pt    gemv_fp8pt_*          kt_tile_k2_fp8pt     32       codes [Σk, N] + fp32 [E]  (per-tensor; MoE 포맷 아님, common.Fp8PtGpu)
 
 정렬이 dtype마다 다른 것은 배율 블록이 원본 행 블록에 걸려 있기 때문이다 (계약 ①) —
 티어가 그 블록을 쪼개면 "블록당 배율 1"이 깨진다. `hot_frac`/`warm_frac`의 행 반올림도
@@ -43,6 +44,9 @@
 
     # ③ cold만 (GPU 불필요)
     cold_cpu(shape, sparsity=0.9).us      # 103.5
+
+    # ③' dense 레인 흉내 — kt dense 경로(sparsity=None), 토큰 m개, 슬롯 = expert
+    cold_sparse_gemv(5120, 17408, None, experts=64, m=64, proj="down", dtype="fp8pt").us
 
     # ④ 같은 질문을 다른 dtype으로 (커널·스토어·정렬이 함께 바뀐다)
     hot_dense_gemv(shape, hot_frac=0.375, device=1, dtype="fp8").layer_gemv_us

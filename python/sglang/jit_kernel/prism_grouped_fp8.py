@@ -20,8 +20,9 @@ from sglang.jit_kernel.utils import cache_once, load_jit
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# cold slab 레이아웃 (C++ enum Layout): fp8 타일 (tile_k2_fp8b128)만.
-COLD_LAYOUTS = {"kt_tile8": 1}
+# cold slab 레이아웃 (C++ enum Layout): kt_tile8 = 블록 배율 타일(tile_k2_fp8b128),
+# kt_tile8pt = per-tensor 타일(tile_k2_fp8pt; 배율은 코드 끝 64 B 슬롯의 fp32 1개).
+COLD_LAYOUTS = {"kt_tile8": 1, "kt_tile8pt": 3}
 
 _WRAPPERS = (
     "grouped_fp8_indexed",
@@ -30,6 +31,11 @@ _WRAPPERS = (
     "grouped_fp8_indexed_pinned_gateup",
     "grouped_fp8_cold",
     "grouped_fp8_cold_gateup",
+    # per-tensor 배율 (ROWMAJOR_PT): scales [E], kr 32 배수
+    "grouped_fp8pt_indexed",
+    "grouped_fp8pt_indexed_pinned",
+    "grouped_fp8pt_indexed_gateup",
+    "grouped_fp8pt_indexed_pinned_gateup",
 )
 
 
@@ -78,6 +84,11 @@ grouped_fp8_indexed = _single("grouped_fp8_indexed")
 grouped_fp8_indexed_pinned = _single("grouped_fp8_indexed_pinned")
 grouped_fp8_indexed_gateup = _gateup("grouped_fp8_indexed_gateup")
 grouped_fp8_indexed_pinned_gateup = _gateup("grouped_fp8_indexed_pinned_gateup")
+# per-tensor 배율 쌍둥이 — 같은 호출 규약, scales만 [E].
+grouped_fp8pt_indexed = _single("grouped_fp8pt_indexed")
+grouped_fp8pt_indexed_pinned = _single("grouped_fp8pt_indexed_pinned")
+grouped_fp8pt_indexed_gateup = _gateup("grouped_fp8pt_indexed_gateup")
+grouped_fp8pt_indexed_pinned_gateup = _gateup("grouped_fp8pt_indexed_pinned_gateup")
 
 
 def grouped_fp8_cold(x2d, grouping, cold, out3d, out_col_offset, x_row_is_pair,

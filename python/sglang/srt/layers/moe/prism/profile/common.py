@@ -95,6 +95,40 @@ class Shape:
                 "hidden": self.hidden, "inter": self.inter}
 
 
+# ─── fp8pt GPU 진입점 (MoE 포맷 없이 프로파일이 직접 든다) ──────────────────
+class Fp8PtGpu:
+    """per-tensor fp8의 GPU 진입점 묶음 — `formats.StoreFormat` 중 프로파일이 쓰는 부분만
+    (`gemv`, `gemv_gateup`, `warmup`, `cold_kernels`). MoE에는 per-tensor fp8 체크포인트가
+    없어 `moe/prism/formats.py`에 포맷을 두지 않는다; 커널은 dense 레인(Mistral)용으로
+    `jit_kernel/prism_gemv_fp8.py`에 있고(`gemv_fp8pt_*` 8개) 인자 순서는 블록판과 같다
+    (배율만 슬롯당 스칼라 `[E]`).
+    """
+
+    name = "fp8pt"
+    cold_kernels = ("kt_tile_k2_fp8pt",)
+
+    def gemv(self, *, pinned, sparse):
+        from sglang.jit_kernel import prism_gemv_fp8 as k
+
+        return {(False, False): k.gemv_fp8pt_indexed,
+                (True, False): k.gemv_fp8pt_indexed_pinned,
+                (False, True): k.gemv_fp8pt_indexed_sparse,
+                (True, True): k.gemv_fp8pt_indexed_pinned_sparse}[(pinned, sparse)]
+
+    def gemv_gateup(self, *, pinned, sparse):
+        from sglang.jit_kernel import prism_gemv_fp8 as k
+
+        return {(False, False): k.gemv_fp8pt_indexed_gateup,
+                (True, False): k.gemv_fp8pt_indexed_pinned_gateup,
+                (False, True): k.gemv_fp8pt_indexed_sparse_gateup,
+                (True, True): k.gemv_fp8pt_indexed_pinned_sparse_gateup}[(pinned, sparse)]
+
+    def warmup(self) -> None:
+        from sglang.jit_kernel.prism_gemv_fp8 import warmup_jit
+
+        warmup_jit()
+
+
 # ─── 스토어 dtype (= 백엔드 선택) ──────────────────────────────────────────
 @dataclass(frozen=True)
 class Store:
@@ -115,9 +149,19 @@ class Store:
     k_align: int
     elem_bytes: float          # weight 원소 하나의 바이트 (배율 제외)
     has_vec: bool = False
+    # MoE 포맷(`formats.FORMATS`)이 없는 스토어는 GPU 진입점 묶음을 직접 든다 (fp8pt →
+    # `Fp8PtGpu`). None이면 GPU가 없는 스토어 — cold(kt)만 잴 수 있다.
+    gpu_adapter: Optional[Callable[[], object]] = None
+    gpu: bool = True
 
     @property
     def fmt(self):
+        if not self.gpu:
+            raise ValueError(
+                f"{self.name}: no GPU store format — only cold (kt) profiling is possible "
+                f"(cold_cpu / cold_sparse_gemv); hot/warm/full_layer need GPU entry points")
+        if self.gpu_adapter is not None:
+            return self.gpu_adapter()
         from sglang.srt.layers.moe.prism.formats import FORMATS
 
         return FORMATS[self.name]
@@ -131,22 +175,26 @@ class Store:
         return max(base, self.k_align)
 
     # ── 합성 스토어 ──────────────────────────────────────────────────────
-    def _codes_scales(self, rows: int, n: int, seed: int):
-        """(codes, scales) CPU 텐서. rows = 이 스토어의 총 k 행 수."""
+    def _codes_scales(self, rows: int, n: int, seed: int, experts: int = 1):
+        """(codes, scales) CPU 텐서. rows = 이 스토어의 총 k 행 수, experts = 슬롯 수
+        (per-tensor 배율 `[E]`에만 쓰인다)."""
         g = torch.Generator().manual_seed(seed)
         if self.name == "mxfp4":
             nib = torch.randint(0, 16, (rows, n), generator=g, dtype=torch.int64)
             codes = (nib[0::2] | (nib[1::2] << 4)).to(torch.uint8)      # 행 = k-페어
             scales = torch.full((rows // 32, n), 127, dtype=torch.uint8)  # 2^0
             return codes.contiguous(), scales.contiguous()
-        if self.name == "fp8":
+        if self.name in ("fp8", "fp8pt"):
             # 지수 1..13, 가수·부호 임의 — denormal(e=0)·NaN(0x7F/0xFF)은 만들지 않는다
             # (커널·CPU 포팅이 공유하는 인코더 전제).
             e = torch.randint(1, 14, (rows, n), generator=g)
             m = torch.randint(0, 8, (rows, n), generator=g)
             sg = torch.randint(0, 2, (rows, n), generator=g)
             codes = ((sg << 7) | (e << 3) | m).to(torch.uint8)
-            scales = torch.ones(rows // 128, max(1, n // 128), dtype=torch.float32)
+            if self.name == "fp8pt":
+                scales = torch.ones(experts, dtype=torch.float32)      # 슬롯당 스칼라
+            else:
+                scales = torch.ones(rows // 128, max(1, n // 128), dtype=torch.float32)
             return codes.contiguous(), scales.contiguous()
         w = torch.empty(rows, n, dtype=torch.bfloat16)
         w.normal_(0, 0.02, generator=g)
@@ -161,10 +209,12 @@ class Store:
         어느 expert인지는 `row_off`가 말한다 (`tier_indices`가 같이 만든다).
 
         `node`를 주면 pinned + NUMA 바인딩(warm), 아니면 device 상주(hot)다."""
+        if not self.gpu:
+            self.fmt  # raises with the explanation
         rows = per_expert(k_rows, experts, "k_rows")
         for ke in rows:
             self.check_geometry(int(ke), n)
-        parts = self._codes_scales(sum(int(k) for k in rows), n, seed)
+        parts = self._codes_scales(sum(int(k) for k in rows), n, seed, experts)
         out = []
         for t in parts:
             if t is None:
@@ -209,12 +259,16 @@ class Store:
             # kt는 bf16 배율(2^e)을 받아 자기 형식으로 바꾼다 — 1.0으로 채운다.
             scales = torch.ones(experts * n * (k // 32), dtype=torch.bfloat16)
             return codes.reshape(-1).contiguous(), scales
-        if self.name == "fp8":
+        if self.name in ("fp8", "fp8pt"):
             e = torch.randint(1, 14, (experts * n, k), generator=g)
             m = torch.randint(0, 8, (experts * n, k), generator=g)
             sg = torch.randint(0, 2, (experts * n, k), generator=g)
             codes = ((sg << 7) | (e << 3) | m).to(torch.uint8)
-            scales = torch.ones(experts * (n // 128) * (k // 128), dtype=torch.float32)
+            if self.name == "fp8pt":
+                # per-tensor: 선형층(= expert 슬롯)당 fp32 배율 하나 → [E]
+                scales = torch.ones(experts, dtype=torch.float32)
+            else:
+                scales = torch.ones(experts * (n // 128) * (k // 128), dtype=torch.float32)
             return codes.reshape(-1).contiguous(), scales
         raise ValueError(f"unknown store dtype {self.name!r}")
 
@@ -235,6 +289,8 @@ class Store:
             base += sum(k // 32 for k in rows) * n
         elif self.name == "fp8":
             base += sum(k // 128 for k in rows) * max(1, n // 128) * 4
+        elif self.name == "fp8pt":
+            base += experts * 4
         return int(base)
 
     def call(self, fn, args: tuple, *, vec: int = 0) -> None:
@@ -260,6 +316,12 @@ class Store:
                              scales.int() - 127).repeat_interleave(32, dim=0)
             return vals * sc
         vals = _e4m3_table()[codes.long()]
+        if self.name == "fp8pt":
+            # 배율 [E] — 균일 행 수 k_rows 전제 (expert 블록마다 스칼라 하나)
+            if scales.numel() * k_rows != vals.shape[0]:
+                raise ValueError(f"fp8pt dequant: scales {scales.numel()} × k_rows {k_rows} "
+                                 f"!= rows {vals.shape[0]}")
+            return vals * scales.float().repeat_interleave(k_rows)[:, None]
         sc = scales.float().repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
         return vals * sc[: vals.shape[0], : vals.shape[1]]
 
@@ -284,6 +346,11 @@ STORES = {
                    elem_bytes=0.5),
     "fp8": Store(name="fp8", cpu_kernel="kt_tile_k2_fp8b128", k_align=128,
                  elem_bytes=1.0),
+    # per-tensor fp8 (Mistral-Medium-3.5 dense: weight_block_size null, 선형층당 배율 스칼라).
+    # 배율 블록이 없어 포맷상 K 정렬은 페어지만, GPU gemv의 row_off와 kt pack 타일이 32 배수를
+    # 요구하므로 티어 정렬은 32다. GPU 진입점은 `Fp8PtGpu` (MoE 포맷 아님).
+    "fp8pt": Store(name="fp8pt", cpu_kernel="kt_tile_k2_fp8pt", k_align=32,
+                   elem_bytes=1.0, gpu_adapter=Fp8PtGpu),
 }
 
 
@@ -509,10 +576,11 @@ class SparseGemv:
     where: str            # "warm" (pinned/UVA) | "cold" (CPU/kt)
     k_rows: int
     n_cols: int
-    sparsity: float       # 요청값
+    sparsity: Optional[float]   # 요청값. None = kt dense 경로 (테이블 없음, 마스크 빌드 없음)
     keep_frac: float      # 실현값 (합성이 정확하므로 요청과 거의 같다)
-    dense_bytes: int
+    dense_bytes: int      # 한 호출이 읽는 weight 바이트 (토큰 수와 무관 — W는 호출당 한 번)
     timing: Timing
+    tokens: int = 1       # 한 호출의 토큰 수 M (cold 전용; warm은 decode M=1)
     # cold 전용. NUMA N 분할은 요청값이 커널의 N 정렬로 **반올림**되므로
     # (tile_k2는 노드당 256의 배수) 실현된 행 수를 같이 남긴다 — 저장된 JSON이
     # 어느 분할에서 나온 값인지 스스로 말해야 한다.
@@ -542,7 +610,8 @@ class SparseGemv:
         d.update(where=self.where, k_rows=self.k_rows, n_cols=self.n_cols,
                  sparsity=self.sparsity, keep_frac=round(self.keep_frac, 4),
                  dense_bytes=self.dense_bytes, kept_bytes=self.kept_bytes,
-                 gbps=self.gbps, gbps_dense=self.gbps_dense)
+                 gbps=self.gbps, gbps_dense=self.gbps_dense, tokens=self.tokens,
+                 us_per_token=round(self.timing.us / self.tokens, 3))
         if self.numa_split is not None:
             d["numa_split"] = self.numa_split
             d["node_rows"] = list(self.node_rows or ())

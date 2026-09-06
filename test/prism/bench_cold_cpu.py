@@ -50,8 +50,11 @@ def main() -> None:
     p.add_argument("--hidden", type=int, default=2048)
     p.add_argument("--inter", type=int, default=768)
     p.add_argument("--cold-frac", type=float, default=0.875)
-    p.add_argument("--sparsity", type=float, default=0.9,
-                   help="죽이는 페어의 비율. 1.0 = 준비 작업만 (진단용)")
+    p.add_argument("--sparsity", default="0.9",
+                   help="죽이는 페어의 비율. 1.0 = 준비 작업만 (진단용). "
+                        "'none' = kt dense 경로 (테이블 없음; dense 레인의 cold가 부르는 경로)")
+    p.add_argument("--m", type=int, default=1,
+                   help="한 호출의 토큰 수 (qlen). >1은 --sparsity none 필수 (sparse는 decode 전용)")
     p.add_argument("--proj", default="gateup", choices=("gateup", "down"))
     p.add_argument("--band", action="store_true",
                    help="밴드 퇴화형 주입 (kt의 gather zero-copy 경로)")
@@ -62,12 +65,13 @@ def main() -> None:
     p.add_argument("--sweep-experts", default=None,
                    help="쉼표로 구분한 E 목록 — A 고정, E만 훑는다")
     p.add_argument("--mask-pattern", default="random", choices=("random", "block"))
-    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8"),
+    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8", "fp8pt"),
                    help="cold 스토어 dtype = kt 백엔드 (bf16 → TileK2BF16, mxfp4 → "
-                        "TileK2MXFP4, fp8 → TileK2FP8B128). --cpu-kernel은 그 안에서만 고른다")
+                        "TileK2MXFP4, fp8 → TileK2FP8B128, fp8pt → TileK2FP8PT per-tensor). "
+                        "--cpu-kernel은 그 안에서만 고른다")
     p.add_argument("--cpu-kernel", default=None,
                    choices=("kt_tile_k2_bf16", "kt_amx_bf16", "kt_amx_fp4",
-                            "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128"),
+                            "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128", "kt_tile_k2_fp8pt"),
                    help="기본값은 dtype이 정한다")
     p.add_argument("--numa-map", default="",
                    help="쉼표로 구분한 NUMA 노드 목록 (예: 0 / 1 / 0,1). "
@@ -85,10 +89,11 @@ def main() -> None:
     experts = ([int(x) for x in a.sweep_experts.split(",")] if a.sweep_experts
                else [a.experts])
     numa_map = [int(x) for x in a.numa_map.split(",") if x.strip()] or None
+    sparsity = None if a.sparsity.lower() in ("none", "dense") else float(a.sparsity)
     try:
         payload = cold_cpu_sweep(
             shape, experts, iters=a.iters, replays=a.replays,
-            fixed_ids=a.fixed_ids, cold_frac=a.cold_frac, sparsity=a.sparsity,
+            fixed_ids=a.fixed_ids, cold_frac=a.cold_frac, sparsity=sparsity, m=a.m,
             proj=a.proj, band=a.band, split_index=a.split_index,
             mask_pattern=a.mask_pattern, numa_split=a.numa_split,
             threads=a.threads, cpu_kernel=a.cpu_kernel, dtype=a.dtype, seed=a.seed,

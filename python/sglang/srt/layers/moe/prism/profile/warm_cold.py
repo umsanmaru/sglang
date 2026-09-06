@@ -81,7 +81,9 @@ VARIANTS = ("warm_only", "cold_only", "combined", "combined_eager",
 # 아직 256이다.
 N_ALIGN = {"kt_tile_k2_bf16": 32, "kt_amx_bf16": 32,
            "kt_amx_fp4": 32, "kt_tile_k2_mxfp4": 256,
-           "kt_tile_k2_fp8b128": 256}
+           "kt_tile_k2_fp8b128": 256,
+           # per-tensor fp8 — 같은 fp8 타일(super 256 n), 배율만 expert당 스칼라
+           "kt_tile_k2_fp8pt": 256}
 
 
 # ─── 행 분할 ───────────────────────────────────────────────────────────────
@@ -324,8 +326,15 @@ class ColdTier:
             self.w[proj] = w
             self.s[proj] = sc
 
-        tables, self.keep_frac, self.a_host = {}, {}, {}
+        # sparsity=None: 테이블을 설치하지 않는다 = kt **dense 경로** (마스크 빌드·plan 없음).
+        # sparsity=0.0과 다르다 — 0.0은 전부 살리는 *sparse* 경로다. dense 레인(linear)의
+        # cold가 부르는 것은 이 dense 경로다.
+        tables, self.keep_frac, self.a_host = ({} if sparsity is not None else None), {}, {}
         for proj in PROJS:
+            if sparsity is None:
+                self.keep_frac[proj] = 1.0
+                self.a_host[proj] = [torch.ones(r, dtype=torch.float32) for r in self.rows[proj]]
+                continue
             a, c, thr, frac = sparse_tables(
                 E, self.rows[proj], sparsity, pattern=pattern, seed=seed)
             tables[f"{proj}_wn_sq"] = a
@@ -369,7 +378,7 @@ class ColdTier:
                 low, high = (b & 0xF).long(), (b >> 4).long()
                 out.append(torch.stack([_FP4_TABLE[low], _FP4_TABLE[high]],
                                        dim=2).reshape(n, k))
-            else:
+            else:                      # fp8 / fp8pt — 합성 배율이 1.0이라 코드 값 그대로
                 take = n * k
                 out.append(_e4m3_table()[w[pos:pos + take].long()].reshape(n, k))
             pos += take

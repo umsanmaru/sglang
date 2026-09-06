@@ -9,6 +9,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#include <type_traits>
 
 #include "prism_fp8.cuh"
 #include "prism_sparse_common.cuh"
@@ -55,6 +56,13 @@ using prism_sparse::SparseIn;
 //
 // SPARSE: 페어 마스크(k2wl2)는 bf16/mxfp4 커널과 **같은 함수**(prism_sparse_common.cuh)로
 // 만들고, 죽은 페어의 두 행 로드를 발행하지 않는다.
+//
+// **PT(per-tensor 배율) 판** (2026-09-05, Mistral-Medium-3.5 static-tensor FP8 — `weight_block_size:
+// null`, `weight_scale_inv` 스칼라): 스토어 인자의 `scales`가 **[E] fp32**(슬롯당 1개)이고 청크마다
+// 곱하던 배율을 ty 트리 합산 **뒤에 1회** 곱한다 — kt `ktf8pt_gemv`(전 K 누산 후 ×s)와 같은 구조.
+// 코드 스토어는 블록판과 같은 `[Σk, N]` u8이고 k 행 수는 128이 아닌 **32 배수**면 된다(청크 단위).
+// 블록판과 pt판은 배율이 2^n이면 비트동일하고, 임의 fp32면 마지막 라운딩 하나가 다르다 —
+// 비트일치 계약은 exact 픽스처(2^n 배율)로만 건다.
 constexpr int kKTile = 2048;     // x 스테이징 폭 (k)
 constexpr int kChunk = 32;       // ty 하나가 맡는 k 행 수 (16 페어)
 constexpr int kBlk = prism_fp8::kBlk;  // 128
@@ -75,13 +83,13 @@ __device__ __forceinline__ void f8_load(const uint8_t* p, uint32_t (&w)[B / 4]) 
 
 struct F8Slot {
   const uint8_t* codes;
-  const float* scales;
+  const float* scales;  // 블록판: [Σk/128, N/128] / PT: [E] (슬롯당 스칼라)
   const int32_t* row_off;
   const uint16_t* kidx;
   long long out_off;
 };
 
-template <typename IdxT, bool SPARSE, int kV, int kNX, int kNY>
+template <typename IdxT, bool SPARSE, bool PT, int kV, int kNX, int kNY>
 __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
     const __nv_bfloat16* __restrict__ x,
     const IdxT* __restrict__ topk,
@@ -107,7 +115,9 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
   const long long kr = static_cast<long long>(s.row_off[e + 1]) - o0;
   const __nv_bfloat16* xr = x + row * x_kx;
   const uint8_t* codes_e = s.codes + o0 * n_cols;
-  const float* scales_e = s.scales + (o0 / kBlk) * (n_cols / kBlk);
+  // 블록판: expert의 배율표 시작. PT: 슬롯 스칼라 하나 (마지막에 곱한다).
+  const float* scales_e = PT ? nullptr : s.scales + (o0 / kBlk) * (n_cols / kBlk);
+  const float sc_e = PT ? s.scales[e] : 0.f;
   const uint16_t* ie = s.kidx + o0;
 
   float thr2 = 0.f;
@@ -139,7 +149,7 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
       __syncthreads();
     }
     if (!active) continue;
-    const int nchunk = cnt / kChunk;  // cnt는 128 배수 (kr·kKTile 모두 128 배수)
+    const int nchunk = cnt / kChunk;  // cnt는 32 배수 (kr: 블록판 128·PT 32, kKTile 2048)
     for (int g = ty; g < nchunk; g += kNY) {
       float accb[kV];
 #pragma unroll
@@ -166,10 +176,15 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
         }
       }
       if (!any) continue;
-      // 열 타일이 배율 블록 하나라 스칼라 1개다 (열 인덱스 = blockIdx.x).
-      const float sc = scales_e[(krow / kBlk) * (n_cols / kBlk) + nblock];
+      if constexpr (PT) {
 #pragma unroll
-      for (int j = 0; j < kV; ++j) acc[j] += accb[j] * sc;
+        for (int j = 0; j < kV; ++j) acc[j] += accb[j];
+      } else {
+        // 열 타일이 배율 블록 하나라 스칼라 1개다 (열 인덱스 = blockIdx.x).
+        const float sc = scales_e[(krow / kBlk) * (n_cols / kBlk) + nblock];
+#pragma unroll
+        for (int j = 0; j < kV; ++j) acc[j] += accb[j] * sc;
+      }
     }
   }
 
@@ -185,6 +200,11 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
     __syncthreads();
   }
   if (ty == 0 && active) {
+    // PT: 전 K 합산 뒤 배율 1회 (kt ktf8pt_gemv와 같은 순서).
+    if constexpr (PT) {
+#pragma unroll
+      for (int j = 0; j < kV; ++j) red[0][tx * kV + j] *= sc_e;
+    }
     // kV열 bf16 = 2·kV B (out_off 8 배수, n0 kV 배수 — host 검증).
     __nv_bfloat162 h[kV / 2];
 #pragma unroll
@@ -218,19 +238,19 @@ inline uint32_t sm_count_of(int device_id) {
                     static_cast<unsigned int>(pairs), static_cast<unsigned int>(slots));    \
     if (is_type<int32_t>(topk.dtype())) {                                                   \
       LaunchKernel(grid, block, device)(                                                    \
-          prism_gemv_fp8<int32_t, SPARSE, (V), (NX), (NY)>, x,                              \
+          prism_gemv_fp8<int32_t, SPARSE, PT, (V), (NX), (NY)>, x,                              \
           static_cast<const int32_t*>(topk.data_ptr()), out, x_kx, n_cols, out_row, top_k,  \
           x_row_is_pair, s0, s1, sp0, sp1);                                                 \
     } else {                                                                                \
       LaunchKernel(grid, block, device)(                                                    \
-          prism_gemv_fp8<int64_t, SPARSE, (V), (NX), (NY)>, x,                              \
+          prism_gemv_fp8<int64_t, SPARSE, PT, (V), (NX), (NY)>, x,                              \
           static_cast<const int64_t*>(topk.data_ptr()), out, x_kx, n_cols, out_row, top_k,  \
           x_row_is_pair, s0, s1, sp0, sp1);                                                 \
     }                                                                                       \
   } while (0)
 
 // 타일 선택 — mxfp4와 같은 규칙. 어느 타일을 골라도 결과는 비트 동일하다.
-template <bool SPARSE>
+template <bool SPARSE, bool PT>
 inline void launch_gemv_fp8(const DLDevice& device, tvm::ffi::TensorView topk,
                             const __nv_bfloat16* x, __nv_bfloat16* out,
                             int64_t x_kx, int64_t n_cols, int64_t out_row, int64_t top_k,
@@ -275,29 +295,40 @@ inline bool aligned16(const void* p) {
 }
 
 // 스토어 한 슬롯의 검증. R(k 행 수)은 kidx가 정하고 codes는 그와 같은 행 수, scales는
-// R/128 × N/128이어야 한다 — 오프셋 테이블과 스토어가 어긋나면 조용히 남의 행을 읽는다.
+// 블록판이면 R/128 × N/128, PT면 [E](= row_off 길이 − 1)이어야 한다 — 오프셋 테이블과 스토어가
+// 어긋나면 조용히 남의 행을 읽는다. PT는 R % 32 == 0(청크)만 요구한다.
 inline int64_t verify_f8_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
                                tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
                                host::SymbolicSize& E1, host::SymbolicSize& N,
-                               host::SymbolicDevice& cuda_device, bool w_on_device,
+                               host::SymbolicDevice& cuda_device, bool w_on_device, bool pt,
                                const char* what) {
   using namespace host;
   auto R = SymbolicSize{"total_rows"};
   auto Rb = SymbolicSize{"total_k_blocks"};
   auto Nb = SymbolicSize{"n_blocks"};
+  auto Es = SymbolicSize{"scale_experts"};
   TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(row_off);
   TensorMatcher({R}).with_dtype<uint16_t>().with_device(cuda_device).verify(kidx);
   if (w_on_device) {
     TensorMatcher({R, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(codes);
-    TensorMatcher({Rb, Nb}).with_dtype<float>().with_device(cuda_device).verify(scales);
+    if (pt) TensorMatcher({Es}).with_dtype<float>().with_device(cuda_device).verify(scales);
+    else TensorMatcher({Rb, Nb}).with_dtype<float>().with_device(cuda_device).verify(scales);
   } else {
     TensorMatcher({R, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(codes);
-    TensorMatcher({Rb, Nb}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
+    if (pt) TensorMatcher({Es}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
+    else TensorMatcher({Rb, Nb}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
   }
-  RuntimeCheck(Rb.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rb.unwrap(),
-               " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/", kBlk, ")");
-  RuntimeCheck(Nb.unwrap() * kBlk == N.unwrap(), what, ": scales has ", Nb.unwrap(),
-               " block cols but the store has ", N.unwrap(), " columns (must be exactly 1/", kBlk, ")");
+  if (pt) {
+    RuntimeCheck(Es.unwrap() + 1 == E1.unwrap(), what, ": per-tensor scales has ", Es.unwrap(),
+                 " entries but row_off implies ", E1.unwrap() - 1, " experts");
+    RuntimeCheck(R.unwrap() % kChunk == 0, what, ": per-tensor store rows ", R.unwrap(),
+                 " must be a multiple of ", kChunk);
+  } else {
+    RuntimeCheck(Rb.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rb.unwrap(),
+                 " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/", kBlk, ")");
+    RuntimeCheck(Nb.unwrap() * kBlk == N.unwrap(), what, ": scales has ", Nb.unwrap(),
+                 " block cols but the store has ", N.unwrap(), " columns (must be exactly 1/", kBlk, ")");
+  }
   RuntimeCheck(aligned16(codes.data_ptr()), what, ": codes must be 16-byte aligned");
   return R.unwrap();
 }
@@ -337,7 +368,7 @@ inline void gemv_fp8_impl(
     tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
     tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
     tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
-    bool w_on_device, const SparseIn* sin,
+    bool w_on_device, bool pt, const SparseIn* sin,
     const tvm::ffi::TensorView* codes_up = nullptr,
     const tvm::ffi::TensorView* scales_up = nullptr,
     const tvm::ffi::TensorView* row_off_up = nullptr,
@@ -358,7 +389,7 @@ inline void gemv_fp8_impl(
   TensorMatcher({Rx, Kx}).with_dtype<bf16_t>().with_device(cuda_device).verify(x);
   TensorMatcher({M, K, W_row}).with_dtype<bf16_t>().with_device(cuda_device).verify(out);
   const int64_t rows0 = verify_f8_store(codes, scales, row_off, kidx, E1, N, cuda_device,
-                                        w_on_device, "gemv_fp8");
+                                        w_on_device, pt, "gemv_fp8");
 
   const int64_t m = M.unwrap(), top_k = K.unwrap();
   const int64_t n_cols = N.unwrap(), out_row = W_row.unwrap();
@@ -395,7 +426,7 @@ inline void gemv_fp8_impl(
   if (fused) {
     RuntimeCheck(scales_up && row_off_up && kidx_up, "gemv_fp8_gateup: up slot needs all four tensors");
     const int64_t rows1 = verify_f8_store(*codes_up, *scales_up, *row_off_up, *kidx_up, E1, N,
-                                          cuda_device, w_on_device, "gemv_fp8_gateup(up)");
+                                          cuda_device, w_on_device, pt, "gemv_fp8_gateup(up)");
     RuntimeCheck(out_col_offset_up >= 0 && out_col_offset_up % 8 == 0 &&
                  out_col_offset_up + n_cols <= out_row,
                  "gemv_fp8_gateup: up out cols [", out_col_offset_up, ",",
@@ -419,126 +450,88 @@ inline void gemv_fp8_impl(
   const int64_t avg_rows = rows0 / (E1.unwrap() - 1);  // expert당 평균 k 행 (타일 heuristic)
   const __nv_bfloat16* xp = static_cast<const __nv_bfloat16*>(x.data_ptr());
   __nv_bfloat16* op = static_cast<__nv_bfloat16*>(out.data_ptr());
-  if (sin != nullptr) {
-    launch_gemv_fp8<true>(device, topk, xp, op, x_kx, n_cols, out_row, top_k,
-                          static_cast<int>(x_row_is_pair), s0, s1, sp0, sp1,
-                           pairs, slots, w_on_device, avg_rows);
-  } else {
-    launch_gemv_fp8<false>(device, topk, xp, op, x_kx, n_cols, out_row, top_k,
-                           static_cast<int>(x_row_is_pair), s0, s1, sp0, sp1,
-                           pairs, slots, w_on_device, avg_rows);
+  auto go = [&](auto sparse_tag, auto pt_tag) {
+    launch_gemv_fp8<decltype(sparse_tag)::value, decltype(pt_tag)::value>(
+        device, topk, xp, op, x_kx, n_cols, out_row, top_k, static_cast<int>(x_row_is_pair),
+        s0, s1, sp0, sp1, pairs, slots, w_on_device, avg_rows);
+  };
+  using T = std::true_type;
+  using F = std::false_type;
+  if (sin != nullptr) { if (pt) go(T{}, T{}); else go(T{}, F{}); }
+  else { if (pt) go(F{}, T{}); else go(F{}, F{}); }
+}
+
+// ── 진입점 16개: {device, pinned} × {dense, sparse} × {single, gateup} × {블록 배율, PT} ──
+// 커널 코드는 하나이고 host 검증(스토어 거처·배율 모양)만 갈린다.
+#define PRISM_F8_ENTRY_DENSE(NAME, ON_DEVICE, PT)                                              \
+  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes,     \
+            tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, \
+            tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair) {          \
+    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,   \
+                  ON_DEVICE, PT, nullptr);                                                     \
   }
-}
+#define PRISM_F8_ENTRY_SPARSE(NAME, ON_DEVICE, PT)                                             \
+  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes,     \
+            tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, \
+            tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView c,          \
+            tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, int64_t out_col_offset,     \
+            int64_t x_row_is_pair, double p, double lam, double pmax, double grid, int64_t ng,   \
+            int64_t renorm_it) {                                                               \
+    const SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};                  \
+    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,   \
+                  ON_DEVICE, PT, &sin);                                                        \
+  }
+#define PRISM_F8_ENTRY_GATEUP(NAME, ON_DEVICE, PT)                                             \
+  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g,   \
+            tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g,                     \
+            tvm::ffi::TensorView kidx_g, tvm::ffi::TensorView codes_u,                         \
+            tvm::ffi::TensorView scales_u, tvm::ffi::TensorView row_off_u,                     \
+            tvm::ffi::TensorView kidx_u, tvm::ffi::TensorView out, int64_t out_col_offset_g,    \
+            int64_t out_col_offset_u, int64_t x_row_is_pair) {                                 \
+    gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,        \
+                  x_row_is_pair, ON_DEVICE, PT, nullptr, &codes_u, &scales_u, &row_off_u,      \
+                  &kidx_u, out_col_offset_u);                                                  \
+  }
+#define PRISM_F8_ENTRY_SPARSE_GATEUP(NAME, ON_DEVICE, PT)                                      \
+  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g,   \
+            tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g,                     \
+            tvm::ffi::TensorView kidx_g, tvm::ffi::TensorView codes_u,                         \
+            tvm::ffi::TensorView scales_u, tvm::ffi::TensorView row_off_u,                     \
+            tvm::ffi::TensorView kidx_u, tvm::ffi::TensorView out, tvm::ffi::TensorView a_g,   \
+            tvm::ffi::TensorView c_g, tvm::ffi::TensorView thr_g, tvm::ffi::TensorView a_u,    \
+            tvm::ffi::TensorView c_u, tvm::ffi::TensorView thr_u, tvm::ffi::TensorView topk_w, \
+            int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair,         \
+            double p_g, double lam_g, double p_u, double lam_u, double pmax, double grid,       \
+            int64_t ng, int64_t renorm_it) {                                                   \
+    const SparseIn sin{a_g, c_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it};        \
+    const SparseIn sin_up{a_u, c_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it};     \
+    gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,        \
+                  x_row_is_pair, ON_DEVICE, PT, &sin, &codes_u, &scales_u, &row_off_u,         \
+                  &kidx_u, out_col_offset_u, &sin_up);                                         \
+  }
 
-// ── 진입점 8개: {device, pinned} × {dense, sparse} × {single, gateup} ─────────────
-void gemv_fp8_indexed(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair) {
-  gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,
-                true, nullptr);
-}
+// 블록 배율 (128×128) — 기존 8개
+PRISM_F8_ENTRY_DENSE(gemv_fp8_indexed, true, false)
+PRISM_F8_ENTRY_DENSE(gemv_fp8_indexed_pinned, false, false)
+PRISM_F8_ENTRY_SPARSE(gemv_fp8_indexed_sparse, true, false)
+PRISM_F8_ENTRY_SPARSE(gemv_fp8_indexed_pinned_sparse, false, false)
+PRISM_F8_ENTRY_GATEUP(gemv_fp8_indexed_gateup, true, false)
+PRISM_F8_ENTRY_GATEUP(gemv_fp8_indexed_pinned_gateup, false, false)
+PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8_indexed_sparse_gateup, true, false)
+PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8_indexed_pinned_sparse_gateup, false, false)
+// per-tensor 배율 — scales [E]
+PRISM_F8_ENTRY_DENSE(gemv_fp8pt_indexed, true, true)
+PRISM_F8_ENTRY_DENSE(gemv_fp8pt_indexed_pinned, false, true)
+PRISM_F8_ENTRY_SPARSE(gemv_fp8pt_indexed_sparse, true, true)
+PRISM_F8_ENTRY_SPARSE(gemv_fp8pt_indexed_pinned_sparse, false, true)
+PRISM_F8_ENTRY_GATEUP(gemv_fp8pt_indexed_gateup, true, true)
+PRISM_F8_ENTRY_GATEUP(gemv_fp8pt_indexed_pinned_gateup, false, true)
+PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8pt_indexed_sparse_gateup, true, true)
+PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8pt_indexed_pinned_sparse_gateup, false, true)
 
-void gemv_fp8_indexed_pinned(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair) {
-  gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,
-                false, nullptr);
-}
-
-void gemv_fp8_indexed_sparse(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView c,
-    tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,
-    int64_t out_col_offset, int64_t x_row_is_pair,
-    double p, double lam, double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  const SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
-  gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,
-                true, &sin);
-}
-
-void gemv_fp8_indexed_pinned_sparse(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView c,
-    tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,
-    int64_t out_col_offset, int64_t x_row_is_pair,
-    double p, double lam, double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  const SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
-  gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,
-                false, &sin);
-}
-
-void gemv_fp8_indexed_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g,
-    tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
-    tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u,
-    tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
-    tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
-    int64_t x_row_is_pair) {
-  gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,
-                x_row_is_pair, true, nullptr, &codes_u, &scales_u, &row_off_u, &kidx_u,
-                out_col_offset_u);
-}
-
-void gemv_fp8_indexed_pinned_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g,
-    tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
-    tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u,
-    tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
-    tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
-    int64_t x_row_is_pair) {
-  gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,
-                x_row_is_pair, false, nullptr, &codes_u, &scales_u, &row_off_u, &kidx_u,
-                out_col_offset_u);
-}
-
-void gemv_fp8_indexed_sparse_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g,
-    tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
-    tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u,
-    tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView a_g, tvm::ffi::TensorView c_g, tvm::ffi::TensorView thr_g,
-    tvm::ffi::TensorView a_u, tvm::ffi::TensorView c_u, tvm::ffi::TensorView thr_u,
-    tvm::ffi::TensorView topk_w,
-    int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair,
-    double p_g, double lam_g, double p_u, double lam_u,
-    double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  const SparseIn sin{a_g, c_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it};
-  const SparseIn sin_up{a_u, c_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it};
-  gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,
-                x_row_is_pair, true, &sin, &codes_u, &scales_u, &row_off_u, &kidx_u,
-                out_col_offset_u, &sin_up);
-}
-
-void gemv_fp8_indexed_pinned_sparse_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g,
-    tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
-    tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u,
-    tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView a_g, tvm::ffi::TensorView c_g, tvm::ffi::TensorView thr_g,
-    tvm::ffi::TensorView a_u, tvm::ffi::TensorView c_u, tvm::ffi::TensorView thr_u,
-    tvm::ffi::TensorView topk_w,
-    int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair,
-    double p_g, double lam_g, double p_u, double lam_u,
-    double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  const SparseIn sin{a_g, c_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it};
-  const SparseIn sin_up{a_u, c_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it};
-  gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,
-                x_row_is_pair, false, &sin, &codes_u, &scales_u, &row_off_u, &kidx_u,
-                out_col_offset_u, &sin_up);
-}
+#undef PRISM_F8_ENTRY_DENSE
+#undef PRISM_F8_ENTRY_SPARSE
+#undef PRISM_F8_ENTRY_GATEUP
+#undef PRISM_F8_ENTRY_SPARSE_GATEUP
 
 }  // namespace

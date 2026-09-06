@@ -46,7 +46,7 @@ def main() -> None:
     p.add_argument("--m", type=int, default=1, help="토큰 수 (decode=1)")
     p.add_argument("--vec", type=int, default=0, choices=(0, 1, 4, 8),
                    help="W 로드 폭 (0=자동, bf16 커널 전용)")
-    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8"),
+    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8", "fp8pt"),
                    help="스토어 dtype = 커널 백엔드 (bf16 / mxfp4 g32 / fp8 e4m3 b128). "
                         "K 행 정렬도 따라 바뀐다: 2 / 32 / 128")
     p.add_argument("--reps", type=int, default=100,
