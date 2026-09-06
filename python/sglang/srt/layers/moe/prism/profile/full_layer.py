@@ -533,6 +533,20 @@ class FullLayerProfiler:
             gpu_only(i)                            # main 스트림
             main.wait_stream(side)
 
+        def combined_nowarm(i: int) -> None:
+            """warm을 뺀 combined — warm '존재'의 대가를 재는 대조군.
+
+            `combined - combined_nowarm`이 combined 안에서 warm의 **한계 비용**이고,
+            그것과 단독 `warm_only`의 차가 곧 warm이 있어서 새로 생기는 오버헤드다
+            (GPU 안의 hot↔warm 간섭 + warm의 PCIe 읽기가 cold의 host DRAM 대역폭과
+            벌이는 경쟁). 스토어·plan은 그대로 두고 launch만 뺀다.
+            """
+            st.fill_expert_ids(ids_dev[i], non_blocking=True)
+            stream = torch.cuda.current_stream().cuda_stream
+            submit(qlen_ptr, topk, st.expert_ids_ptr(), cold_in, cold_out, stream, w_ptr)
+            hot_only(i)
+            self.cold.wrapper.sync(stream)
+
         def _with_rejoin(inner):
             def run(i: int) -> None:
                 inner(i)
@@ -558,6 +572,7 @@ class FullLayerProfiler:
             ("warm_only", warm_only, flush),
             ("gpu_only", gpu_only, flush),
             ("cold_graph", cold_graph, False),
+            ("combined_nowarm", combined_nowarm, False),
             ("combined", combined, False),
             ("combined_split", combined_split, False),
             ("layer", _with_rejoin(combined), False),
