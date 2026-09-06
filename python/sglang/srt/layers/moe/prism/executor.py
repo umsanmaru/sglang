@@ -76,6 +76,7 @@ def _nvtx_pop() -> None:
 from sglang.srt.layers.moe.prism.cold_backend import ColdBackend
 from sglang.srt.layers.moe.prism.grouping import Grouping, build_grouping
 from sglang.srt.layers.moe.prism.plan import Plan, Proj, Tier
+from sglang.srt.layers.moe.prism.activation import Activation
 from sglang.srt.layers.moe.prism.rejoin import rejoin_down, rejoin_gateup
 from sglang.srt.layers.moe.prism.resources import ExecutionResources
 from sglang.srt.layers.moe.prism.tiers import LayerTiers, build_layer_tiers
@@ -543,9 +544,11 @@ class PrismExecutor:
     # ── 본체 ──────────────────────────────────────────────────────────────
     def run_layer(self, layer_idx: int, hidden: torch.Tensor,
                   topk_ids: torch.Tensor, topk_weights: torch.Tensor,
-                  swiglu_limit: Optional[float] = None) -> torch.Tensor:
+                  swiglu_limit: Optional[float] = None,
+                  activation: Optional["Activation"] = None) -> torch.Tensor:
         """hidden [M, H] bf16 cuda, topk_ids [M, k] int64, topk_weights [M, k].
-        swiglu_limit: 모델의 SwiGLU clamp (DSV4-Flash 10.0; None = 없음) — rejoin#1에서 적용.
+        activation: 모델의 gate/up 활성화 (activation.py; None = silu). swiglu_limit: 구 API —
+        silu의 clamp (DSV4-Flash/GLM 10.0). 둘 다 rejoin#1에서만 적용된다.
         반환 [M, H] bf16 cuda (router 가중 expert 합 완료).
 
         두 phase가 같은 네 걸음을 밟는다: 관측 → CPU 몫 개시 → GPU 티어 발행 →
@@ -573,8 +576,9 @@ class PrismExecutor:
         # 융합 커널 한 launch: Σ partial(fp32) → silu·up → bf16 (rejoin.py). torch
         # 사슬(캐스팅 3 + add 2 + split/silu/mul/cast)은 prefill에서 88 MB 텐서를
         # ~10번 왕복해 층당 2.5 ms였다 (2026-08-27 nsys).
-        with _nvtx("rejoin1.acc+silu"):
-            act = rejoin_gateup(gu_parts + [cold_gu, warm_gu], inter, swiglu_limit)
+        with _nvtx("rejoin1.acc+act"):
+            act = rejoin_gateup(gu_parts + [cold_gu, warm_gu], inter, swiglu_limit,
+                                activation=activation)
 
         # ── Phase 2: down ────────────────────────────────────────────────
         self._observe(layer_idx, DOWN, act, topk_ids, flow)

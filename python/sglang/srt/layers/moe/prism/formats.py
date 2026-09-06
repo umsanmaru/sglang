@@ -279,9 +279,20 @@ class Bf16Format(StoreFormat):
 
 # ─────────────────────────────────────────────────────────────────────────────
 class Mxfp4Format(StoreFormat):
-    """DeepSeek-V4-Flash류 MXFP4 g32 routed expert. 파라미터 이름/shape/dtype/attrs는 sglang의
-    `DeepSeekMxfp4MoEMethod.create_weights`와 **동일**해야 한다 — 그 이름으로 로더가 채운다
-    (w13_weight int8 [E, 2I, H/2], w13_weight_scale_inv fp32 [E, 2I, H/32], BLOCK quant_method)."""
+    """MXFP4 g32 routed expert (e2m1 nibble 코드 + E8M0 32-블록 배율). 파라미터 이름/shape/dtype/
+    attrs는 **감싸는 GPU quant method가 만들었을 것과 동일**해야 한다 — 로더가 그 이름으로 채우고,
+    모델 load_weights는 이름이 없으면 조용히 건너뛴다 (kimi_k3.py: `if name not in params_dict: break`).
+    두 가지 명명이 있다 (`layer._prism_mxfp4_naming`, method.create_weights가 gpu_method로 정한다):
+
+      "deepseek" — DeepSeek-V4-Flash, `DeepSeekMxfp4MoEMethod`:
+                   w13_weight int8 [E, 2I, H/2], w13_weight_scale_inv fp32(=2^e) [E, 2I, H/32], BLOCK
+      "ct"       — Kimi K3 (compressed-tensors mxfp4-pack-quantized → `Mxfp4MoEMethod`):
+                   w13_weight uint8 [E, 2I, H/2], w13_weight_scale uint8(E8M0) [E, 2I, H/32], GROUP
+
+    둘의 차이는 파라미터 컨테이너까지다 — 코드 nibble 배치와 E8M0 배율은 같은 것이라 인출
+    뒤(`take_full`)의 경로(gather / cold_flat / 커널)는 하나다 (`_e8m0_bytes`가 fp32·u8 둘을 받는다)."""
+
+    NAMINGS = ("deepseek", "ct")
 
     name = "mxfp4"
     k_align = 32
@@ -297,45 +308,82 @@ class Mxfp4Format(StoreFormat):
         # 사용자 결정(2026-08-27): mxfp4 prefill은 AMX를 쓰지 않고 전부 GPU — grouped 경계부터 GPU.
         return grouped_min_m
 
+    @classmethod
+    def naming(cls, layer) -> str:
+        n = getattr(layer, "_prism_mxfp4_naming", "deepseek")
+        if n not in cls.NAMINGS:
+            raise PlanError(f"unknown mxfp4 param naming {n!r} (known: {cls.NAMINGS})")
+        return n
+
+    @classmethod
+    def naming_for_method(cls, gpu_method) -> str:
+        """감싸는 GPU method → 명명. compressed-tensors mxfp4(Mxfp4MoEMethod, K3)만 "ct"."""
+        return "ct" if gpu_method.__class__.__name__ == "Mxfp4MoEMethod" else "deepseek"
+
+    @classmethod
+    def scale_names(cls, layer) -> tuple[str, str]:
+        if cls.naming(layer) == "ct":
+            return ("w13_weight_scale", "w2_weight_scale")
+        return ("w13_weight_scale_inv", "w2_weight_scale_inv")
+
     def create_params(self, layer, num_experts, hidden, inter, params_dtype, extra_weight_attrs):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
         from sglang.srt.utils import set_weight_attrs
 
         if hidden % self.BLOCK_K or inter % self.BLOCK_K:
             raise PlanError(f"mxfp4 needs hidden/inter multiples of {self.BLOCK_K}, got {hidden}/{inter}")
+        ct = self.naming(layer) == "ct"
+        code_dtype = torch.uint8 if ct else torch.int8
         w13 = torch.nn.Parameter(
-            torch.empty(num_experts, 2 * inter, hidden // 2, dtype=torch.int8, device="cpu"),
+            torch.empty(num_experts, 2 * inter, hidden // 2, dtype=code_dtype, device="cpu"),
             requires_grad=False)
         w2 = torch.nn.Parameter(
-            torch.empty(num_experts, hidden, inter // 2, dtype=torch.int8, device="cpu"),
+            torch.empty(num_experts, hidden, inter // 2, dtype=code_dtype, device="cpu"),
             requires_grad=False)
         layer.register_parameter("w13_weight", w13)
         set_weight_attrs(w13, extra_weight_attrs)
         layer.register_parameter("w2_weight", w2)
         set_weight_attrs(w2, extra_weight_attrs)
-        w13_s = torch.nn.Parameter(
-            torch.ones(num_experts, 2 * inter, hidden // self.BLOCK_K, dtype=torch.float32, device="cpu"),
-            requires_grad=False)
-        w2_s = torch.nn.Parameter(
-            torch.ones(num_experts, hidden, inter // self.BLOCK_K, dtype=torch.float32, device="cpu"),
-            requires_grad=False)
-        w13_s.format_ue8m0 = False
-        w2_s.format_ue8m0 = False
+        if ct:
+            # E8M0 바이트 그대로 (127 = 2^0). 로더의 GROUP 경로(_load_w13/_load_w2)가 shard를 narrow해
+            # copy_ 하므로 u8→u8 무손실. dummy 로더(initialize_dummy_weights)는 비부동 파라미터를
+            # 건드리지 않아 배율이 1.0으로 남는다 — 랜덤 nibble 코드만으로도 유한한 가중치가 된다.
+            w13_s = torch.nn.Parameter(
+                torch.full((num_experts, 2 * inter, hidden // self.BLOCK_K), 127, dtype=torch.uint8, device="cpu"),
+                requires_grad=False)
+            w2_s = torch.nn.Parameter(
+                torch.full((num_experts, hidden, inter // self.BLOCK_K), 127, dtype=torch.uint8, device="cpu"),
+                requires_grad=False)
+            quant_method = FusedMoeWeightScaleSupported.GROUP.value
+            ue8m0 = True
+        else:
+            w13_s = torch.nn.Parameter(
+                torch.ones(num_experts, 2 * inter, hidden // self.BLOCK_K, dtype=torch.float32, device="cpu"),
+                requires_grad=False)
+            w2_s = torch.nn.Parameter(
+                torch.ones(num_experts, hidden, inter // self.BLOCK_K, dtype=torch.float32, device="cpu"),
+                requires_grad=False)
+            quant_method = FusedMoeWeightScaleSupported.BLOCK.value
+            ue8m0 = False
+        w13_s.format_ue8m0 = ue8m0
+        w2_s.format_ue8m0 = ue8m0
         scale_attrs = dict(extra_weight_attrs)
-        scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.BLOCK.value
-        layer.register_parameter("w13_weight_scale_inv", w13_s)
+        scale_attrs["quant_method"] = quant_method
+        n13, n2 = self.scale_names(layer)
+        layer.register_parameter(n13, w13_s)
         set_weight_attrs(w13_s, scale_attrs)
-        layer.register_parameter("w2_weight_scale_inv", w2_s)
+        layer.register_parameter(n2, w2_s)
         set_weight_attrs(w2_s, scale_attrs)
 
     def take_full(self, layer) -> FullWeights:
+        n13, n2 = self.scale_names(layer)
         return FullWeights(
             w13=_host(layer.w13_weight.data), w2=_host(layer.w2_weight.data),
-            w13_scale=_host(layer.w13_weight_scale_inv.data),
-            w2_scale=_host(layer.w2_weight_scale_inv.data))
+            w13_scale=_host(getattr(layer, n13).data),
+            w2_scale=_host(getattr(layer, n2).data))
 
     def release(self, layer) -> None:
-        for name in ("w13_weight", "w2_weight", "w13_weight_scale_inv", "w2_weight_scale_inv"):
+        for name in ("w13_weight", "w2_weight", *self.scale_names(layer)):
             p = getattr(layer, name)
             p.data = torch.empty(0, dtype=p.dtype)
 

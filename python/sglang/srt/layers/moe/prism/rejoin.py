@@ -10,7 +10,7 @@ prefill(M=2688)에서는 같은 사슬이 88 MB짜리 텐서를 ~10번 왕복하
 여기 두 커널은 partial을 **한 번만** 읽고 결과를 한 번만 쓴다:
 
     rejoin_gateup(parts[≤4] bf16 [M,k,2I]) → act bf16 [M,k,I]
-        acc = Σ parts (fp32) ; act = silu(acc[:I]) · acc[I:]
+        acc = Σ parts (fp32) ; act = f(acc[:I], acc[I:])   (f: activation.py — silu | situ)
     rejoin_down(parts[≤4] bf16 [M,k,H], w fp32 [M,k]) → out bf16 [M,H]
         out[m] = Σ_j w[m,j] · Σ parts[m,j] (fp32)
 
@@ -31,12 +31,21 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.moe.prism.activation import Activation
+
+
+@triton.jit
+def _tanh(x):
+    # libdevice 없이도 도는 안정형: x→+∞에서 exp→inf → 1, x→−∞에서 exp→0 → −1.
+    return 1.0 - 2.0 / (1.0 + tl.exp(2.0 * x))
+
 
 @triton.jit
 def _rejoin_gateup_kernel(
     p0, p1, p2, p3, p4, act,
-    inter, n_rows, limit,
+    inter, n_rows, limit, alpha,
     NUM_PARTS: tl.constexpr, BLOCK: tl.constexpr, HAS_LIMIT: tl.constexpr,
+    ACT: tl.constexpr,
 ):
     row = tl.program_id(0)          # pair (m·k + j)
     cb = tl.program_id(1)           # inter 블록
@@ -57,11 +66,18 @@ def _rejoin_gateup_kernel(
     if NUM_PARTS > 4:
         g += tl.load(p4 + base + cols, mask=mask, other=0.0).to(tl.float32)
         u += tl.load(p4 + base + inter + cols, mask=mask, other=0.0).to(tl.float32)
-    if HAS_LIMIT:
-        # DSV4 swiglu_limit (참조 Expert.forward): up ∈ [−L, L], gate ≤ L — fp32에서, silu 전에.
-        u = tl.minimum(tl.maximum(u, -limit), limit)
-        g = tl.minimum(g, limit)
-    a = g / (1.0 + tl.exp(-g)) * u   # silu(gate) · up, fp32
+    if ACT == 0:
+        # silu. DSV4/GLM swiglu_limit (참조 Expert.forward): up ∈ [−L, L], gate ≤ L — fp32에서, silu 전에.
+        if HAS_LIMIT:
+            u = tl.minimum(tl.maximum(u, -limit), limit)
+            g = tl.minimum(g, limit)
+        a = g / (1.0 + tl.exp(-g)) * u   # silu(gate) · up, fp32
+    else:
+        # situ (Kimi K3, SituAndMul): α·tanh(g/α)·σ(g) · (L·tanh(u/L) | u) — fp32.
+        ga = alpha * _tanh(g / alpha) / (1.0 + tl.exp(-g))
+        if HAS_LIMIT:
+            u = limit * _tanh(u / limit)
+        a = ga * u
     tl.store(act + row * inter + cols, a.to(tl.bfloat16), mask=mask)
 
 
@@ -107,12 +123,25 @@ def _pad3(parts: Sequence[torch.Tensor]):
     return ps
 
 
+def _resolve_activation(swiglu_limit: Optional[float], activation: Optional[Activation]) -> Activation:
+    """구 API(swiglu_limit)와 신 API(activation)의 합류. 둘 다 주면 activation이 우선하되
+    swiglu_limit이 그와 어긋나면 즉사한다 (호출자 두 곳이 다른 모델을 말하는 상황)."""
+    if activation is None:
+        return Activation.silu(swiglu_limit)
+    if swiglu_limit is not None and not (activation.kind == "silu" and activation.limit == swiglu_limit):
+        raise ValueError(f"swiglu_limit={swiglu_limit} conflicts with activation {activation}")
+    return activation
+
+
 def rejoin_gateup(parts: Sequence[Optional[torch.Tensor]], inter: int,
-                  swiglu_limit: Optional[float] = None) -> torch.Tensor:
+                  swiglu_limit: Optional[float] = None,
+                  activation: Optional[Activation] = None) -> torch.Tensor:
     """parts: bf16 [M, k, 2·inter] (gate 앞 절반, up 뒤 절반). 반환 act bf16 [M, k, inter].
 
-    swiglu_limit(DSV4-Flash 10.0): None이 아니면 fp32 합 뒤 silu 전에 up을 [−L, L], gate를
-    ≤ L로 자른다 (참조 `Expert.forward`와 같은 순서·같은 정밀도)."""
+    activation(activation.py): fp32 합 뒤에 거는 함수. None이면 silu이고, 그때
+    swiglu_limit(DSV4-Flash/GLM 10.0)이 있으면 silu 전에 up을 [−L, L], gate를 ≤ L로 자른다
+    (참조 `Expert.forward`와 같은 순서·같은 정밀도). situ(Kimi K3)는 activation으로만 지정한다."""
+    act_fn = _resolve_activation(swiglu_limit, activation)
     ps = _pad3(parts)
     m, k, two_i = ps[0].shape
     if two_i != 2 * inter:
@@ -121,10 +150,11 @@ def rejoin_gateup(parts: Sequence[Optional[torch.Tensor]], inter: int,
     n_used = sum(1 for p in parts if p is not None)
     block = 1024
     grid = (m * k, triton.cdiv(inter, block))
+    limit, alpha = act_fn.kernel_scalars()
     _rejoin_gateup_kernel[grid](ps[0], ps[1], ps[2], ps[3], ps[4], act, inter, m * k,
-                                float(swiglu_limit if swiglu_limit is not None else 0.0),
+                                limit, alpha,
                                 NUM_PARTS=n_used, BLOCK=block,
-                                HAS_LIMIT=swiglu_limit is not None)
+                                HAS_LIMIT=act_fn.has_limit, ACT=act_fn.act_code)
     return act
 
 
@@ -145,14 +175,16 @@ def rejoin_down(parts: Sequence[Optional[torch.Tensor]], w32: torch.Tensor) -> t
 
 
 def warmup(device: torch.device, inter: int, hidden: int, top_k: int,
-           swiglu_limit: Optional[float] = None) -> None:
+           swiglu_limit: Optional[float] = None,
+           activation: Optional[Activation] = None) -> None:
     """NUM_PARTS 1..MAX 변형을 미리 컴파일한다 (graph 캡처 워밍업과의 얽힘 방지).
-    swiglu_limit이 있으면 그 변형(HAS_LIMIT)도 함께."""
+    모델의 activation 변형(HAS_LIMIT/ACT)을 함께 — 기본 silu 변형도 항상."""
+    act_fn = _resolve_activation(swiglu_limit, activation)
     for n in range(1, MAX_PARTS + 1):
         gu = [torch.zeros(1, top_k, 2 * inter, dtype=torch.bfloat16, device=device)] * n
         rejoin_gateup(gu, inter)
-        if swiglu_limit is not None:
-            rejoin_gateup(gu, inter, swiglu_limit)
+        if act_fn != Activation.silu():
+            rejoin_gateup(gu, inter, activation=act_fn)
         dn = [torch.zeros(1, top_k, hidden, dtype=torch.bfloat16, device=device)] * n
         rejoin_down(dn, torch.ones(1, top_k, dtype=torch.float32, device=device))
     torch.cuda.synchronize(device)
