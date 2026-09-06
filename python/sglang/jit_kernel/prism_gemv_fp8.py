@@ -1,10 +1,12 @@
-"""Prism worklist GEMV — FP8 e4m3(128×128 블록 배율) 스토어 판 (`prism_gemv_fp8.cuh`).
+"""Prism worklist GEMV — FP8 e4m3 스토어 판 (`prism_gemv_fp8.cuh`), 배율 두 가지.
 
 호출 규약은 mxfp4 `prism_gemv_mxfp4.py`와 **같다** (스토어 인자가 `(codes, scales)` 둘):
   codes  u8   [Σₑ k[e], N]         — 행 = k (원소 1 B)
-  scales fp32 [Σₑ k[e]/128, N/128] — 행 = 128-k 블록, 열 = 128-n 블록
-row_off(k 단위, 128 배수)/kidx/out3d/out_col_offset/x_row_is_pair/stream은 동일.
+  scales fp32 [Σₑ k[e]/128, N/128] — 블록판 (`gemv_fp8_*`): 행 = 128-k 블록, 열 = 128-n 블록
+         fp32 [E]                  — per-tensor판 (`gemv_fp8pt_*`): 슬롯당 스칼라 1개
+row_off(k 단위; 블록판 128 배수, pt판 32 배수)/kidx/out3d/out_col_offset/x_row_is_pair/stream은 동일.
 누산 fp32, 출력 bf16 (계약 ⑤). 정확표현 입력에서 grouped fp8 커널과 비트일치.
+pt판은 Mistral-Medium-3.5 류 static-tensor FP8(`weight_block_size: null`)용이다.
 """
 
 from __future__ import annotations
@@ -32,6 +34,15 @@ _WRAPPERS = (
     "gemv_fp8_indexed_pinned_sparsek1",
     "gemv_fp8_indexed_sparsek1_gateup",
     "gemv_fp8_indexed_pinned_sparsek1_gateup",
+    # per-tensor 배율 (scales [E])
+    "gemv_fp8pt_indexed",
+    "gemv_fp8pt_indexed_pinned",
+    "gemv_fp8pt_indexed_sparse",
+    "gemv_fp8pt_indexed_pinned_sparse",
+    "gemv_fp8pt_indexed_gateup",
+    "gemv_fp8pt_indexed_pinned_gateup",
+    "gemv_fp8pt_indexed_sparse_gateup",
+    "gemv_fp8pt_indexed_pinned_sparse_gateup",
 )
 
 
@@ -132,3 +143,13 @@ gemv_fp8_indexed_gateup = _dense_gateup("gemv_fp8_indexed_gateup")
 gemv_fp8_indexed_pinned_gateup = _dense_gateup("gemv_fp8_indexed_pinned_gateup")
 gemv_fp8_indexed_sparse_gateup = _sparse_gateup("gemv_fp8_indexed_sparse_gateup")
 gemv_fp8_indexed_pinned_sparse_gateup = _sparse_gateup("gemv_fp8_indexed_pinned_sparse_gateup")
+
+# per-tensor 배율 쌍둥이 — 같은 호출 규약, scales만 [E].
+gemv_fp8pt_indexed = _dense("gemv_fp8pt_indexed")
+gemv_fp8pt_indexed_pinned = _dense("gemv_fp8pt_indexed_pinned")
+gemv_fp8pt_indexed_sparse = _sparse("gemv_fp8pt_indexed_sparse")
+gemv_fp8pt_indexed_pinned_sparse = _sparse("gemv_fp8pt_indexed_pinned_sparse")
+gemv_fp8pt_indexed_gateup = _dense_gateup("gemv_fp8pt_indexed_gateup")
+gemv_fp8pt_indexed_pinned_gateup = _dense_gateup("gemv_fp8pt_indexed_pinned_gateup")
+gemv_fp8pt_indexed_sparse_gateup = _sparse_gateup("gemv_fp8pt_indexed_sparse_gateup")
+gemv_fp8pt_indexed_pinned_sparse_gateup = _sparse_gateup("gemv_fp8pt_indexed_pinned_sparse_gateup")

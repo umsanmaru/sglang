@@ -82,12 +82,12 @@ def main() -> None:
     p.add_argument("--only", default=None,
                    help=f"이 변형만 측정 (쉼표 구분: {','.join(VARIANTS)})")
     p.add_argument("--mask-pattern", default="random", choices=("random", "block"))
-    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8"),
+    p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8", "fp8pt"),
                    help="스토어 dtype = warm GPU 커널 + cold kt 백엔드를 함께 고른다")
     p.add_argument("--cpu-kernel", default=None,
                    choices=("kt_tile_k2_bf16", "kt_amx_bf16", "kt_amx_fp4",
                             "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128",
-                            "kt_tile_k1_fp8b128"),
+                            "kt_tile_k1_fp8b128", "kt_tile_k2_fp8pt"),
                    help="기본값은 dtype이 정한다")
     p.add_argument("--threads", type=int, default=None,
                    help="CPUInfer 스레드 (기본 cpu_count//2-2, method.py와 같은 관례)")

@@ -47,6 +47,13 @@ using namespace nvcuda;
 //              같고 그룹 안 순열만 다르다 — 64 B 라인 = **k 한 행 × 64 n**. 로더의 주소식(load_b)은
 //              공유하고 Bs로 푸는 store_b만 갈린다. 바이트 오프셋(ktf8k1_off):
 //              (n&63) + (k&31)·64 + ((n>>6)&3)·2048 + (k>>5)·8192 + (n>>8)·8192·(K/32).
+//
+// **per-tensor 배율 판** (2026-09-05, Mistral-Medium-3.5 static-tensor FP8): 레이아웃 둘의 PT 쌍둥이.
+//   ROWMAJOR_PT — 코드는 ROWMAJOR과 같고 `scales`가 [E] fp32 (슬롯당 스칼라 1개).
+//   KT_TILE8_PT — kt `GemmKernelTileK2FP8PT::BufferB`: 코드 타일은 KT_TILE8과 같고, 배율은 코드
+//                 (64 B 올림) 뒤 **64 B 슬롯의 fp32 1개** (블록판 배율표가 있던 자리).
+//   두 경우 `sreg`가 K 타일과 무관한 상수가 되는 것 외에 로더·store_b는 같다. kr은 **32 배수**면
+//   되고(128 제약 없음), kr % 64 == 32인 부분 K 타일은 기존 `k < kr` 가드가 처리한다.
 constexpr int kBM = 128;
 constexpr int kBN = 128;
 constexpr int kBK = 64;
@@ -63,16 +70,21 @@ constexpr int kColBytes = 8192;        // 타일 컬럼 = 32 k × 256 n × 1 B
 constexpr int kGrpBytes = 2048;        // 16 페어 × 64 n × 2 k
 
 struct F8Slot {
-  const uint8_t* codes;   // ROWMAJOR: [Σ k, N] / KT_TILE8: slab 시작 (u8)
-  const float* scales;    // ROWMAJOR: [Σ k/128, N/128] / KT_TILE8: 미사용 (slab 안)
+  const uint8_t* codes;   // ROWMAJOR[_PT]: [Σ k, N] / KT_TILE8[_PT]: slab 시작 (u8)
+  const float* scales;    // ROWMAJOR: [Σ k/128, N/128] / ROWMAJOR_PT: [E] / KT_TILE8[_PT]: 미사용 (slab 안)
   const int32_t* row_off; // [E+1] (k 단위)
   const uint16_t* kidx;   // [Σ k]
   long long out_off;
   const int64_t* blk_off; // KT_TILE8 전용: [E] expert 블록의 slab 내 **바이트** 오프셋
 };
 
-enum Layout : int { ROWMAJOR = 0, KT_TILE8 = 1, KT_TILE8_K1 = 2 };
-__host__ __device__ constexpr bool is_tile_layout(int layout) { return layout != ROWMAJOR; }
+enum Layout : int { ROWMAJOR = 0, KT_TILE8 = 1, ROWMAJOR_PT = 2, KT_TILE8_PT = 3, KT_TILE8_K1 = 4 };
+// 타일(kt slab) 레이아웃: KT_TILE8(b128 페어 타일) · KT_TILE8_PT(per-tensor 배율) · KT_TILE8_K1(k=1 순열).
+// 값은 python COLD_LAYOUTS(prism_grouped_fp8.py)와 맞춘다 — 비트 트릭 없이 명시 판정.
+__host__ __device__ constexpr bool layout_is_tile(int l) {
+  return l == KT_TILE8 || l == KT_TILE8_PT || l == KT_TILE8_K1;
+}
+__host__ __device__ constexpr bool layout_is_pt(int l) { return l == ROWMAJOR_PT || l == KT_TILE8_PT; }
 
 template <int LAYOUT>
 __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
@@ -83,6 +95,8 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
     __nv_bfloat16* __restrict__ out,
     int num_experts, long long top_k, long long x_kx, int x_row_is_pair,
     long long n_cols, long long out_row, F8Slot s0, F8Slot s1) {
+  constexpr bool kTile = layout_is_tile(LAYOUT);
+  constexpr bool kPT = layout_is_pt(LAYOUT);
   const F8Slot s = (blockIdx.z != 0) ? s1 : s0;
 
   __shared__ __align__(128) unsigned char smem[kSmemBytes];
@@ -126,14 +140,16 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
     const long long kr = static_cast<long long>(s.row_off[e + 1]) - o0;
     const long long nblk = n_cols / kBlk;
     const uint8_t* codes_e = s.codes + o0 * n_cols + n0;
-    const float* scales_e = s.scales + (o0 / kBlk) * nblk;
-    // KT_TILE8: expert 블록 base와 그 안의 super/배율 테이블.
-    const uint8_t* blk = is_tile_layout(LAYOUT) ? s.codes + s.blk_off[e] : nullptr;
-    const long long t8_super = is_tile_layout(LAYOUT)
+    const float* scales_e = (kTile || kPT) ? nullptr : s.scales + (o0 / kBlk) * nblk;
+    // KT_TILE8[_PT]: expert 블록 base와 그 안의 super/배율 영역 (블록판: 전치 표, PT: float 1개).
+    const uint8_t* blk = kTile ? s.codes + s.blk_off[e] : nullptr;
+    const long long t8_super = kTile
         ? (n0 >> 8) * static_cast<long long>(kColBytes) * (kr / 32) : 0;
-    const float* blk_s = is_tile_layout(LAYOUT)
+    const float* blk_s = kTile
         ? reinterpret_cast<const float*>(blk + (((n_cols * kr) + 63) & ~static_cast<long long>(63)))
         : nullptr;
+    // PT: 슬롯 스칼라 하나 — K 타일과 무관.
+    const float pt_scale = kPT ? (kTile ? blk_s[0] : s.scales[e]) : 0.f;
 
     if (tid < kBM) {
       if (tid < cnt) {
@@ -150,7 +166,7 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
     float sreg = 0.f;
     // K 타일 하나(64 k × 128 n)를 레지스터로 선인출한다. 두 레이아웃 모두 스레드당 32 B.
     auto load_b = [&](long long kb) {
-      if constexpr (LAYOUT == ROWMAJOR) {
+      if constexpr (!kTile) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
           const long long k = kb + h * 32 + br;
@@ -158,7 +174,8 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
               ? *reinterpret_cast<const uint4*>(codes_e + k * n_cols + bc)
               : make_uint4(0u, 0u, 0u, 0u);
         }
-        sreg = (kb < kr) ? scales_e[(kb / kBlk) * nblk + (n0 / kBlk)] : 0.f;
+        if constexpr (kPT) sreg = (kb < kr) ? pt_scale : 0.f;
+        else sreg = (kb < kr) ? scales_e[(kb / kBlk) * nblk + (n0 / kBlk)] : 0.f;
       } else {
         const long long c = (kb >> 5) + t8_cc;  // 타일 컬럼
         const uint8_t* base = blk + t8_super + c * kColBytes + t8_g * kGrpBytes + t8_q * 16;
@@ -167,13 +184,14 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
         for (int h = 0; h < 2; ++h)
           breg[h] = live ? *reinterpret_cast<const uint4*>(base + h * 1024)
                          : make_uint4(0u, 0u, 0u, 0u);
-        sreg = (kb < kr) ? blk_s[(kb / kBlk) * nblk + (n0 / kBlk)] : 0.f;
+        if constexpr (kPT) sreg = (kb < kr) ? pt_scale : 0.f;
+        else sreg = (kb < kr) ? blk_s[(kb / kBlk) * nblk + (n0 / kBlk)] : 0.f;
       }
     };
     // 배율은 K 타일당 스칼라 하나다 (kBN = 128 = 배율 블록, kBK = 64 ⊂ 128-k 블록).
     // B를 bf16으로 풀 때 그대로 곱한다 — 위 "수치 계약" 참조.
     auto store_b = [&]() {
-      if constexpr (LAYOUT == ROWMAJOR) {
+      if constexpr (!kTile) {
 #pragma unroll
         for (int h = 0; h < 2; ++h) {
           const uint32_t w[4] = {breg[h].x, breg[h].y, breg[h].z, breg[h].w};
@@ -306,25 +324,35 @@ inline bool aligned16(const void* p) {
 inline int64_t verify_f8_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
                                tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
                                host::SymbolicSize& E1, host::SymbolicSize& N,
-                               host::SymbolicDevice& cuda_device, bool w_on_device,
+                               host::SymbolicDevice& cuda_device, bool w_on_device, bool pt,
                                const char* what) {
   using namespace host;
   auto R = SymbolicSize{"total_rows"};
   auto Rb = SymbolicSize{"total_k_blocks"};
   auto Nb = SymbolicSize{"n_blocks"};
+  auto Es = SymbolicSize{"scale_experts"};
   TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(row_off);
   TensorMatcher({R}).with_dtype<uint16_t>().with_device(cuda_device).verify(kidx);
   if (w_on_device) {
     TensorMatcher({R, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(codes);
-    TensorMatcher({Rb, Nb}).with_dtype<float>().with_device(cuda_device).verify(scales);
+    if (pt) TensorMatcher({Es}).with_dtype<float>().with_device(cuda_device).verify(scales);
+    else TensorMatcher({Rb, Nb}).with_dtype<float>().with_device(cuda_device).verify(scales);
   } else {
     TensorMatcher({R, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(codes);
-    TensorMatcher({Rb, Nb}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
+    if (pt) TensorMatcher({Es}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
+    else TensorMatcher({Rb, Nb}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
   }
-  RuntimeCheck(Rb.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rb.unwrap(),
-               " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/", kBlk, ")");
-  RuntimeCheck(Nb.unwrap() * kBlk == N.unwrap(), what, ": scales has ", Nb.unwrap(),
-               " block cols but the store has ", N.unwrap(), " columns");
+  if (pt) {
+    RuntimeCheck(Es.unwrap() + 1 == E1.unwrap(), what, ": per-tensor scales has ", Es.unwrap(),
+                 " entries but row_off implies ", E1.unwrap() - 1, " experts");
+    RuntimeCheck(R.unwrap() % 32 == 0, what, ": per-tensor store rows ", R.unwrap(),
+                 " must be a multiple of 32");
+  } else {
+    RuntimeCheck(Rb.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rb.unwrap(),
+                 " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/", kBlk, ")");
+    RuntimeCheck(Nb.unwrap() * kBlk == N.unwrap(), what, ": scales has ", Nb.unwrap(),
+                 " block cols but the store has ", N.unwrap(), " columns");
+  }
   RuntimeCheck(aligned16(codes.data_ptr()), what, ": codes must be 16-byte aligned");
   return R.unwrap();
 }
@@ -365,7 +393,10 @@ inline void grouped_fp8_impl(
   TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(tile_off);
   TensorMatcher({M, K, W_row}).with_dtype<bf16_t>().with_device(cuda_device).verify(out);
   auto S = SymbolicSize{"slab_bytes"};
-  if (is_tile_layout(layout)) {
+  const bool tile = layout_is_tile(layout);
+  const bool pt = layout_is_pt(layout);
+  RuntimeCheck(layout >= ROWMAJOR && layout <= KT_TILE8_K1, "grouped_fp8: unknown layout ", layout);
+  if (tile) {
     // slab은 1-D u8(host-register된 kt 메모리)이고 길이는 expert 블록 합이라 N과 무관하다 —
     // n_cols는 인자로 받는다 (노드 N shard 행 수).
     RuntimeCheck(cold_n_cols % 256 == 0, "grouped_fp8_cold: n_cols ", cold_n_cols,
@@ -380,7 +411,7 @@ inline void grouped_fp8_impl(
     RuntimeCheck(E.unwrap() + 1 == E1.unwrap(), "grouped_fp8_cold: blk_off must have E entries");
     N.set_value(cold_n_cols);
   } else {
-    verify_f8_store(codes, scales, row_off, kidx, E1, N, cuda_device, w_on_device, "grouped_fp8");
+    verify_f8_store(codes, scales, row_off, kidx, E1, N, cuda_device, w_on_device, pt, "grouped_fp8");
   }
 
   const int64_t m = M.unwrap(), top_k = K.unwrap(), p = P.unwrap();
@@ -405,7 +436,7 @@ inline void grouped_fp8_impl(
   RuntimeCheck(aligned16(out.data_ptr()), "grouped_fp8: out must be 16-byte aligned");
 
   F8Slot s0{static_cast<const uint8_t*>(codes.data_ptr()),
-            is_tile_layout(layout) ? nullptr : static_cast<const float*>(scales.data_ptr()),
+            tile ? nullptr : static_cast<const float*>(scales.data_ptr()),
             static_cast<const int32_t*>(row_off.data_ptr()),
             static_cast<const uint16_t*>(kidx.data_ptr()), out_col_offset,
             blk_off ? static_cast<const int64_t*>(blk_off->data_ptr()) : nullptr};
@@ -413,7 +444,7 @@ inline void grouped_fp8_impl(
   const bool fused = (codes_up != nullptr);
   if (fused) {
     RuntimeCheck(row_off_up && kidx_up, "grouped_fp8_gateup: up slot needs its offset tensors");
-    if (is_tile_layout(layout)) {
+    if (tile) {
       auto S2 = SymbolicSize{"slab_bytes_up"};
       TensorMatcher({S2}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(*codes_up);
       TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(*row_off_up);
@@ -425,14 +456,14 @@ inline void grouped_fp8_impl(
     } else {
       RuntimeCheck(scales_up != nullptr, "grouped_fp8_gateup: up slot needs scales");
       verify_f8_store(*codes_up, *scales_up, *row_off_up, *kidx_up, E1, N, cuda_device,
-                      w_on_device, "grouped_fp8_gateup(up)");
+                      w_on_device, pt, "grouped_fp8_gateup(up)");
     }
     RuntimeCheck(out_col_offset_up % 8 == 0 && out_col_offset_up >= 0 &&
                  out_col_offset_up + n_cols <= out_row,
                  "grouped_fp8_gateup: up out cols [", out_col_offset_up, ",",
                  out_col_offset_up + n_cols, ") invalid for out width ", out_row);
     s1 = F8Slot{static_cast<const uint8_t*>(codes_up->data_ptr()),
-                is_tile_layout(layout) ? nullptr : static_cast<const float*>(scales_up->data_ptr()),
+                tile ? nullptr : static_cast<const float*>(scales_up->data_ptr()),
                 static_cast<const int32_t*>(row_off_up->data_ptr()),
                 static_cast<const uint16_t*>(kidx_up->data_ptr()), out_col_offset_up,
                 blk_off_up ? static_cast<const int64_t*>(blk_off_up->data_ptr()) : nullptr};
@@ -461,9 +492,13 @@ inline void grouped_fp8_impl(
         static_cast<long long>(x_kx), static_cast<int>(x_row_is_pair),
         static_cast<long long>(n_cols), static_cast<long long>(out_row), s0, s1);
   };
-  if (layout == KT_TILE8) launch(prism_grouped_gemm_fp8<KT_TILE8>);
-  else if (layout == KT_TILE8_K1) launch(prism_grouped_gemm_fp8<KT_TILE8_K1>);
-  else launch(prism_grouped_gemm_fp8<ROWMAJOR>);
+  switch (layout) {
+    case KT_TILE8: launch(prism_grouped_gemm_fp8<KT_TILE8>); break;
+    case ROWMAJOR_PT: launch(prism_grouped_gemm_fp8<ROWMAJOR_PT>); break;
+    case KT_TILE8_PT: launch(prism_grouped_gemm_fp8<KT_TILE8_PT>); break;
+    case KT_TILE8_K1: launch(prism_grouped_gemm_fp8<KT_TILE8_K1>); break;
+    default: launch(prism_grouped_gemm_fp8<ROWMAJOR>); break;
+  }
 }
 
 // KT_TILE8 (cold slab) 진입점 — kt fp8 타일 BufferB를 host 메모리(cudaHostRegister됨)에서
@@ -476,11 +511,12 @@ void grouped_fp8_cold(
     tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
     tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
     int64_t max_blocks, int64_t n_cols, int64_t layout) {
-  host::RuntimeCheck(layout == KT_TILE8 || layout == KT_TILE8_K1,
-                     "grouped_fp8_cold: layout must be 1 (kt fp8 k2 tile) or 2 (k1 tile)");
+  host::RuntimeCheck(layout == KT_TILE8 || layout == KT_TILE8_PT || layout == KT_TILE8_K1,
+                     "grouped_fp8_cold: layout must be 1 (kt fp8 b128 tile), 3 (per-tensor tile) or 4 (k1 tile)");
   grouped_fp8_impl(x, pair_sorted, pair_off, tile_off, slab, slab, row_off, kidx, out,
                    out_col_offset, x_row_is_pair, false, max_blocks,
-                   nullptr, nullptr, nullptr, nullptr, 0, static_cast<int>(layout), &blk_off, nullptr, n_cols);
+                   nullptr, nullptr, nullptr, nullptr, 0, static_cast<int>(layout), &blk_off, nullptr,
+                   n_cols);
 }
 
 void grouped_fp8_cold_gateup(
@@ -492,8 +528,8 @@ void grouped_fp8_cold_gateup(
     tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
     tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
     int64_t x_row_is_pair, int64_t max_blocks, int64_t n_cols, int64_t layout) {
-  host::RuntimeCheck(layout == KT_TILE8 || layout == KT_TILE8_K1,
-                     "grouped_fp8_cold_gateup: layout must be 1 (k2 tile) or 2 (k1 tile)");
+  host::RuntimeCheck(layout == KT_TILE8 || layout == KT_TILE8_PT || layout == KT_TILE8_K1,
+                     "grouped_fp8_cold_gateup: layout must be 1, 3 or 4");
   grouped_fp8_impl(x, pair_sorted, pair_off, tile_off, slab_g, slab_g, row_off_g, kidx_g, out,
                    out_col_offset_g, x_row_is_pair, false, max_blocks,
                    &slab_u, nullptr, &row_off_u, &kidx_u, out_col_offset_u,
@@ -546,6 +582,57 @@ void grouped_fp8_indexed_pinned_gateup(
   grouped_fp8_impl(x, pair_sorted, pair_off, tile_off, codes_g, scales_g, row_off_g, kidx_g, out,
                    out_col_offset_g, x_row_is_pair, false, max_blocks,
                    &codes_u, &scales_u, &row_off_u, &kidx_u, out_col_offset_u);
+}
+
+// ── per-tensor 배율 (ROWMAJOR_PT) — scales [E], kr 32 배수 ─────────────────────
+void grouped_fp8pt_indexed(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
+    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
+    tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
+    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair, int64_t max_blocks) {
+  grouped_fp8_impl(x, pair_sorted, pair_off, tile_off, codes, scales, row_off, kidx, out,
+                   out_col_offset, x_row_is_pair, true, max_blocks,
+                   nullptr, nullptr, nullptr, nullptr, 0, ROWMAJOR_PT);
+}
+
+void grouped_fp8pt_indexed_pinned(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
+    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
+    tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
+    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair, int64_t max_blocks) {
+  grouped_fp8_impl(x, pair_sorted, pair_off, tile_off, codes, scales, row_off, kidx, out,
+                   out_col_offset, x_row_is_pair, false, max_blocks,
+                   nullptr, nullptr, nullptr, nullptr, 0, ROWMAJOR_PT);
+}
+
+void grouped_fp8pt_indexed_gateup(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
+    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
+    tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g,
+    tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
+    tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u,
+    tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
+    tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
+    int64_t x_row_is_pair, int64_t max_blocks) {
+  grouped_fp8_impl(x, pair_sorted, pair_off, tile_off, codes_g, scales_g, row_off_g, kidx_g, out,
+                   out_col_offset_g, x_row_is_pair, true, max_blocks,
+                   &codes_u, &scales_u, &row_off_u, &kidx_u, out_col_offset_u, ROWMAJOR_PT);
+}
+
+void grouped_fp8pt_indexed_pinned_gateup(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
+    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
+    tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g,
+    tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
+    tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u,
+    tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
+    tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
+    int64_t x_row_is_pair, int64_t max_blocks) {
+  grouped_fp8_impl(x, pair_sorted, pair_off, tile_off, codes_g, scales_g, row_off_g, kidx_g, out,
+                   out_col_offset_g, x_row_is_pair, false, max_blocks,
+                   &codes_u, &scales_u, &row_off_u, &kidx_u, out_col_offset_u, ROWMAJOR_PT);
 }
 
 }  // namespace

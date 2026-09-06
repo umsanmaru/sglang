@@ -76,10 +76,16 @@ class ColdCpuReport:
     timing: Timing
     iters: int
     mask_per_k: bool = False   # 마스크 출처: False = a/c 테이블(k2wl2), True = 입력 x(k1)
+    tokens: int = 1            # 한 호출의 토큰 수 M (qlen)
+    sparse: bool = True        # False = kt dense 경로 (sparsity=None)
 
     @property
     def us(self) -> float:
         return self.timing.us
+
+    @property
+    def us_per_token(self) -> float:
+        return self.timing.us / self.tokens
 
     def as_dict(self) -> dict:
         d = dict(self.timing.as_dict())
@@ -87,7 +93,9 @@ class ColdCpuReport:
                  keep_frac=self.keep_frac, band=self.band,
                  fixed_ids=self.fixed_ids, split_index=self.split_index,
                  numa_nodes=self.numa_nodes, iters=self.iters,
-                 mask_per_k=self.mask_per_k)
+                 mask_per_k=self.mask_per_k,
+                 tokens=self.tokens, us_per_token=round(self.us_per_token, 3),
+                 sparse=self.sparse)
         return d
 
 
@@ -98,17 +106,33 @@ class ColdCpuProfiler:
     """
 
     def __init__(self, shape: Shape, *, cold_frac: float = 0.875,
-                 sparsity: float = 0.9, proj: str = "gateup",
+                 sparsity: Optional[float] = 0.9, proj: str = "gateup",
                  band: bool = False, split_index: bool = False,
                  mask_pattern: str = "random", numa_split: float = 0.5,
                  threads: Optional[int] = None,
                  cpu_kernel: Optional[str] = None, dtype: str = "bf16",
-                 seed: int = 0, numa_map: Optional[Sequence[int]] = None):
+                 seed: int = 0, numa_map: Optional[Sequence[int]] = None,
+                 m: int = 1):
+        """`sparsity=None`은 kt **dense 경로**다 — 테이블을 설치하지 않으므로 마스크
+        빌드·plan 인코딩이 없다. `sparsity=0.0`(전부 살리는 sparse 경로)과 다른 코드
+        경로이고, dense 레인(`srt/layers/prism/linear`)의 cold가 부르는 것은 이쪽이다.
+
+        `m`은 한 호출의 토큰 수(qlen). kt는 qlen==1과 >1이 다른 경로이므로 prefill
+        비용은 m을 실제 청크로 줘야 나온다. sparse는 decode 전용(qlen==1)이라 m>1이면
+        `sparsity=None`이어야 한다. 모든 토큰이 같은 expert 집합을 쓴다 — dense 레인은
+        한 호출에 슬롯 하나이고, MoE prefill의 토큰별 라우팅은 여기서 흉내내지 않는다.
+        """
         from kt_kernel import kt_kernel_ext
         from kt_kernel.experts_partial import PartialMoEWrapper
 
         if proj not in ("gateup", "down"):
             raise ValueError(f"proj must be gateup|down, got {proj!r}")
+        if m < 1:
+            raise ValueError(f"m (tokens per call) must be >= 1, got {m}")
+        if m > 1 and sparsity is not None:
+            raise ValueError("sparse cold is decode-only (kt rejects qlen != 1 with sparsity "
+                             "tables) — use sparsity=None for m > 1")
+        self.m = m
         # dtype이 백엔드(kt 커널 키)와 K 정렬을 정한다 — cpu_kernel은 그 안에서만 고른다.
         self.store = store_of(dtype)
         cpu_kernel = cpu_kernel or self.store.cpu_kernel
@@ -154,7 +178,7 @@ class ColdCpuProfiler:
         else:
             self.cpuinfer = kt_kernel_ext.CPUInfer(self.threads)
         cfg = kt_kernel_ext.moe.MOEConfig(E, topk, H, I, 0)
-        cfg.max_len = 1
+        cfg.max_len = m
         cfg.layer_idx = 0
         cfg.partial.enabled = True
         cfg.partial.n_total = I
@@ -202,13 +226,18 @@ class ColdCpuProfiler:
         self.mask_per_k = (kernel_mask_per_k(cpu_kernel)
                            or bool(getattr(self.wrapper, "mask_per_k", False)))
 
+        # sparsity=None은 kt dense 경로 — 테이블을 설치하지 않는다 (마스크 종류와 무관).
         # per-k 커널이면 마스크는 x의 레벨 + expert별 thr(순서통계)로 실현한다 — common.py
         # per_k_levels/per_k_thr. gate/up은 K축(hidden)이 같아 같은 x를 본다 (같은 seed).
-        weights, scales, tables, keep, self.x_levels = {}, {}, {}, {}, {}
+        weights, scales, keep, self.x_levels = {}, {}, {}, {}
+        tables = {} if sparsity is not None else None
         for p in PROJS:
             n = shape.n_cols(p)
             weights[p], scales[p] = self.store.cold_store(
                 E, n, self.k_cold[p], seed=seed + hash(p) % 97)
+            if sparsity is None:
+                keep[p] = 1.0
+                continue
             if self.mask_per_k:
                 xl = per_k_levels(shape.k_axis(p), pattern=mask_pattern, seed=seed)
                 self.x_levels[p] = xl
@@ -244,31 +273,39 @@ class ColdCpuProfiler:
         shape, topk = self.shape, self.shape.topk
         E = shape.experts
         g = torch.Generator().manual_seed(seed)
+        m = self.m
+        # expert_ids [m, topk]: 토큰마다 같은 집합 (한 호출 = 슬롯 하나, dense 레인과 같다).
         if fixed_ids:
             # 판별자: 풀은 E개인데 매 스텝 **같은** top_k만 쓴다.
-            one = torch.randperm(E, generator=g)[:topk].to(torch.int64).contiguous()
-            ids = [one] * iters
+            one = torch.randperm(E, generator=g)[:topk].to(torch.int64)
+            ids = [one.reshape(1, topk).expand(m, topk).contiguous()] * iters
         else:
-            ids = [torch.randperm(E, generator=g)[:topk].to(torch.int64).contiguous()
+            ids = [torch.randperm(E, generator=g)[:topk].to(torch.int64)
+                   .reshape(1, topk).expand(m, topk).contiguous()
                    for _ in range(iters)]
-        w = torch.full((1, topk), 1.0 / topk, dtype=torch.float32)
+        # 라우터 가중: sparse 경로는 점수에 쓰므로 넘기고, dense 경로는 dense 레인처럼 0(없음).
+        w = (None if self.sparsity is None
+             else torch.full((m, topk), 1.0 / topk, dtype=torch.float32))
 
         # 입력: 페어 커널은 x ≡ 1 (sparsity 합성이 x0=x1=1 전제), per-k 커널은 레벨 x
         # (common.per_k_levels — 마스크가 |x_k| ≥ thr[e]로 실현된다).
+        per_k_x = self.mask_per_k and self.sparsity is not None
         if self.proj == "gateup":
-            x = (torch.ones(1, shape.hidden, dtype=torch.bfloat16) if not self.mask_per_k
-                 else self.x_levels["gate"].reshape(1, shape.hidden).clone())
-            out = torch.zeros(1, topk, 2 * shape.inter, dtype=torch.bfloat16)
+            # 페어 커널·dense 경로는 x ≡ 1, per-k sparse는 레벨 x (토큰마다 같은 x).
+            x = (torch.ones(m, shape.hidden, dtype=torch.bfloat16) if not per_k_x
+                 else self.x_levels["gate"].reshape(1, shape.hidden)
+                 .expand(m, shape.hidden).contiguous())
+            out = torch.zeros(m, topk, 2 * shape.inter, dtype=torch.bfloat16)
             call = self.wrapper.forward_gateup
         else:
-            x = (torch.ones(1, topk, shape.inter, dtype=torch.bfloat16) if not self.mask_per_k
+            x = (torch.ones(m, topk, shape.inter, dtype=torch.bfloat16) if not per_k_x
                  else self.x_levels["down"].reshape(1, 1, shape.inter)
-                 .expand(1, topk, shape.inter).contiguous())
-            out = torch.zeros(1, topk, shape.hidden, dtype=torch.bfloat16)
+                 .expand(m, topk, shape.inter).contiguous())
+            out = torch.zeros(m, topk, shape.hidden, dtype=torch.bfloat16)
             call = self.wrapper.forward_down
 
         def step(i: int) -> None:
-            call(ids[i].reshape(1, topk), x, out, w)
+            call(ids[i], x, out, w)
 
         for i in range(min(20, iters)):   # warmup
             step(i)
@@ -285,6 +322,7 @@ class ColdCpuProfiler:
             fixed_ids=fixed_ids, split_index=self.split_index,
             numa_nodes=self.nodes, timing=Timing.of(per), iters=iters,
             mask_per_k=self.mask_per_k,
+            tokens=m, sparse=self.sparsity is not None,
         )
 
 
@@ -323,22 +361,33 @@ def cold_cpu_sweep(shape: Shape, experts: Sequence[int], *, iters: int = 100,
             "numa_map": list(kw["numa_map"]) if kw.get("numa_map") else None,
             "iters": iters, "replays": replays, "seed": kw.get("seed", 0),
             "mask_per_k": bool(results and results[0].get("mask_per_k")),
+            "m": kw.get("m", 1), "sparse": kw.get("sparsity", 0.9) is not None,
         },
         "results": results,
         "env": env_stamp(None),
     }
 
 
-def cold_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, iters: int = 100,
+def cold_sparse_gemv(k: int, n: int, sparsity: Optional[float] = 0.9, *, iters: int = 100,
                      replays: int = 8, mask_pattern: str = "random",
                      numa_split: float = 0.5, threads: Optional[int] = None,
                      cpu_kernel: Optional[str] = None, dtype: str = "bf16", seed: int = 0,
                      numa_map: Optional[Sequence[int]] = None,
-                     experts: int = 1, topk: int = 1) -> SparseGemv:
+                     experts: int = 1, topk: int = 1, m: int = 1,
+                     proj: str = "gateup") -> SparseGemv:
     """[k, n] weight 하나의 cold sparse GEMV — shape과 sparsity만 받는다. CUDA 불필요.
 
         cold_sparse_gemv(1792, 768, 0.9).us                       # 접힌 형태 (상한)
         cold_sparse_gemv(1792, 768, 0.9, experts=128, topk=8).us   # 실제 풀·활성 수
+        cold_sparse_gemv(5120, 17408, None, experts=64, m=64,      # dense 레인: 층 64개를
+                         proj="down", dtype="fp8pt")               # 슬롯으로, M=64 prefill
+
+    **dense 레인 흉내 (`sparsity=None`, `m`, `proj`)** — `srt/layers/prism/linear`의 cold는
+    이 partial 경로의 퇴화형이다: expert 축 = 슬롯(층·part), top_k = 1, 테이블 없음
+    (kt dense 경로). `experts`에 그 형상 그룹의 unit 수(예: 층 수)를 주면 iteration마다
+    다른 슬롯의 W를 읽어 L3 재사용이 없는 실제 조건이 된다 — `experts=1`은 같은 W를
+    반복 읽어 낙관적이다. `proj="gateup"`은 K를 공유하는 인접 두 part(GEMV 2개),
+    `proj="down"`은 part 하나(GEMV 1개)다. `m`은 한 호출의 토큰 수(prefill 청크).
 
     `warm_sparse_gemv`의 CPU 짝이다: kt의 동기 진입점 `forward_gateup_partial`을
     부른다 (`cold_backend`가 부르는 그 경로). s → thr → 점수 → 마스크 → masked
@@ -364,16 +413,20 @@ def cold_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, iters: int = 100,
         raise ValueError(f"{store.name}: k must be a multiple of {store.rows_step()}, got {k}")
     if topk > experts:
         raise ValueError(f"topk {topk} > experts {experts} (풀에서 중복 없이 뽑는다)")
-    shape = Shape(experts=experts, topk=topk, hidden=k, inter=n)
-    with ColdCpuProfiler(shape, cold_frac=1.0, sparsity=sparsity, proj="gateup",
+    if proj not in ("gateup", "down"):
+        raise ValueError(f"proj must be gateup|down, got {proj!r}")
+    # K축이 hidden인 것은 gate/up, inter인 것은 down — 같은 [k, n]을 두 진입점에 맞춘다.
+    shape = (Shape(experts=experts, topk=topk, hidden=k, inter=n) if proj == "gateup"
+             else Shape(experts=experts, topk=topk, hidden=n, inter=k))
+    with ColdCpuProfiler(shape, cold_frac=1.0, sparsity=sparsity, proj=proj,
                          mask_pattern=mask_pattern, numa_split=numa_split,
                          threads=threads, cpu_kernel=cpu_kernel, dtype=store,
-                         seed=seed, numa_map=numa_map) as prof:
+                         seed=seed, numa_map=numa_map, m=m) as prof:
         rep = prof.measure(iters=iters, replays=replays)
-        rows = prof.node_gateup_rows   # proj="gateup" 고정
+        rows = prof.node_gateup_rows if proj == "gateup" else prof.node_down_rows
     return SparseGemv(where="cold", k_rows=k, n_cols=n, sparsity=sparsity,
                       keep_frac=rep.keep_frac,
-                      # 한 호출이 읽는 weight 수 = topk × 2 (활성 expert의 gate + up).
-                      dense_bytes=store.store_bytes(2 * topk, k, n),
+                      # 한 호출이 읽는 weight 수 = topk × (gateup 2 | down 1).
+                      dense_bytes=store.store_bytes((2 if proj == "gateup" else 1) * topk, k, n),
                       timing=rep.timing, numa_split=numa_split,
-                      node_rows=rows)
+                      node_rows=rows, tokens=m)

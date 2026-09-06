@@ -25,7 +25,8 @@ from typing import Tuple
 _GPU_WARM_KERNELS: Tuple[str, ...] = ("gemv_worklist", "torch_bmm", "gemv_worklist_mxfp4",
                                       "gemv_worklist_fp8")
 _CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_fp4",
-                                      "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128", "kt_tile_k1_fp8b128")
+                                      "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128", "kt_tile_k1_fp8b128",
+                                      "kt_tile_k2_fp8pt")
 
 # cold 커널 키가 함의하는 **slab 레이아웃**(GPU 제자리 읽기 로더가 해석) 과 노드 N shard 정렬.
 #   kt_bf16  — kt BufferBBF16Impl packed 6D (prism_grouped.cuh COLD)
@@ -35,11 +36,16 @@ _CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_
 #              (KT_TILE8); N shard 256 배수, K 128 배수
 #   kt_tile8k1 — GemmKernelTileK1FP8B128::BufferB: 같은 타일 기하, 64 B 라인 = k 한 행 × 64 n
 #              (KT_TILE8_K1); per-k 마스크 커널(score k1) — 정렬 요구는 kt_tile8과 동일
+#   kt_tile8pt — GemmKernelTileK2FP8PT::BufferB: 코드 타일은 kt_tile8과 같고 배율은 expert 블록 끝
+#              64 B 슬롯의 fp32 1개(per-tensor). N shard 256 배수, K 32 배수 (128 제약 없음).
+#              GPU 로더는 Layout::KT_TILE8_PT.
 _CPU_COLD_SLAB_LAYOUT: dict = {"kt_amx_bf16": "kt_bf16", "kt_tile_k2_bf16": "kt_bf16",
                                "kt_amx_fp4": "kt_fp4", "kt_tile_k2_mxfp4": "kt_tile4",
-                               "kt_tile_k2_fp8b128": "kt_tile8", "kt_tile_k1_fp8b128": "kt_tile8k1"}
+                               "kt_tile_k2_fp8b128": "kt_tile8", "kt_tile_k1_fp8b128": "kt_tile8k1",
+                               "kt_tile_k2_fp8pt": "kt_tile8pt"}
 _CPU_COLD_N_ALIGN: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_fp4": 32,
-                           "kt_tile_k2_mxfp4": 256, "kt_tile_k2_fp8b128": 256, "kt_tile_k1_fp8b128": 256}
+                           "kt_tile_k2_mxfp4": 256, "kt_tile_k2_fp8b128": 256, "kt_tile_k1_fp8b128": 256,
+                           "kt_tile_k2_fp8pt": 256}
 
 # GPU 커널 키가 함의하는 **스토어 포맷** (formats.py). 키 하나가 스토어 형식·K 정렬·커널
 # 진입점·로더 파라미터 형태를 전부 정한다 (계약 ①) — 이 dict가 그 유일한 대응표다.
@@ -59,7 +65,8 @@ _GPU_STORE_FORMAT: dict = {
 # 채운다. 새 cold 커널은 자기 타일 크기를 여기 등록한다.
 # fp8 타일은 배율 블록이 128 k라 타일 올림도 128이다 (32로 올리면 마지막 블록의 배율이 없다).
 _CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_fp4": 32,
-                             "kt_tile_k2_mxfp4": 32, "kt_tile_k2_fp8b128": 128, "kt_tile_k1_fp8b128": 128}
+                             "kt_tile_k2_mxfp4": 32, "kt_tile_k2_fp8b128": 128, "kt_tile_k1_fp8b128": 128,
+                             "kt_tile_k2_fp8pt": 32}
 
 # cold 커널 키가 함의하는 **Seam B 마스크 종류** = 요구하는 sparsity score.
 #   k2wl2 — 페어 마스크(VNNI 페어 단위 skip), wn²/pair_dot 테이블 + 페어 에너지 thr 곡선
@@ -67,7 +74,7 @@ _CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_f
 # plan.sparsity.score와 어긋나면 startup 즉사 (cold_backend) — 마스크 규칙과 thr 분위수가 다르다.
 _CPU_COLD_SCORE: dict = {"kt_amx_bf16": "k2wl2", "kt_tile_k2_bf16": "k2wl2", "kt_amx_fp4": "k2wl2",
                          "kt_tile_k2_mxfp4": "k2wl2", "kt_tile_k2_fp8b128": "k2wl2",
-                         "kt_tile_k1_fp8b128": "k1"}
+                         "kt_tile_k1_fp8b128": "k1", "kt_tile_k2_fp8pt": "k2wl2"}
 
 
 class KernelError(ValueError):

@@ -130,7 +130,7 @@ needs_rig = pytest.mark.skipif(
 
 
 @needs_rig
-@pytest.mark.parametrize("dtype", ["fp8", "bf16"])
+@pytest.mark.parametrize("dtype", ["fp8", "bf16", "fp8pt"])
 @pytest.mark.parametrize("group", ["gateup", "down"])
 def test_check_matches_masked_reference(dtype, group):
     """세 티어 partial의 합이 합성 마스크 레퍼런스와 맞아야 한다.

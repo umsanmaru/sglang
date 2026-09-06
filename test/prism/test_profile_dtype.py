@@ -20,7 +20,7 @@ SHAPE = Shape(experts=8, topk=4, hidden=1024, inter=512)
 
 def test_store_registry_maps_dtype_to_backend():
     """dtype → (포맷, cold 커널, 정렬). 세 축이 한 이름에 묶여 있어야 한다 (계약 ①)."""
-    assert sorted(STORES) == ["bf16", "fp8", "mxfp4"]
+    assert sorted(STORES) == ["bf16", "fp8", "fp8pt", "mxfp4"]
     bf16, mx, f8 = (store_of(d) for d in ("bf16", "mxfp4", "fp8"))
     assert (bf16.fmt.name, bf16.cpu_kernel, bf16.k_align) == ("bf16", "kt_tile_k2_bf16", 2)
     assert (mx.fmt.name, mx.cpu_kernel, mx.k_align) == ("mxfp4", "kt_tile_k2_mxfp4", 32)
@@ -69,14 +69,14 @@ def test_cold_kernel_must_match_dtype():
 
 
 @cuda_required
-@pytest.mark.parametrize("dtype", ["bf16", "mxfp4", "fp8"])
+@pytest.mark.parametrize("dtype", ["bf16", "mxfp4", "fp8", "fp8pt"])
 def test_hot_dense_gemv_runs_on_each_dtype(dtype):
     """세 dtype 모두 자기 커널로 돌고, 리포트가 어느 커널이었는지 말한다."""
     from sglang.srt.layers.moe.prism.profile import hot_dense_gemv
 
     r = hot_dense_gemv(SHAPE, hot_frac=0.25, device=0, reps=4, replays=2, dtype=dtype)
     assert r.params["dtype"] == dtype
-    assert dtype.replace("bf16", "worklist") in r.params["kernel"]
+    assert dtype.replace("bf16", "worklist") in r.params["kernel"]   # fp8pt → gemv_fp8pt_*
     assert r.layer_gemv_us > 0
     for res in r.results:
         assert res.dtype == dtype
@@ -85,7 +85,7 @@ def test_hot_dense_gemv_runs_on_each_dtype(dtype):
 
 
 @cuda_required
-@pytest.mark.parametrize("dtype", ["bf16", "mxfp4", "fp8"])
+@pytest.mark.parametrize("dtype", ["bf16", "mxfp4", "fp8", "fp8pt"])
 def test_warm_sparse_gemv_runs_on_each_dtype(dtype):
     """warm(pinned UVA) sparse GEMV도 dtype으로 갈린다 — 실현 keep 비율은 같다."""
     from sglang.srt.layers.moe.prism.profile import warm_sparse_gemv
@@ -198,3 +198,82 @@ def test_full_layer_k1_with_expert_varied_tiers_and_sparsity():
             rep = p.check(group)
             errs = [v for k, v in rep.items() if k.endswith("_max_rel_err")]
             assert errs and max(errs) < 0.02, rep
+
+
+# ─── per-tensor fp8 (fp8pt) — cold 전용 스토어 · kt dense 경로 · 토큰 m ─────────
+def _has_fp8pt_kernel() -> bool:
+    try:
+        from kt_kernel import kt_kernel_ext
+    except ImportError:
+        return False
+    return hasattr(kt_kernel_ext.moe, "TileK2FP8PT_MOE")
+
+
+fp8pt_required = pytest.mark.skipif(not _has_fp8pt_kernel(), reason="kt build without TileK2FP8PT_MOE")
+
+
+def test_fp8pt_store_maps_to_pt_kernels():
+    """fp8pt: cold 커널 키·정렬·GPU 진입점(gemv_fp8pt_*)이 한 이름에 묶인다. 배율은 슬롯당 스칼라."""
+    from sglang.srt.layers.moe.prism.profile import N_ALIGN
+
+    st = store_of("fp8pt")
+    assert st.cpu_kernel == "kt_tile_k2_fp8pt" and st.cpu_kernels == ("kt_tile_k2_fp8pt",)
+    assert st.k_align == 32 and st.rows_step() == 32     # GPU row_off·kt pack 타일이 32 배수
+    assert N_ALIGN["kt_tile_k2_fp8pt"] == 256
+    assert st.fmt.name == "fp8pt"
+    assert st.fmt.gemv(pinned=True, sparse=True).__name__ == "gemv_fp8pt_indexed_pinned_sparse"
+    assert st.fmt.gemv_gateup(pinned=False, sparse=False).__name__ == "gemv_fp8pt_indexed_gateup"
+    E, k, n = 3, 96, 256                                  # k % 32 == 0, 128 배수 아님
+    codes, scales = st.cold_store(E, n, k)
+    assert codes.shape == (E * n * k,) and codes.dtype is torch.uint8
+    assert scales.shape == (E,) and scales.dtype is torch.float32   # expert당 배율 1개
+    codes, scales = st.gpu_store(E, k, n)
+    assert codes.shape == (E * k, n) and scales.shape == (E,) and scales.dtype is torch.float32
+    assert st.store_bytes(E, k, n) == E * k * n + E * 4
+    assert st.dequant((codes, scales), k, n).shape == (E * k, n)
+    with pytest.raises(ValueError, match="multiple of 32"):
+        st.gpu_store(E, 48, n)
+
+
+def test_dense_mode_and_tokens_are_validated():
+    """m>1은 dense 경로만 (kt sparse는 decode 전용). 검사는 kt 인스턴스를 만들기 전에 난다."""
+    from sglang.srt.layers.moe.prism.profile.cold_cpu import ColdCpuProfiler
+
+    with pytest.raises(ValueError, match="decode-only"):
+        ColdCpuProfiler(SHAPE, sparsity=0.5, m=8, threads=2, numa_map=[0])
+    with pytest.raises(ValueError, match="m .* >= 1"):
+        ColdCpuProfiler(SHAPE, sparsity=None, m=0, threads=2, numa_map=[0])
+
+
+@fp8pt_required
+def test_cold_cpu_fp8pt_dense_runs_and_scales_with_tokens():
+    """fp8pt cold가 kt dense 경로(sparsity=None)로 돌고, m=1과 m>1 둘 다 값이 나온다.
+
+    동일 [k, n]을 fp8(b128)과 fp8pt로 재면 코드 바이트가 같으니 dense_bytes도 같다(배율 제외)."""
+    from sglang.srt.layers.moe.prism.profile import cold_sparse_gemv
+
+    kw = dict(experts=8, topk=1, threads=4, numa_map=[0], iters=10, replays=2, proj="down")
+    r1 = cold_sparse_gemv(512, 1024, None, dtype="fp8pt", m=1, **kw)
+    r8 = cold_sparse_gemv(512, 1024, None, dtype="fp8pt", m=8, **kw)
+    assert r1.sparsity is None and r1.keep_frac == 1.0 and r1.tokens == 1 and r8.tokens == 8
+    assert r1.us > 0 and r8.us > 0
+    assert r1.dense_bytes == store_of("fp8pt").store_bytes(1, 512, 1024)
+    d = r8.as_dict()
+    assert d["tokens"] == 8 and abs(d["us_per_token"] - r8.us / 8) < 1e-3   # 소수 3자리 반올림
+    # 리포트가 dense 경로였음을 말한다
+    from sglang.srt.layers.moe.prism.profile import Shape, cold_cpu
+
+    rep = cold_cpu(Shape(experts=8, topk=1, hidden=512, inter=1024), cold_frac=1.0,
+                   sparsity=None, proj="gateup", dtype="fp8pt", threads=4, numa_map=[0],
+                   iters=10, replays=2, m=4)
+    assert rep.sparse is False and rep.tokens == 4 and rep.keep_frac == 1.0
+
+
+@fp8pt_required
+def test_fp8pt_rejects_foreign_kernel():
+    """fp8pt 스토어를 b128 커널이 읽으면 배율 형태가 달라 조용히 쓰레기 — 로드 전 즉사."""
+    from sglang.srt.layers.moe.prism.profile.cold_cpu import ColdCpuProfiler
+
+    with pytest.raises(ValueError, match="cannot consume"):
+        ColdCpuProfiler(SHAPE, sparsity=None, dtype="fp8pt", cpu_kernel="kt_tile_k2_fp8b128",
+                        threads=2, numa_map=[0])
