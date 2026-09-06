@@ -1083,6 +1083,24 @@ class FusedMoE(torch.nn.Module):
                 if expert_id >= self.quant_method.num_gpu_experts:
                     return
 
+        # --- prism TP: routed expert weights live on the MoE-TP owner rank only (whole rows,
+        # no TP shard) — the other ranks hold none and emit zeros; the model's post-experts
+        # reduce sums them. "skip": drop the tensor. "full": load whole rows by making the
+        # shard arithmetic below (loaded.shape // moe_tp_size, offset tp_rank) see TP=1.
+        prism_tp_mode = getattr(self.quant_method, "prism_tp_mode", None)
+        if prism_tp_mode == "skip":
+            return
+        if prism_tp_mode == "full" and self.moe_tp_size != 1:
+            saved_tp = self.moe_tp_size
+            self.moe_tp_size = 1
+            try:
+                return self._weight_loader_physical(
+                    param, loaded_weight, weight_name, shard_id, expert_id
+                )
+            finally:
+                self.moe_tp_size = saved_tp
+        # --- prism end ---
+
         self._weight_loader_impl(
             param=param,
             loaded_weight=loaded_weight,

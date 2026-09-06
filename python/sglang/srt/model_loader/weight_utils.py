@@ -1110,11 +1110,37 @@ def safetensors_weights_iterator(
                 for name in sorted(result.keys()):
                     yield name, result[name]
         else:
+            skip = _prism_skip_tensor_fn()
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
+                    if skip is not None and skip(name):
+                        continue
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
+
+
+_PRISM_EXPERT_RE = re.compile(r"\.experts\.\d+\.")
+
+
+def _prism_skip_tensor_fn():
+    """prism(SGLANG_PRISM_PLAN) + MoE-TP에서 owner(rank 0)가 아닌 rank는 routed expert 텐서를 갖지
+    않는다 (PrismMoEMethod.prism_tp_mode == "skip" — 로더 hook이 어차피 버린다). 여기서 이름으로
+    먼저 걸러 `get_tensor`(mmap page-in)를 피한다 — K3는 expert가 1.4 TB라 rank마다 그걸 읽으면
+    로딩이 rank 수만큼 느려진다. 그 외 상황(env 없음, TP=1, owner)은 None."""
+    import os
+
+    if not os.environ.get("SGLANG_PRISM_PLAN"):
+        return None
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        p = get_parallel()
+        if int(p.moe_tp_size) <= 1 or int(p.moe_tp_rank) == 0:
+            return None
+    except Exception:
+        return None
+    return lambda name: _PRISM_EXPERT_RE.search(name) is not None
 
 
 def fastsafetensors_weights_iterator(

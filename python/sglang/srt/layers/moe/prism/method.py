@@ -16,7 +16,8 @@ Prism의 "full 텐서 로드 → K-슬라이스 → 주입" 흐름과 겹치는 
     (full 텐서 소멸 — 계약 ③)
   apply: executor.run_layer 위임 한 줄
 
-P0 제약: TP=1. batch size 제약은 없다 — GPU 티어가 pair-native가 되면서
+TP: MoE-TP owner(rank 0)만 expert를 갖고 나머지 rank는 0을 낸다 (is_tp_owner 참조,
+2026-09-06 — K3를 GPU 2장 dense + CPU expert로 돌리기 위해). EP(a2a)는 미지원. batch size 제약은 없다 — GPU 티어가 pair-native가 되면서
 그룹 조성의 host 결정이 사라졌고, eager·캡처·prefill이 모두 같은 경로다
 (2026-08-25). executor가 캡처 구간을 자동 감지해 cold를 stream 통합
 (kt host node)으로 돌린다.
@@ -261,6 +262,28 @@ class _PrismRuntime:
 _RUNTIME: Optional[_PrismRuntime] = None
 
 
+def moe_tp_coords() -> tuple[int, int, int]:
+    """(moe_tp_rank, moe_tp_size, moe_ep_size). 분산 초기화 전(단위 테스트·프로파일러)에는 (0, 1, 1)."""
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        p = get_parallel()
+        return int(p.moe_tp_rank), int(p.moe_tp_size), int(p.moe_ep_size)
+    except Exception:
+        return 0, 1, 1
+
+
+def is_tp_owner() -> bool:
+    """MoE-TP에서 routed expert를 실제로 가진 rank인가 (rank 0). TP=1이면 항상 True.
+
+    TP 설계 (kt KTEPWrapperMethod와 같은 배치): expert 가중치·CPU 풀·GPU 티어는 **rank 0 하나**가
+    전부 갖고(K-split은 TP shard가 아니라 whole row로), 나머지 rank는 0을 낸다 — 모델의 post-experts
+    reduce(all-reduce / reduce-scatter)는 합이므로 결과가 같다. attention·shared expert·latent proj는
+    평범한 TP로 GPU에 갈라진다. 이게 "GPU 2장에 dense, CPU에 expert"의 최소 형태다."""
+    rank, size, _ = moe_tp_coords()
+    return size == 1 or rank == 0
+
+
 def _get_runtime() -> _PrismRuntime:
     global _RUNTIME
     if _RUNTIME is None:
@@ -268,9 +291,10 @@ def _get_runtime() -> _PrismRuntime:
         plan = parse_plan(plan_path)
         # sparsity plan이면 자산을 먼저 열어 shape까지 검증한다 (계약 ①):
         # 다른 모델의 calib을 적용하는 것은 dims 불일치와 같은 급의 silent
-        # failure이므로 startup에서 죽는 편이 낫다.
+        # failure이므로 startup에서 죽는 편이 낫다. 비-owner rank는 자산을 열지 않는다
+        # (executor를 만들지 않으므로 필요 없고, 382 MB를 rank마다 읽을 이유가 없다).
         calib = None
-        if plan.sparsity is not None:
+        if plan.sparsity is not None and is_tp_owner():
             from sglang.srt.layers.moe.prism.calib import CalibTables
 
             calib = CalibTables.load(plan.sparsity)
@@ -299,10 +323,22 @@ class PrismMoEMethod(FusedMoEMethodBase):
         self.gpu_method = gpu_method  # create_moe_runner 등 미지 속성의 위임처
         self.layer_id = layer_id
         self._registered = False
+        rank, size, ep = moe_tp_coords()
+        if ep != 1:
+            raise NotImplementedError(
+                f"Prism does not support expert parallelism (moe_ep_size={ep}); use plain TP")
+        self.tp_rank, self.tp_size = rank, size
+        self.is_owner = is_tp_owner()
+        # FusedMoE.weight_loader(fused_moe_triton/layer.py)의 prism hook이 읽는 모드:
+        #   None   TP=1 — 평범한 로딩
+        #   "full" owner — TP shard를 자르지 않고 whole row를 받는다
+        #   "skip" 비-owner — 이 층의 routed expert 텐서를 버린다
+        self.prism_tp_mode = None if size == 1 else ("full" if self.is_owner else "skip")
 
     def __getattr__(self, name):
         # __init__ 이전/자기 속성 미존재 시 재귀 방지 (kt의 알려진 함정)
-        if name in ("gpu_method", "layer_id", "_registered"):
+        if name in ("gpu_method", "layer_id", "_registered", "tp_rank", "tp_size", "is_owner",
+                    "prism_tp_mode"):
             raise AttributeError(name)
         return getattr(self.gpu_method, name)
 
@@ -342,9 +378,16 @@ class PrismMoEMethod(FusedMoEMethodBase):
 
         runtime = _get_runtime()
         dims = runtime.plan.dims
+        # FusedMoE는 intermediate를 moe_tp_size로 갈라 넘긴다. prism의 expert는 TP shard가 아니라
+        # whole row(inter_full)이고 owner rank에만 있다 (is_tp_owner 참조).
         inter_full = intermediate_size_per_partition * getattr(layer, "moe_tp_size", 1)
-        if getattr(layer, "moe_tp_size", 1) != 1:
-            raise NotImplementedError("Prism P0 supports TP=1 only")
+        if not self.is_owner:
+            # 파라미터를 하나도 만들지 않는다: 모델 load_weights는 `name not in params_dict`로
+            # expert 텐서를 건너뛰고(kimi_k3.py), 로더 hook은 prism_tp_mode="skip"으로 버리며,
+            # apply는 0을 낸다. dummy 로더도 만질 파라미터가 없다.
+            logger.info("[prism] layer %d: MoE-TP rank %d/%d holds no experts (owner = rank 0)",
+                        self.layer_id, self.tp_rank, self.tp_size)
+            return
         if (num_experts, hidden_size, inter_full) != (
             dims.num_experts, dims.hidden_size, dims.intermediate_size
         ):
@@ -369,6 +412,9 @@ class PrismMoEMethod(FusedMoEMethodBase):
                                   extra_weight_attrs)
 
     def process_weights_after_loading(self, layer) -> None:
+        if not self.is_owner:
+            self._registered = True   # 가진 것이 없다 — 등록할 것도 없다
+            return
         runtime = _get_runtime()
         # 파라미터는 CPU에 그대로 있다: `keeps_params_on_host`가 loader.py의
         # device_loading_context에게 왕복을 건너뛰게 한다. cold 주입은 C++가 host
@@ -442,6 +488,11 @@ class PrismMoEMethod(FusedMoEMethodBase):
 
         x = dispatch_output.hidden_states
         topk = dispatch_output.topk_output
+        if not self.is_owner:
+            # 비-owner rank의 몫은 0 — 모델의 post-experts reduce(합)가 owner의 결과를 전 rank에 퍼뜨린다.
+            # (K3 `_forward_unfused`: experts → +shared → all_reduce; DSV2/GLM: 같은 자리의 all-reduce /
+            # reduce-scatter. EP a2a 경로는 reduce를 생략하므로 지원하지 않는다 — __init__에서 즉사.)
+            return StandardCombineInput(hidden_states=torch.zeros_like(x))
         runtime = _get_runtime()
         out = runtime.executor(x.device).run_layer(
             self.layer_id, x, topk.topk_ids, topk.topk_weights,
