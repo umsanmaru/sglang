@@ -52,6 +52,9 @@ from sglang.srt.layers.moe.prism.profile.common import (
     default_cpuinfer_threads,
     env_stamp,
     numa_nodes,
+    kernel_mask_per_k,
+    per_k_levels,
+    per_k_thr,
     sparse_tables,
     split_rows,
     tier_index,
@@ -72,6 +75,7 @@ class ColdCpuReport:
     numa_nodes: int
     timing: Timing
     iters: int
+    mask_per_k: bool = False   # 마스크 출처: False = a/c 테이블(k2wl2), True = 입력 x(k1)
 
     @property
     def us(self) -> float:
@@ -82,7 +86,8 @@ class ColdCpuReport:
         d.update(experts=self.experts, topk=self.topk, k_cold=dict(self.k_cold),
                  keep_frac=self.keep_frac, band=self.band,
                  fixed_ids=self.fixed_ids, split_index=self.split_index,
-                 numa_nodes=self.numa_nodes, iters=self.iters)
+                 numa_nodes=self.numa_nodes, iters=self.iters,
+                 mask_per_k=self.mask_per_k)
         return d
 
 
@@ -153,6 +158,8 @@ class ColdCpuProfiler:
         cfg.layer_idx = 0
         cfg.partial.enabled = True
         cfg.partial.n_total = I
+        # proj별 cold 행 번호 (전 expert 공유) — per-k 커널이 x에 마스크를 심을 자리.
+        self.cold_index = {}
         for p, ki in (("gate", cfg.partial.gate), ("up", cfg.partial.up),
                       ("down", cfg.partial.down)):
             axis, kc = shape.k_axis(p), self.k_cold[p]
@@ -160,11 +167,13 @@ class ColdCpuProfiler:
                 # 퇴화형: 전 expert가 같은 연속 밴드. kt가 gather를 건너뛴다.
                 ki.offset = axis - kc          # 축 끝에 붙인 밴드
                 ki.rows = kc
+                self.cold_index[p] = torch.arange(axis - kc, axis, dtype=torch.int32)
             else:
                 ki.row_off = [e * kc for e in range(E + 1)]
                 sd = seed + (7919 if (split_index and p == "up") else 0)
-                ki.idx = tier_index(axis, kc, skip=axis - kc, seed=sd) \
-                    .to(torch.int32).repeat(E).tolist()
+                idx = tier_index(axis, kc, skip=axis - kc, seed=sd).to(torch.int32)
+                ki.idx = idx.repeat(E).tolist()
+                self.cold_index[p] = idx
 
         align = N_ALIGN[cpu_kernel]
         gu_off, gu_rows, gu_frac = node_table(I, numa_split, self.nodes, align)
@@ -186,20 +195,33 @@ class ColdCpuProfiler:
         sp.p_down, sp.lam_down = SPARSITY_P, SPARSITY_LAM
         cfg.pool = self.cpuinfer.backend_
 
-        weights, scales, tables, keep = {}, {}, {}, {}
+        # 커널이 마스크를 어디서 읽는지는 kt 클래스가 안다 — 페어 커널은 a/c 테이블,
+        # per-k 커널(score k1)은 입력 x. 테이블 합성 전에 그 사실이 필요하다.
+        self.wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=cpu_kernel)
+        # 옛 kt python(페어 커널만)에는 속성이 없다 → 페어 마스크.
+        self.mask_per_k = (kernel_mask_per_k(cpu_kernel)
+                           or bool(getattr(self.wrapper, "mask_per_k", False)))
+
+        # per-k 커널이면 마스크는 x의 레벨 + expert별 thr(순서통계)로 실현한다 — common.py
+        # per_k_levels/per_k_thr. gate/up은 K축(hidden)이 같아 같은 x를 본다 (같은 seed).
+        weights, scales, tables, keep, self.x_levels = {}, {}, {}, {}, {}
         for p in PROJS:
             n = shape.n_cols(p)
             weights[p], scales[p] = self.store.cold_store(
                 E, n, self.k_cold[p], seed=seed + hash(p) % 97)
-            a, c, thr, frac = sparse_tables(E, self.k_cold[p], sparsity,
-                                            pattern=mask_pattern, seed=seed)
-            tables[f"{p}_wn_sq"] = a
-            tables[f"{p}_pair_dot"] = c
-            tables[f"thr_{p}"] = thr
+            if self.mask_per_k:
+                xl = per_k_levels(shape.k_axis(p), pattern=mask_pattern, seed=seed)
+                self.x_levels[p] = xl
+                thr, _, frac = per_k_thr(xl, [self.cold_index[p]] * E, sparsity)
+                tables[f"thr_{p}"] = thr
+            else:
+                a, c, thr, frac = sparse_tables(E, self.k_cold[p], sparsity,
+                                                pattern=mask_pattern, seed=seed)
+                tables[f"{p}_wn_sq"] = a
+                tables[f"{p}_pair_dot"] = c
+                tables[f"thr_{p}"] = thr
             keep[p] = frac
         self.keep_frac = keep
-
-        self.wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=cpu_kernel)
         scale_kw = ({} if scales["gate"] is None else
                     dict(gate_scale=scales["gate"], up_scale=scales["up"],
                          down_scale=scales["down"]))
@@ -231,12 +253,17 @@ class ColdCpuProfiler:
                    for _ in range(iters)]
         w = torch.full((1, topk), 1.0 / topk, dtype=torch.float32)
 
+        # 입력: 페어 커널은 x ≡ 1 (sparsity 합성이 x0=x1=1 전제), per-k 커널은 레벨 x
+        # (common.per_k_levels — 마스크가 |x_k| ≥ thr[e]로 실현된다).
         if self.proj == "gateup":
-            x = torch.ones(1, shape.hidden, dtype=torch.bfloat16)
+            x = (torch.ones(1, shape.hidden, dtype=torch.bfloat16) if not self.mask_per_k
+                 else self.x_levels["gate"].reshape(1, shape.hidden).clone())
             out = torch.zeros(1, topk, 2 * shape.inter, dtype=torch.bfloat16)
             call = self.wrapper.forward_gateup
         else:
-            x = torch.ones(1, topk, shape.inter, dtype=torch.bfloat16)
+            x = (torch.ones(1, topk, shape.inter, dtype=torch.bfloat16) if not self.mask_per_k
+                 else self.x_levels["down"].reshape(1, 1, shape.inter)
+                 .expand(1, topk, shape.inter).contiguous())
             out = torch.zeros(1, topk, shape.hidden, dtype=torch.bfloat16)
             call = self.wrapper.forward_down
 
@@ -257,6 +284,7 @@ class ColdCpuProfiler:
             keep_frac=self.keep_frac["gate"], band=self.band,
             fixed_ids=fixed_ids, split_index=self.split_index,
             numa_nodes=self.nodes, timing=Timing.of(per), iters=iters,
+            mask_per_k=self.mask_per_k,
         )
 
 
@@ -294,6 +322,7 @@ def cold_cpu_sweep(shape: Shape, experts: Sequence[int], *, iters: int = 100,
             "cpuinfer_threads": kw.get("threads") or default_cpuinfer_threads(),
             "numa_map": list(kw["numa_map"]) if kw.get("numa_map") else None,
             "iters": iters, "replays": replays, "seed": kw.get("seed", 0),
+            "mask_per_k": bool(results and results[0].get("mask_per_k")),
         },
         "results": results,
         "env": env_stamp(None),

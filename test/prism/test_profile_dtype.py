@@ -94,3 +94,107 @@ def test_warm_sparse_gemv_runs_on_each_dtype(dtype):
     assert r.us > 0
     assert abs(r.keep_frac - 0.5) < 0.02
     assert r.dense_bytes == store_of(dtype).store_bytes(1, 1024, 512)
+
+
+# ─── per-k 마스크 커널 (score k1) ─────────────────────────────────────────
+def _has_k1_kernel() -> bool:
+    try:
+        from kt_kernel import kt_kernel_ext
+    except ImportError:
+        return False
+    return hasattr(kt_kernel_ext.moe, "TileK1FP8B128_MOE")
+
+
+k1_required = pytest.mark.skipif(not _has_k1_kernel(), reason="kt build without TileK1FP8B128_MOE")
+K1 = "kt_tile_k1_fp8b128"
+
+
+def test_per_k_levels_and_thr_realize_per_expert_sparsity():
+    """레벨 x는 서로 다른 bf16 값, thr는 expert별 밴드 안 순서통계 — expert마다 다른 sparsity·
+    다른 행 집합이 한 x로 실현되고, 실현 keep은 레벨 동률만큼만 어긋난다."""
+    from sglang.srt.layers.moe.prism.profile import PER_K_LEVELS, per_k_levels, per_k_thr
+
+    K = 2048
+    x = per_k_levels(K, seed=3)
+    assert x.dtype is torch.bfloat16 and x.unique().numel() == PER_K_LEVELS
+    assert 0.125 <= float(x.min()) and float(x.max()) < 2.0
+    assert torch.equal(x, per_k_levels(K, seed=3))                 # 결정적 (gate/up 공유)
+    bands = [torch.arange(0, 1792), torch.randperm(K)[:1536], torch.arange(256, K)]
+    thr, keeps, frac = per_k_thr(x, bands, [0.5, 0.75, 0.9])
+    assert thr.shape == (3, 201) and torch.equal(thr[:, 0], thr[:, -1])   # grid 무관 상수
+    for idx, keep, sp in zip(bands, keeps, (0.5, 0.75, 0.9)):
+        assert keep.shape == idx.shape
+        assert abs(keep.float().mean().item() - (1 - sp)) <= 1.0 / PER_K_LEVELS + 1e-9
+    # keep은 정확히 |x| >= thr (커널과 같은 규칙)
+    assert torch.equal(keeps[0], x[bands[0]].float() >= thr[0, 0])
+    # 극단: 전부 살림 / 전부 죽임
+    thr2, keeps2, _ = per_k_thr(x, [torch.arange(K)] * 2, [0.0, 1.0])
+    assert keeps2[0].all() and not keeps2[1].any()
+    # block 패턴은 앞 행이 산다
+    xb = per_k_levels(K, pattern="block", seed=0)
+    _, kb, _ = per_k_thr(xb, [torch.arange(K)], 0.75)
+    assert kb[0][: K // 4].all() and not kb[0][K // 4:].any()
+
+
+def test_k1_kernel_is_known_to_the_profiler():
+    """N 정렬표와 fp8 포맷의 cold 커널 목록 둘 다에 있어야 `cpu_kernel=`로 고를 수 있다."""
+    from sglang.srt.layers.moe.prism.profile import N_ALIGN, kernel_mask_per_k
+
+    assert N_ALIGN[K1] == N_ALIGN["kt_tile_k2_fp8b128"] == 256
+    assert K1 in store_of("fp8").cpu_kernels
+    assert kernel_mask_per_k("kt_tile_k2_fp8b128") is False
+    assert kernel_mask_per_k("no_such_kernel") is False
+
+
+@k1_required
+def test_cold_cpu_k1_realizes_sparsity_through_x():
+    """k1 커널로 cold_cpu가 돌고 마스크가 x·thr로 실현된다 (dense보다 sparse가 빠르다).
+    gate/up 인덱스가 달라도(split_index) 각자 thr로 실현되므로 허용된다."""
+    from sglang.srt.layers.moe.prism.profile import kernel_mask_per_k, cold_cpu
+
+    assert kernel_mask_per_k(K1) is True
+    shape = Shape(experts=8, topk=2, hidden=1024, inter=512)
+    kw = dict(cold_frac=1.0, dtype="fp8", cpu_kernel=K1, threads=4, numa_map=[0],
+              iters=20, replays=2)
+    dense = cold_cpu(shape, sparsity=0.0, **kw)
+    sparse = cold_cpu(shape, sparsity=0.75, split_index=True, **kw)
+    assert dense.mask_per_k and sparse.mask_per_k
+    assert dense.keep_frac == 1.0 and abs(sparse.keep_frac - 0.25) < 0.01
+    assert sparse.us < dense.us
+
+
+@k1_required
+@cuda_required
+@pytest.mark.parametrize("group", ["gateup", "down"])
+def test_warm_cold_k1_matches_x_weighted_reference(group):
+    """k1: warm(GPU per-k)·cold(kt per-k)가 같은 레벨 x·thr를 보고, 레퍼런스 Σ x_k·W와 맞는다.
+    죽인 행도 x ≠ 0이므로 마스킹이 빠지면 여기서 드러난다."""
+    from sglang.srt.layers.moe.prism.profile import WarmColdProfiler
+
+    shape = Shape(experts=8, topk=4, hidden=1024, inter=512)
+    with WarmColdProfiler(shape, warm_frac=0.25, cold_frac=0.75, sparsity=0.6, device=0,
+                          dtype="fp8", cpu_kernel=K1, threads=4, numa_map=[0]) as p:
+        assert p.params["mask_per_k"] is True
+        assert p.warm["gate"].spec.per_k and p.warm["gate"].spec.a is None
+        rep = p.check(group)
+        for k, v in rep.items():
+            assert v < 0.02, f"{k}={v}"
+        r = p.measure(group, reps=4, replays=2, only=("warm_only", "cold_only"))
+        assert abs(r.info["warm_keep_frac"] - 0.4) < 0.01 and abs(r.info["cold_keep_frac"] - 0.4) < 0.01
+
+
+@k1_required
+@cuda_required
+def test_full_layer_k1_with_expert_varied_tiers_and_sparsity():
+    """expert마다 다른 티어 경계·sparsity도 per-k로 실현된다 (순서통계 thr) — 세 티어 합이 레퍼런스와 맞는다."""
+    from sglang.srt.layers.moe.prism.profile import FullLayerProfiler
+
+    with FullLayerProfiler(Shape(experts=16, topk=4, hidden=1024, inter=512),
+                           hot_frac=0.25, warm_frac=0.25, sparsity=0.5, sparsity_spread=0.3,
+                           hot_spread=0.1, warm_spread=0.05, dtype="fp8", cpu_kernel=K1,
+                           device=0, seed=0, threads=4, numa_map=[0]) as p:
+        assert p.params["mask_per_k"] is True
+        for group in ("gateup", "down"):
+            rep = p.check(group)
+            errs = [v for k, v in rep.items() if k.endswith("_max_rel_err")]
+            assert errs and max(errs) < 0.02, rep

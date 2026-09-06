@@ -206,3 +206,50 @@ def test_check_dims_rejects_wrong_model(tmp_path):
     )
     with pytest.raises(PlanError, match="calib table"):
         tables.check_dims(other, spec)
+
+
+# ── score k1 (2026-09-05): thr 곡선만, 가중치 통계 없음 ─────────────────────
+
+
+def make_k1_asset(tmp_path, **overrides):
+    torch.manual_seed(1)
+    blob = {"tg": torch.rand(L, E, NG), "tu": torch.rand(L, E, NG), "td": torch.rand(L, E, NG),
+            # k2wl2 계열이 같이 들어 있어도 무시돼야 한다
+            "tg2l": torch.rand(L, E, NG), "wn_g": torch.rand(L, E, H), "PMAX": 0.9}
+    blob.update(overrides)
+    for key in [k for k, v in blob.items() if v is None]:
+        del blob[key]
+    path = tmp_path / "k1_calib.pt"
+    torch.save(blob, path)
+    return path, blob
+
+
+def test_k1_loads_thr_only(tmp_path):
+    path, blob = make_k1_asset(tmp_path)
+    tables = CalibTables.load(make_spec(path, score="k1"))
+    assert tables.score == "k1" and not tables.has_weight_stats
+    assert set(tables.shapes()) == {f"thr_{p.value}" for p in Proj}
+    assert torch.equal(tables.thr(1, Proj.UP), blob["tu"][1])
+    # 점수 재료가 없으므로 밴드/인덱스 gather는 None — 소비자는 thr만 주입한다
+    assert tables.slice_band(0, Proj.GATE, 0, H, "t") is None
+
+
+def test_k1_missing_thr_rejected(tmp_path):
+    path, _ = make_k1_asset(tmp_path, td=None)
+    with pytest.raises(PlanError, match="has no 'td'"):
+        CalibTables.load(make_spec(path, score="k1"))
+
+
+def test_k1_expected_shapes_and_check_dims(tmp_path):
+    path, _ = make_k1_asset(tmp_path)
+    spec = make_spec(path, score="k1")
+    assert not spec.uses_weight_stats
+    assert set(spec.expected_calib_shapes(DIMS)) == {f"thr_{p.value}" for p in Proj}
+    CalibTables.load(spec).check_dims(DIMS, spec)
+
+
+def test_k2wl2_asset_does_not_satisfy_k1_spec(tmp_path):
+    """k2wl2 자산(tg2l…)을 k1 plan에 꽂으면 즉사 — thr 분위수의 정의(페어 에너지 vs |x|)가 다르다."""
+    path, _ = make_asset(tmp_path)
+    with pytest.raises(PlanError, match="has no 'tg'"):
+        CalibTables.load(make_spec(path, score="k1"))

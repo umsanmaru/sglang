@@ -86,7 +86,8 @@ def main() -> None:
                    help="스토어 dtype = warm GPU 커널 + cold kt 백엔드를 함께 고른다")
     p.add_argument("--cpu-kernel", default=None,
                    choices=("kt_tile_k2_bf16", "kt_amx_bf16", "kt_amx_fp4",
-                            "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128"),
+                            "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128",
+                            "kt_tile_k1_fp8b128"),
                    help="기본값은 dtype이 정한다")
     p.add_argument("--threads", type=int, default=None,
                    help="CPUInfer 스레드 (기본 cpu_count//2-2, method.py와 같은 관례)")

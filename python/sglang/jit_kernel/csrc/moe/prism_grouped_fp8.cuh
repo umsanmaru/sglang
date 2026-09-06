@@ -43,6 +43,10 @@ using namespace nvcuda;
 //              GPU 타일(64k × 128n) = 타일 컬럼 2 × n-그룹 2 = **2 KB 연속 청크 4개**.
 //              바이트 오프셋(ktf8_off): (k&1) + (n&63)·2 + ((k>>1)&15)·128 + ((n>>6)&3)·2048
 //              + (k>>5)·8192 + (n>>8)·8192·(K/32).
+//   KT_TILE8_K1 — kt `GemmKernelTileK1FP8B128::BufferB`: KT_TILE8과 super/컬럼/그룹/배율 위치가 전부
+//              같고 그룹 안 순열만 다르다 — 64 B 라인 = **k 한 행 × 64 n**. 로더의 주소식(load_b)은
+//              공유하고 Bs로 푸는 store_b만 갈린다. 바이트 오프셋(ktf8k1_off):
+//              (n&63) + (k&31)·64 + ((n>>6)&3)·2048 + (k>>5)·8192 + (n>>8)·8192·(K/32).
 constexpr int kBM = 128;
 constexpr int kBN = 128;
 constexpr int kBK = 64;
@@ -67,7 +71,8 @@ struct F8Slot {
   const int64_t* blk_off; // KT_TILE8 전용: [E] expert 블록의 slab 내 **바이트** 오프셋
 };
 
-enum Layout : int { ROWMAJOR = 0, KT_TILE8 = 1 };
+enum Layout : int { ROWMAJOR = 0, KT_TILE8 = 1, KT_TILE8_K1 = 2 };
+__host__ __device__ constexpr bool is_tile_layout(int layout) { return layout != ROWMAJOR; }
 
 template <int LAYOUT>
 __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
@@ -123,10 +128,10 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
     const uint8_t* codes_e = s.codes + o0 * n_cols + n0;
     const float* scales_e = s.scales + (o0 / kBlk) * nblk;
     // KT_TILE8: expert 블록 base와 그 안의 super/배율 테이블.
-    const uint8_t* blk = (LAYOUT == KT_TILE8) ? s.codes + s.blk_off[e] : nullptr;
-    const long long t8_super = (LAYOUT == KT_TILE8)
+    const uint8_t* blk = is_tile_layout(LAYOUT) ? s.codes + s.blk_off[e] : nullptr;
+    const long long t8_super = is_tile_layout(LAYOUT)
         ? (n0 >> 8) * static_cast<long long>(kColBytes) * (kr / 32) : 0;
-    const float* blk_s = (LAYOUT == KT_TILE8)
+    const float* blk_s = is_tile_layout(LAYOUT)
         ? reinterpret_cast<const float*>(blk + (((n_cols * kr) + 63) & ~static_cast<long long>(63)))
         : nullptr;
 
@@ -173,6 +178,22 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
         for (int h = 0; h < 2; ++h) {
           const uint32_t w[4] = {breg[h].x, breg[h].y, breg[h].z, breg[h].w};
           __nv_bfloat16* row = Bs + (h * 32 + br) * kBld + bc;
+#pragma unroll
+          for (int j = 0; j < 16; ++j) {
+            const uint32_t b = (w[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
+            row[j] = __float2bfloat16(prism_fp8::e4m3_val(b) * sreg);
+          }
+        }
+      } else if constexpr (LAYOUT == KT_TILE8_K1) {
+        // 16 B = k 한 행 × n 16개: 그룹 안 바이트 b0 → 행 b0>>6 (0..31), 첫 n = b0&63.
+        const int byte0 = t8_q * 16;
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const uint32_t w[4] = {breg[h].x, breg[h].y, breg[h].z, breg[h].w};
+          const int b0 = byte0 + h * 1024;
+          const int krow = t8_cc * 32 + (b0 >> 6);
+          const int ncol = t8_gg * 64 + (b0 & 63);
+          __nv_bfloat16* row = Bs + krow * kBld + ncol;
 #pragma unroll
           for (int j = 0; j < 16; ++j) {
             const uint32_t b = (w[j >> 2] >> ((j & 3) * 8)) & 0xFFu;
@@ -344,7 +365,7 @@ inline void grouped_fp8_impl(
   TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(tile_off);
   TensorMatcher({M, K, W_row}).with_dtype<bf16_t>().with_device(cuda_device).verify(out);
   auto S = SymbolicSize{"slab_bytes"};
-  if (layout == KT_TILE8) {
+  if (is_tile_layout(layout)) {
     // slab은 1-D u8(host-register된 kt 메모리)이고 길이는 expert 블록 합이라 N과 무관하다 —
     // n_cols는 인자로 받는다 (노드 N shard 행 수).
     RuntimeCheck(cold_n_cols % 256 == 0, "grouped_fp8_cold: n_cols ", cold_n_cols,
@@ -384,7 +405,7 @@ inline void grouped_fp8_impl(
   RuntimeCheck(aligned16(out.data_ptr()), "grouped_fp8: out must be 16-byte aligned");
 
   F8Slot s0{static_cast<const uint8_t*>(codes.data_ptr()),
-            layout == KT_TILE8 ? nullptr : static_cast<const float*>(scales.data_ptr()),
+            is_tile_layout(layout) ? nullptr : static_cast<const float*>(scales.data_ptr()),
             static_cast<const int32_t*>(row_off.data_ptr()),
             static_cast<const uint16_t*>(kidx.data_ptr()), out_col_offset,
             blk_off ? static_cast<const int64_t*>(blk_off->data_ptr()) : nullptr};
@@ -392,7 +413,7 @@ inline void grouped_fp8_impl(
   const bool fused = (codes_up != nullptr);
   if (fused) {
     RuntimeCheck(row_off_up && kidx_up, "grouped_fp8_gateup: up slot needs its offset tensors");
-    if (layout == KT_TILE8) {
+    if (is_tile_layout(layout)) {
       auto S2 = SymbolicSize{"slab_bytes_up"};
       TensorMatcher({S2}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(*codes_up);
       TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(*row_off_up);
@@ -411,7 +432,7 @@ inline void grouped_fp8_impl(
                  "grouped_fp8_gateup: up out cols [", out_col_offset_up, ",",
                  out_col_offset_up + n_cols, ") invalid for out width ", out_row);
     s1 = F8Slot{static_cast<const uint8_t*>(codes_up->data_ptr()),
-                layout == KT_TILE8 ? nullptr : static_cast<const float*>(scales_up->data_ptr()),
+                is_tile_layout(layout) ? nullptr : static_cast<const float*>(scales_up->data_ptr()),
                 static_cast<const int32_t*>(row_off_up->data_ptr()),
                 static_cast<const uint16_t*>(kidx_up->data_ptr()), out_col_offset_up,
                 blk_off_up ? static_cast<const int64_t*>(blk_off_up->data_ptr()) : nullptr};
@@ -441,6 +462,7 @@ inline void grouped_fp8_impl(
         static_cast<long long>(n_cols), static_cast<long long>(out_row), s0, s1);
   };
   if (layout == KT_TILE8) launch(prism_grouped_gemm_fp8<KT_TILE8>);
+  else if (layout == KT_TILE8_K1) launch(prism_grouped_gemm_fp8<KT_TILE8_K1>);
   else launch(prism_grouped_gemm_fp8<ROWMAJOR>);
 }
 
@@ -454,10 +476,11 @@ void grouped_fp8_cold(
     tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
     tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
     int64_t max_blocks, int64_t n_cols, int64_t layout) {
-  host::RuntimeCheck(layout == KT_TILE8, "grouped_fp8_cold: layout must be 1 (kt fp8 tile)");
+  host::RuntimeCheck(layout == KT_TILE8 || layout == KT_TILE8_K1,
+                     "grouped_fp8_cold: layout must be 1 (kt fp8 k2 tile) or 2 (k1 tile)");
   grouped_fp8_impl(x, pair_sorted, pair_off, tile_off, slab, slab, row_off, kidx, out,
                    out_col_offset, x_row_is_pair, false, max_blocks,
-                   nullptr, nullptr, nullptr, nullptr, 0, KT_TILE8, &blk_off, nullptr, n_cols);
+                   nullptr, nullptr, nullptr, nullptr, 0, static_cast<int>(layout), &blk_off, nullptr, n_cols);
 }
 
 void grouped_fp8_cold_gateup(
@@ -469,11 +492,12 @@ void grouped_fp8_cold_gateup(
     tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
     tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
     int64_t x_row_is_pair, int64_t max_blocks, int64_t n_cols, int64_t layout) {
-  host::RuntimeCheck(layout == KT_TILE8, "grouped_fp8_cold_gateup: layout must be 1");
+  host::RuntimeCheck(layout == KT_TILE8 || layout == KT_TILE8_K1,
+                     "grouped_fp8_cold_gateup: layout must be 1 (k2 tile) or 2 (k1 tile)");
   grouped_fp8_impl(x, pair_sorted, pair_off, tile_off, slab_g, slab_g, row_off_g, kidx_g, out,
                    out_col_offset_g, x_row_is_pair, false, max_blocks,
                    &slab_u, nullptr, &row_off_u, &kidx_u, out_col_offset_u,
-                   KT_TILE8, &blk_off_g, &blk_off_u, n_cols);
+                   static_cast<int>(layout), &blk_off_g, &blk_off_u, n_cols);
 }
 
 void grouped_fp8_indexed(

@@ -120,7 +120,8 @@ class PrismExecutor:
                  cold_hybrid_frac=None, hybrid_local_node: int = 0,
                  warm_cpu_min_m: Optional[int] = None,
                  cold_async: bool = False,
-                 cold_split: bool = False):
+                 cold_split: bool = False,
+                 mask_stats=None):
         """cold_stream: eager에서도 cold submit/sync를 stream 통합으로 (opt-in).
         force_graph_path: 캡처 없이 graph-safe 경로 강제 (테스트/디버그).
         capture_mode_fn: sglang CudaGraphRunner의 capture 구간(캡처 전 워밍업
@@ -195,6 +196,8 @@ class PrismExecutor:
         self._tiers: dict[int, LayerTiers] = {}
         self._layer_has_cold: dict[int, bool] = {}
         self._sparse = plan.sparsity is not None
+        # effective sparsity 실측기 (mask_stats.MaskStats; None = 끔). decode·eager에서만 관측.
+        self._mask_stats = mask_stats
         # cold task가 나중에 읽는 qlen — 주소 고정 멤버 (계약 ④의 포인터 경유)
         self._qlen_pin = torch.zeros(1, dtype=torch.int32)
         # graph 경로 qlen 버퍼는 **bs별로 격리**한다 (Finding A). 캡처가 baked하는
@@ -237,6 +240,8 @@ class PrismExecutor:
             prepared, self._plan, layer_idx, cold_gpu=cold_gpu,
             warm_kt=warm_kt, warm_kt_calib=warm_kt_calib)
         self._layer_has_cold[layer_idx] = has_cold
+        if self._mask_stats is not None:
+            self._mask_stats.register_layer(layer_idx)
         self._layer_cold_gpu[layer_idx] = cold_gpu is not None
         self._layer_warm_kt[layer_idx] = warm_kt is not None
 
@@ -367,6 +372,15 @@ class PrismExecutor:
         # host-block 경로: split이 켜지면 그쪽이 대신한다.
         cold_host_block = (has_cold or warm_cpu_legacy) and not cold_split
 
+        # effective sparsity 실측 — 커널과 같은 입력으로 마스크를 재계산해 누적 (eager decode만;
+        # graph 경로는 파이썬이 replay되지 않으므로 캡처 중 관측하면 워밍업 토큰이 섞인다).
+        stats_on = masking and self._mask_stats is not None and not flow.graph_flow
+        if self._mask_stats is not None and not flow.graph_flow:
+            # NaN 진단은 prefill(m>1)에서도 돈다 — decode 전용 관측이 못 보는 구간이다.
+            self._mask_stats.probe_calls += 1
+            self._mask_stats.probe(layer_idx, "gateup_in", hidden, m)
+        if stats_on:
+            self._mask_stats.observe_gateup(layer_idx, hidden, topk_ids, w32)
         # ── Phase 1: gateup ──────────────────────────────────────────────
         w_ptr = 0
         cold_gu = warm_gu = None
@@ -444,6 +458,10 @@ class PrismExecutor:
         # ~10번 왕복해 층당 2.5 ms였다 (2026-08-27 nsys).
         with _nvtx("rejoin1.acc+silu"):
             act = rejoin_gateup(gu_parts + [cold_gu, warm_gu], inter, swiglu_limit)
+        if self._mask_stats is not None and not flow.graph_flow:
+            self._mask_stats.probe(layer_idx, "act_after_rejoin1", act, m)
+        if stats_on:
+            self._mask_stats.observe_down(layer_idx, act, topk_ids, w32)
 
         # ── Phase 2: down ────────────────────────────────────────────────
         if hybrid:

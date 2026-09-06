@@ -78,6 +78,16 @@ class KtColdBackend:
 
         self._ext = kt_kernel_ext
         self._plan = plan
+        # 커널 키가 함의하는 마스크 규칙(score)과 plan의 score는 같아야 한다 — 페어 커널에 k1
+        # thr(per-k 분위수)를 꽂거나 per-k 커널에 k2wl2를 꽂으면 마스크와 nnz가 조용히 어긋난다.
+        if plan.sparsity is not None:
+            from sglang.srt.layers.moe.prism.kernels import cold_sparsity_score
+
+            want = cold_sparsity_score(plan.kernels.cpu_cold)
+            if plan.sparsity.score != want:
+                raise PlanError(
+                    f"cpu_cold '{plan.kernels.cpu_cold}' masks with score '{want}' but "
+                    f"plan.sparsity.score is '{plan.sparsity.score}'")
         self._max_tokens = max_tokens
         self._num_nodes = num_numa_nodes
         self.cpuinfer = cpuinfer if cpuinfer is not None else kt_kernel_ext.CPUInfer(cpuinfer_threads)
@@ -201,6 +211,29 @@ class KtColdBackend:
         cfg.pool = self.cpuinfer.backend_
         return cfg
 
+    def _sparsity_tables(self, layer_idx: int, bands, thr, what: str = "cold") -> dict:
+        """kt에 주입할 sparsity 테이블. thr 곡선 [E, ng]은 밴드와 무관하므로 절단하지 않는다.
+
+        score k2wl2(페어 커널)는 점수 재료(wn²/pair_dot)도 같이 간다 — wn_sq(=a)는 CalibShard가
+        정의한다 (GPU 측과 같은 형태를 쓰기 위한 단일 정의점; wn을 그냥 넘기면 마스크가 조용히
+        갈린다). score k1(per-k 커널)은 thr 셋만이다 — 밴드에 calib 재료가 없는 것이 정상.
+        """
+        if thr is None:
+            raise PlanError(
+                f"layer {layer_idx}: plan has sparsity but no threshold curves were passed "
+                f"(PreparedWeights.thr, {what})")
+        tables = {"thr_gate": thr[Proj.GATE], "thr_up": thr[Proj.UP], "thr_down": thr[Proj.DOWN]}
+        if not self._plan.sparsity.uses_weight_stats:
+            return tables
+        for name, band in (("gate", bands.gate), ("up", bands.up), ("down", bands.down)):
+            if band.calib is None:
+                raise PlanError(
+                    f"layer {layer_idx}: plan has sparsity ({self._plan.sparsity.score}) but "
+                    f"{what} {name} band carries no calib tables")
+            tables[f"{name}_wn_sq"] = band.calib.wn_sq
+            tables[f"{name}_pair_dot"] = band.calib.pair_dot
+        return tables
+
     # ── Stage 2: 주입 (이후 PendingColdTensors는 호출자가 해제) ──────────
     def load_layer(self, layer_idx: int, cold: PendingColdTensors,
                    thr=None) -> None:
@@ -215,31 +248,7 @@ class KtColdBackend:
 
         tables = None
         if self._plan.sparsity is not None:
-            if thr is None:
-                raise PlanError(
-                    f"layer {layer_idx}: plan has sparsity but no threshold "
-                    f"curves were passed (PreparedWeights.thr)"
-                )
-            for name, band in (("gate", cold.gate), ("up", cold.up), ("down", cold.down)):
-                if band.calib is None:
-                    raise PlanError(
-                        f"layer {layer_idx}: plan has sparsity but cold {name} "
-                        f"band carries no calib tables"
-                    )
-            # wn_sq(=a)는 CalibBand가 정의한다 — GPU 측과 같은 형태를 쓰기
-            # 위한 단일 정의점 (wn을 그냥 넘기면 마스크가 조용히 갈린다).
-            tables = {
-                "gate_wn_sq": cold.gate.calib.wn_sq,
-                "gate_pair_dot": cold.gate.calib.pair_dot,
-                "up_wn_sq": cold.up.calib.wn_sq,
-                "up_pair_dot": cold.up.calib.pair_dot,
-                "down_wn_sq": cold.down.calib.wn_sq,
-                "down_pair_dot": cold.down.calib.pair_dot,
-                # threshold 곡선 [E, ng] — 밴드와 무관하므로 절단하지 않는다.
-                "thr_gate": thr[Proj.GATE],
-                "thr_up": thr[Proj.UP],
-                "thr_down": thr[Proj.DOWN],
-            }
+            tables = self._sparsity_tables(layer_idx, cold, thr)
 
         kernel_key = self._plan.kernels.cpu_cold
         # 스토어 포맷이 정하는 추가 인자 (mxfp4: bf16 배율 셋). 포맷↔커널 호환은 startup 검증.
@@ -290,14 +299,7 @@ class KtColdBackend:
         cfg = self._build_config(layer_idx, warm, n_shards=n_shards)
         tables = None
         if self._plan.sparsity is not None:
-            if thr is None or any(b.calib is None for b in (warm.gate, warm.up, warm.down)):
-                raise PlanError(f"layer {layer_idx}: warm-kt sparse needs calib/thr")
-            tables = {
-                "gate_wn_sq": warm.gate.calib.wn_sq, "gate_pair_dot": warm.gate.calib.pair_dot,
-                "up_wn_sq": warm.up.calib.wn_sq, "up_pair_dot": warm.up.calib.pair_dot,
-                "down_wn_sq": warm.down.calib.wn_sq, "down_pair_dot": warm.down.calib.pair_dot,
-                "thr_gate": thr[Proj.GATE], "thr_up": thr[Proj.UP], "thr_down": thr[Proj.DOWN],
-            }
+            tables = self._sparsity_tables(layer_idx, warm, thr, what="warm-kt")
         wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=self._plan.kernels.cpu_cold)
         wrapper.load_weights_from_tensors(warm.gate.w_flat, warm.up.w_flat, warm.down.w_flat,
                                           sparsity_tables=tables)

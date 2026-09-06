@@ -77,9 +77,21 @@ def ktf8_off(n, k, K):
             + (k >> 5) * 8192 + (n >> 8) * 8192 * (K // 32))
 
 
-def tile_block(codes_ckpt: torch.Tensor, scales_ckpt: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
-    """expert 하나를 kt `GemmKernelTileK2FP8B128::BufferB` 블록(u8 1-D)으로: 타일 코드 N·k B
-    (64 B 올림) + 전치 fp32 배율 [k/128][N/128]. rows = 128-정렬 k 인덱스. N은 256 배수."""
+def ktf8k1_off(n, k, K):
+    """k=1 타일(tile_k1_fp8b128_port.hpp `ktf8k1_off`): 64 B 라인 = k 한 행 × 64 n.
+    super/컬럼/그룹 stride는 k2와 같고 그룹 안 순열만 다르다."""
+    return ((n & 63) + (k & 31) * 64 + ((n >> 6) & 3) * 2048
+            + (k >> 5) * 8192 + (n >> 8) * 8192 * (K // 32))
+
+
+TILE_OFF = {"kt_tile8": ktf8_off, "kt_tile8k1": ktf8k1_off}
+
+
+def tile_block(codes_ckpt: torch.Tensor, scales_ckpt: torch.Tensor, rows: torch.Tensor,
+               layout: str = "kt_tile8") -> torch.Tensor:
+    """expert 하나를 kt fp8 타일 BufferB 블록(u8 1-D)으로: 타일 코드 N·k B (64 B 올림) + 전치 fp32
+    배율 [k/128][N/128]. rows = 128-정렬 k 인덱스. N은 256 배수. layout: kt_tile8(k2) / kt_tile8k1(k1) —
+    `GemmKernelTileK2FP8B128` / `GemmKernelTileK1FP8B128`의 BufferB."""
     N = codes_ckpt.shape[0]
     k = int(rows.numel())
     assert N % 256 == 0 and k % BLK == 0
@@ -87,7 +99,7 @@ def tile_block(codes_ckpt: torch.Tensor, scales_ckpt: torch.Tensor, rows: torch.
     codes = torch.zeros(N * k, dtype=torch.uint8)
     nn = torch.arange(N).view(N, 1).expand(N, k)
     kk = torch.arange(k).view(1, -1).expand(N, k)
-    off = ktf8_off(nn, kk, k)
+    off = TILE_OFF[layout](nn, kk, k)
     codes[off.reshape(-1)] = src.reshape(-1)
     blocks = (rows[0::BLK] // BLK).long()
     sc = scales_ckpt.index_select(1, blocks).t().contiguous().reshape(-1)  # [k/128][N/128] fp32

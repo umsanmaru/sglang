@@ -40,21 +40,30 @@ from sglang.srt.layers.moe.prism.plan import (
     SparsitySpec,
 )
 
-# 논리명 → 자산 키. k2wl2 계열만 (계약 ①: score는 k2wl2로 고정).
-# `*2l` = pairimp(교차항 포함) 곡선, `wn_*` = 열 노름, `c*` = 인접열 내적.
-_ASSET_KEYS: dict[str, str] = {
-    "thr_gate": "tg2l",
-    "thr_up": "tu2l",
-    "thr_down": "td2l",
-    "wn_gate": "wn_g",
-    "wn_up": "wn_u",
-    "wn_down": "wn_d",
-    "pair_dot_gate": "cg",
-    "pair_dot_up": "cu",
-    "pair_dot_down": "cd",
+# 논리명 → 자산 키, score별.
+#   k2wl2: `*2l` = pairimp(교차항 포함) 곡선, `wn_*` = 열 노름, `c*` = 인접열 내적.
+#   k1   : `tg/tu/td` = per-k |x| 분위수 곡선만 (2026-09-05; linear/calib.py의 `_THR_SUFFIX`와 같은 어휘).
+_ASSET_KEYS_BY_SCORE: dict[str, dict[str, str]] = {
+    "k2wl2": {
+        "thr_gate": "tg2l",
+        "thr_up": "tu2l",
+        "thr_down": "td2l",
+        "wn_gate": "wn_g",
+        "wn_up": "wn_u",
+        "wn_down": "wn_d",
+        "pair_dot_gate": "cg",
+        "pair_dot_up": "cu",
+        "pair_dot_down": "cd",
+    },
+    "k1": {
+        "thr_gate": "tg",
+        "thr_up": "tu",
+        "thr_down": "td",
+    },
 }
+_ASSET_KEYS = _ASSET_KEYS_BY_SCORE["k2wl2"]  # 하위 호환 이름 (k2wl2 전체 집합)
 
-_SUPPORTED_SCORES = ("k2wl2",)
+_SUPPORTED_SCORES = tuple(_ASSET_KEYS_BY_SCORE)
 
 
 @dataclass(frozen=True)
@@ -103,13 +112,25 @@ class CalibShard:
 
 
 class CalibTables:
-    """calib 자산의 소유자. per-layer 슬라이스를 뜨는 것 외의 책임은 없다."""
+    """calib 자산의 소유자. per-layer 슬라이스를 뜨는 것 외의 책임은 없다.
 
-    def __init__(self, tables: Mapping[str, torch.Tensor]):
-        missing = sorted(set(_ASSET_KEYS) - set(tables))
+    score가 `k1`이면 thr 곡선만 갖는다 — `slice_band`/`gather_index`는 None을 돌려주고
+    (점수 재료가 없으므로), 소비자(cold_backend)는 thr만 주입한다.
+    """
+
+    def __init__(self, tables: Mapping[str, torch.Tensor], score: str = "k2wl2"):
+        if score not in _ASSET_KEYS_BY_SCORE:
+            raise NotImplementedError(f"calib adapter supports {_SUPPORTED_SCORES}, got '{score}'")
+        keys = _ASSET_KEYS_BY_SCORE[score]
+        missing = sorted(set(keys) - set(tables))
         if missing:
             raise PlanError(f"calib tables missing: {missing}")
-        self._t = {name: tables[name] for name in _ASSET_KEYS}
+        self.score = score
+        self._t = {name: tables[name] for name in keys}
+
+    @property
+    def has_weight_stats(self) -> bool:
+        return "wn_gate" in self._t
 
     # ── 로딩 ─────────────────────────────────────────────────────────────
     @classmethod
@@ -143,9 +164,9 @@ class CalibTables:
         except Exception as err:  # torch가 던지는 예외 종류가 버전마다 다르다
             raise PlanError(f"cannot load calib asset {path}: {err}") from err
         tables = {}
-        for name, key in _ASSET_KEYS.items():
+        for name, key in _ASSET_KEYS_BY_SCORE[spec.score].items():
             if key not in blob:
-                raise PlanError(f"calib asset {path} has no '{key}' (for {name})")
+                raise PlanError(f"calib asset {path} has no '{key}' (for {name}, score {spec.score})")
             t = blob[key]
             if not isinstance(t, torch.Tensor) or t.dim() != 3:
                 raise PlanError(
@@ -153,7 +174,7 @@ class CalibTables:
                     f"got {type(t).__name__}"
                 )
             tables[name] = t.detach().to(torch.float32).contiguous()
-        return cls(tables)
+        return cls(tables, spec.score)
 
     # ── validate_static의 calib_probe ────────────────────────────────────
     def shapes(self) -> dict[str, tuple[int, ...]]:
@@ -175,13 +196,15 @@ class CalibTables:
 
     def slice_band(
         self, layer_idx: int, proj: Proj, start: int, end: int, where: str
-    ) -> CalibBand:
-        """K축 밴드 [start, end)의 점수 재료를 뜬다.
+    ) -> Optional[CalibBand]:
+        """K축 밴드 [start, end)의 점수 재료를 뜬다. score k1이면 None (재료 없음).
 
         페어 경계 정렬은 계약 ①의 핵심이다 — 밴드가 페어를 쪼개면 두 티어가
         같은 페어의 반쪽씩 갖게 되어 어느 쪽도 imp_j를 계산할 수 없다.
         validate_static이 밴드 정렬을 이미 보증하므로 여기 도달은 결함이다.
         """
+        if not self.has_weight_stats:
+            return None
         if start % PAIR_GROUP or end % PAIR_GROUP:
             raise AssertionError(
                 f"{where}: band [{start}, {end}) splits a masking pair "
@@ -200,8 +223,9 @@ class CalibTables:
         ti: TierIndex,
         real_rows: Optional[Sequence[int]],
         where: str,
-    ) -> CalibShard:
+    ) -> Optional[CalibShard]:
         """티어 인덱스로 점수 재료를 모은다 — weight와 **같은 순서, 같은 오프셋**.
+        score k1이면 None (재료 없음 — thr 곡선은 `thr()`로 따로 간다).
 
         같은 인덱스를 쓰는 것이 전부다: 마스크 비트 ↔ packed 타일 대응이
         유지되려면 점수의 행 순서가 gather된 activation·weight의 순서와 같아야
@@ -210,6 +234,8 @@ class CalibTables:
         `real_rows`가 주어지면 그 뒤는 타일 경계까지의 **패딩**이라 0으로 남긴다
         (weight도 0이므로 수치 기여가 없고, kt가 마스크 tail 비트를 끈다).
         """
+        if not self.has_weight_stats:
+            return None
         wn_all = self._t[f"wn_{proj.value}"][layer_idx]        # [E, K]
         pd_all = self._t[f"pair_dot_{proj.value}"][layer_idx]  # [E, K // PAIR_GROUP]
         total = ti.total_rows

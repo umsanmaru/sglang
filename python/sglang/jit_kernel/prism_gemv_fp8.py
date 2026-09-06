@@ -27,7 +27,16 @@ _WRAPPERS = (
     "gemv_fp8_indexed_pinned_gateup",
     "gemv_fp8_indexed_sparse_gateup",
     "gemv_fp8_indexed_pinned_sparse_gateup",
+    # score k1 (per-k |x| >= thr, a/c 없음) — SparseSpec.per_k가 참이면 아래로 간다.
+    "gemv_fp8_indexed_sparsek1",
+    "gemv_fp8_indexed_pinned_sparsek1",
+    "gemv_fp8_indexed_sparsek1_gateup",
+    "gemv_fp8_indexed_pinned_sparsek1_gateup",
 )
+
+
+def _per_k(sp) -> bool:
+    return bool(getattr(sp, "per_k", False))
 
 
 @cache_once
@@ -59,13 +68,16 @@ def _sparse(name):
     def fn(x2d, topk_ids, topk_weights, codes, scales, row_off, kidx, out3d, sp,
            out_col_offset, x_row_is_pair, stream) -> None:
         module = _jit_prism_gemv_fp8_module()
+        tail = (int(out_col_offset), int(bool(x_row_is_pair)),
+                float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid), int(sp.ng), int(sp.renorm_it))
         with torch.cuda.stream(stream):
-            getattr(module, name)(
-                x2d, topk_ids, codes, scales, row_off, kidx, out3d,
-                sp.a, sp.c, sp.thr, topk_weights,
-                int(out_col_offset), int(bool(x_row_is_pair)),
-                float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid),
-                int(sp.ng), int(sp.renorm_it))
+            if _per_k(sp):
+                getattr(module, name.replace("sparse", "sparsek1"))(
+                    x2d, topk_ids, codes, scales, row_off, kidx, out3d, sp.thr, topk_weights, *tail)
+            else:
+                getattr(module, name)(
+                    x2d, topk_ids, codes, scales, row_off, kidx, out3d,
+                    sp.a, sp.c, sp.thr, topk_weights, *tail)
     fn.__name__ = name
     return fn
 
@@ -88,19 +100,25 @@ def _sparse_gateup(name):
     def fn(x2d, topk_ids, topk_weights, codes_g, scales_g, row_off_g, kidx_g,
            codes_u, scales_u, row_off_u, kidx_u, out3d, sp_gate, sp_up,
            out_col_gate, out_col_up, x_row_is_pair, stream) -> None:
-        for f in ("pmax", "grid", "ng", "renorm_it"):
-            if getattr(sp_gate, f) != getattr(sp_up, f):
+        for f in ("pmax", "grid", "ng", "renorm_it", "per_k"):
+            if getattr(sp_gate, f, False) != getattr(sp_up, f, False):
                 raise ValueError(f"gateup fusion requires a shared sparsity budget; "
-                                 f"{f} differs ({getattr(sp_gate, f)} vs {getattr(sp_up, f)})")
+                                 f"{f} differs ({getattr(sp_gate, f, None)} vs {getattr(sp_up, f, None)})")
         module = _jit_prism_gemv_fp8_module()
-        with torch.cuda.stream(stream):
-            getattr(module, name)(
-                x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
-                codes_u, scales_u, row_off_u, kidx_u, out3d,
-                sp_gate.a, sp_gate.c, sp_gate.thr, sp_up.a, sp_up.c, sp_up.thr, topk_weights,
-                int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
+        tail = (int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
                 float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
                 float(sp_gate.pmax), float(sp_gate.grid), int(sp_gate.ng), int(sp_gate.renorm_it))
+        with torch.cuda.stream(stream):
+            if _per_k(sp_gate):
+                getattr(module, name.replace("sparse", "sparsek1"))(
+                    x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
+                    codes_u, scales_u, row_off_u, kidx_u, out3d,
+                    sp_gate.thr, sp_up.thr, topk_weights, *tail)
+            else:
+                getattr(module, name)(
+                    x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
+                    codes_u, scales_u, row_off_u, kidx_u, out3d,
+                    sp_gate.a, sp_gate.c, sp_gate.thr, sp_up.a, sp_up.c, sp_up.thr, topk_weights, *tail)
     fn.__name__ = name
     return fn
 

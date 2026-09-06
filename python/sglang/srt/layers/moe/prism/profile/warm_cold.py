@@ -81,7 +81,10 @@ VARIANTS = ("warm_only", "cold_only", "combined", "combined_eager",
 # 아직 256이다.
 N_ALIGN = {"kt_tile_k2_bf16": 32, "kt_amx_bf16": 32,
            "kt_amx_fp4": 32, "kt_tile_k2_mxfp4": 256,
-           "kt_tile_k2_fp8b128": 256}
+           "kt_tile_k2_fp8b128": 256,
+           # k=1 판 — 같은 fp8 타일(super 256 n), 마스크만 per-k (score k1). 이 커널은
+           # 마스크를 x에서 읽으므로 프로파일이 레벨 x + expert별 thr로 심는다 (common.per_k_*).
+           "kt_tile_k1_fp8b128": 256}
 
 
 # ─── 행 분할 ───────────────────────────────────────────────────────────────
@@ -151,20 +154,37 @@ class WarmTier:
     w_flat [Σₑ k(e), N] pinned, row_off/k_index는 device 상주."""
 
     def __init__(self, shape: Shape, sp: Split, *, sparsity: float, pattern: str,
-                 seed: int, device, node: Optional[int], dtype: str = "bf16"):
-        from sglang.srt.layers.moe.prism.profile.common import sparse_tables
+                 seed: int, device, node: Optional[int], dtype: str = "bf16",
+                 per_k: bool = False, x_levels: Optional[torch.Tensor] = None):
+        """`per_k=True`(score k1)면 마스크를 a/c가 아니라 `x_levels`(K축 레벨 x)와 expert별
+        thr로 실현하고 GPU per-k 진입점(`*_sparsek1`, fp8만)을 쓴다 — `SparseSpec.per_k`."""
+        from sglang.srt.layers.moe.prism.profile.common import per_k_thr, sparse_tables
         from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
         E = shape.experts
         kw = sp.k_warm
         self.split = sp
         self.store = store_of(dtype)
+        self.per_k = per_k
         # 스토어 인자는 포맷이 정한다 (bf16 (w,), mxfp4/fp8 (codes, scales)) — pinned +
         # NUMA 바인딩은 warm의 거처 계약이다 (계약 ③).
         self.parts = self.store.gpu_store(E, kw, sp.n_cols, node=node, seed=seed)
         self.w_flat = self.parts[0]
         self.row_off = (torch.arange(E + 1, dtype=torch.int32) * kw).to(device)
         self.k_index = sp.warm_rows.to(torch.uint16).repeat(E).contiguous().to(device)
+        if per_k:
+            if x_levels is None:
+                raise ValueError("per_k warm tier needs x_levels (common.per_k_levels)")
+            if self.store.name != "fp8":
+                raise ValueError(f"per-k GPU warm exists for fp8 only, not {self.store.name}")
+            thr, keeps, self.keep_frac = per_k_thr(x_levels, [sp.warm_rows] * E, sparsity)
+            self.a_host = torch.stack([k.float() for k in keeps])       # [E, kw] 0/1 (check용)
+            self.spec = SparseSpec(
+                a=None, c=None, thr=thr.to(device),
+                p=SPARSITY_P, lam=SPARSITY_LAM, pmax=PMAX, grid=GRID,
+                ng=NG, renorm_it=RENORM_IT, per_k=True,
+            )
+            return
         a, c, thr, self.keep_frac = sparse_tables(
             E, kw, sparsity, pattern=pattern, seed=seed)
         self.a_host = a.reshape(E, kw)
@@ -228,8 +248,13 @@ class ColdTier:
                  threads: int, kernel_key: str, dtype: str = "bf16",
                  numa_map: Optional[Sequence[int]] = None,
                  rows_per_expert: Optional[Mapping[str, Sequence[int]]] = None,
-                 index_per_expert: Optional[Mapping[str, torch.Tensor]] = None):
+                 index_per_expert: Optional[Mapping[str, torch.Tensor]] = None,
+                 x_levels: Optional[Mapping[str, torch.Tensor]] = None):
         """`sparsity`는 스칼라 또는 expert당 하나의 시퀀스다.
+
+        per-k 커널(`kernel_mask_per_k(kernel_key)`)이면 마스크를 `x_levels[proj]`(K축 레벨 x,
+        없으면 여기서 만든다)와 expert별 thr(밴드 안 순서통계)로 실현한다 — expert마다 다른
+        행 집합·sparsity도 된다. 호출자는 `x_host(group)`가 주는 x를 입력으로 써야 한다.
 
         `rows_per_expert`/`index_per_expert`를 함께 주면 expert마다 **다른 cold 행
         수**를 쓴다 (`splits[proj].k_cold`를 무시한다). 인덱스는 expert 블록을
@@ -324,8 +349,37 @@ class ColdTier:
             self.w[proj] = w
             self.s[proj] = sc
 
+        # 커널이 마스크를 어디서 읽는지는 kt 클래스가 안다 — 페어 커널은 a/c 테이블,
+        # per-k 커널(score k1)은 입력 x와 thr. 테이블 합성 전에 그 사실이 필요하다.
+        from sglang.srt.layers.moe.prism.profile.common import (
+            kernel_mask_per_k, per_k_levels, per_k_thr)
+
+        self.wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=kernel_key)
+        # 옛 kt python(페어 커널만)에는 속성이 없다 → 페어 마스크.
+        self.mask_per_k = (kernel_mask_per_k(kernel_key)
+                           or bool(getattr(self.wrapper, "mask_per_k", False)))
+        # expert별 cold 행 번호 (K축) — 균일이면 전 expert 같은 텐서.
+        self.cold_bands = {}
+        for proj in PROJS:
+            if index_per_expert is None:
+                self.cold_bands[proj] = [splits[proj].cold_rows] * E
+            else:
+                off = torch.tensor((0,) + self.rows[proj]).cumsum(0)
+                full = index_per_expert[proj]
+                self.cold_bands[proj] = [full[off[e]:off[e + 1]] for e in range(E)]
+        self.x_levels = None
+        if self.mask_per_k:
+            self.x_levels = dict(x_levels) if x_levels is not None else {
+                p: per_k_levels(splits[p].axis, pattern=pattern, seed=seed) for p in PROJS}
+
         tables, self.keep_frac, self.a_host = {}, {}, {}
         for proj in PROJS:
+            if self.mask_per_k:
+                thr, keeps, frac = per_k_thr(self.x_levels[proj], self.cold_bands[proj], sparsity)
+                tables[f"thr_{proj}"] = thr
+                self.keep_frac[proj] = frac
+                self.a_host[proj] = [k.float() for k in keeps]
+                continue
             a, c, thr, frac = sparse_tables(
                 E, self.rows[proj], sparsity, pattern=pattern, seed=seed)
             tables[f"{proj}_wn_sq"] = a
@@ -336,14 +390,24 @@ class ColdTier:
             # 둔다 (check의 레퍼런스가 expert 하나씩 읽는다).
             off = torch.tensor((0,) + self.rows[proj]).cumsum(0)
             self.a_host[proj] = [a[off[e]:off[e + 1]] for e in range(E)]
-
-        self.wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=kernel_key)
         scale_kw = ({} if self.s["gate"] is None else
                     dict(gate_scale=self.s["gate"], up_scale=self.s["up"],
                          down_scale=self.s["down"]))
         self.wrapper.load_weights_from_tensors(
             self.w["gate"], self.w["up"], self.w["down"], sparsity_tables=tables,
             **scale_kw)
+
+    def x_host(self, group: str) -> Optional[torch.Tensor]:
+        """per-k 커널이면 입력으로 써야 하는 레벨 x (bf16 [k_axis]); 페어 커널이면 None (x ≡ 1).
+
+        gateup은 x [hidden] (gate/up 공유), down은 act [inter] — 활성 슬롯마다 같은 벡터."""
+        if not self.mask_per_k:
+            return None
+        return self.x_levels["gate" if group == "gateup" else "down"]
+
+    def band(self, proj: str, e: int) -> torch.Tensor:
+        """expert e의 cold 행 번호 (K축) — check가 x를 이 위치에서 읽는다."""
+        return self.cold_bands[proj][e]
 
     def rows_of(self, proj: str) -> int:
         """expert당 cold 행 수의 평균 (균일이면 그 값 그대로) — 바이트 회계용."""
@@ -434,17 +498,25 @@ class WarmColdProfiler:
                           else gpu_numa_node(self.device.index or 0))
         self.store.fmt.warmup()   # JIT 컴파일을 캡처 밖으로
 
+        # score는 cold 커널 키가 함의한다 (plan에서 model-global). per-k면 warm GPU도 per-k
+        # 진입점을 쓰고, 두 티어가 같은 레벨 x를 본다.
+        from sglang.srt.layers.moe.prism.profile.common import kernel_mask_per_k, per_k_levels
+
+        self.per_k = kernel_mask_per_k(cpu_kernel)
+        x_levels = ({p: per_k_levels(self.splits[p].axis, pattern=mask_pattern, seed=seed)
+                     for p in PROJS} if self.per_k else None)
         self.warm = {
             proj: WarmTier(shape, self.splits[proj], sparsity=sparsity,
                            pattern=mask_pattern, seed=seed, device=self.device,
-                           node=self.warm_node, dtype=self.store)
+                           node=self.warm_node, dtype=self.store, per_k=self.per_k,
+                           x_levels=None if x_levels is None else x_levels[proj])
             for proj in PROJS
         }
         self.cold = ColdTier(shape, self.splits, sparsity=sparsity,
                              pattern=mask_pattern, seed=seed,
                              numa_split=numa_split, threads=self.threads,
                              kernel_key=cpu_kernel, dtype=self.store,
-                             numa_map=numa_map)
+                             numa_map=numa_map, x_levels=x_levels)
         self.res = ExecutionResources(ResourceSpec(
             max_tokens=1, top_k=shape.topk, hidden_size=shape.hidden,
             intermediate_size=shape.inter, device=self.device))
@@ -455,12 +527,28 @@ class WarmColdProfiler:
             "sparsity": sparsity, "warm_frac": warm_frac,
             "cold_frac": cold_frac, "numa_split": numa_split,
             "mask_pattern": mask_pattern, "masking": masking, "m": 1,
-            "cpu_kernel": cpu_kernel, "cpuinfer_threads": self.threads,
+            "cpu_kernel": cpu_kernel, "mask_per_k": self.per_k,
+            "cpuinfer_threads": self.threads,
             "numa_nodes": self.cold.nodes, "warm_node": self.warm_node,
             "numa_map": list(numa_map) if numa_map else None,
             "node_tables": self.cold.node_tables,
             "shuffle_index": shuffle_index, "seed": seed,
         }
+
+    # ── 입력 ─────────────────────────────────────────────────────────────
+    def _x_host(self, group: str) -> torch.Tensor:
+        """cold/warm 공용 입력 (host bf16). 페어 커널은 x ≡ 1 — sparsity 합성이
+        x0=x1=1을 전제한다. per-k 커널은 cold 행에 마스크가 심긴 x (살릴 행 1, 죽일 행
+        0; warm/hot 행은 1 그대로라 warm 레퍼런스에 영향이 없다)."""
+        shape, topk = self.shape, self.shape.topk
+        lv = self.cold.x_host(group)
+        if group == "gateup":
+            if lv is None:
+                return torch.ones(1, shape.hidden, dtype=torch.bfloat16)
+            return lv.reshape(1, shape.hidden).clone()
+        if lv is None:
+            return torch.ones(1, topk, shape.inter, dtype=torch.bfloat16)
+        return lv.reshape(1, 1, shape.inter).expand(1, topk, shape.inter).contiguous()
 
     # ── 수명 ─────────────────────────────────────────────────────────────
     def close(self) -> None:
@@ -513,25 +601,26 @@ class WarmColdProfiler:
         device = self.device
         ids_host, ids_dev = self._ids(reps)
 
-        # warm 입력. x는 1.0으로 채운다 — sparsity 합성이 x0=x1=1을 전제한다.
+        # 입력 (`_x_host`): 페어 커널은 1.0, per-k 커널은 마스크가 심긴 x.
+        xh = self._x_host(group)
         if group == "gateup":
-            x = torch.ones(1, shape.hidden, dtype=torch.bfloat16, device=device)
+            x = xh.to(device)
             out = torch.zeros(1, topk, 2 * shape.inter, dtype=torch.bfloat16,
                               device=device)
             cols = {"gate": 0, "up": shape.inter}
             submit = cold.wrapper.submit_forward_gateup
             cold_in = st.x_ptr()
             cold_out = st.partial_gateup_ptr()
-            st.fill_x(torch.ones(1, shape.hidden, dtype=torch.bfloat16))
+            st.fill_x(xh)
         else:
-            x = torch.ones(topk, shape.inter, dtype=torch.bfloat16, device=device)
+            x = xh.reshape(topk, shape.inter).to(device)
             out = torch.zeros(1, topk, shape.hidden, dtype=torch.bfloat16,
                               device=device)
             cols = {"down": 0}
             submit = cold.wrapper.submit_forward_down
             cold_in = st.act_ptr()
             cold_out = st.partial_down_ptr()
-            st.fill_act(torch.ones(1, topk, shape.inter, dtype=torch.bfloat16))
+            st.fill_act(xh)
         topk_w_dev = torch.full((1, topk), 1.0 / topk, dtype=torch.float32,
                                 device=device)
         st.fill_topk_w(topk_w_dev)
@@ -673,6 +762,9 @@ class WarmColdProfiler:
         x ≡ 1이므로 레퍼런스는 "살아있는 행의 W 합"이다 — 마스킹이 빠지면(전부
         dense) sparsity만큼 값이 커져 즉시 드러난다. 마스킹이 조용히 사라져도
         성능만 달라지므로 이 대조가 유일한 검출기다.
+
+        per-k 커널(k1)은 x가 레벨 값이라 레퍼런스가 "살아있는 행의 x_k·W 합"이 되고,
+        죽인 행도 x ≠ 0이므로 마스킹이 빠지면 값이 달라져 여기서 잡힌다.
         """
         if group not in GROUPS:
             raise ValueError(f"unknown group {group!r}")
@@ -689,14 +781,15 @@ class WarmColdProfiler:
         st.fill_topk_w(topk_w)
         report = {}
 
+        xh = self._x_host(group)
         if group == "gateup":
-            x = torch.ones(1, shape.hidden, dtype=torch.bfloat16, device=device)
+            x = xh.to(device)
             out = torch.zeros(1, topk, 2 * shape.inter, dtype=torch.bfloat16,
                               device=device)
             cols = {"gate": 0, "up": shape.inter}
             width = shape.inter
         else:
-            x = torch.ones(topk, shape.inter, dtype=torch.bfloat16, device=device)
+            x = xh.reshape(topk, shape.inter).to(device)
             out = torch.zeros(1, topk, shape.hidden, dtype=torch.bfloat16,
                               device=device)
             cols = {"down": 0}
@@ -705,18 +798,20 @@ class WarmColdProfiler:
         for proj in projs:
             warm[proj].launch(x, ids_dev, topk_w, out, cols[proj], masking=True)
         torch.cuda.synchronize()
+        xvec = xh.reshape(-1)[: (shape.hidden if group == "gateup" else shape.inter)].float()
         for proj in projs:
             tier = warm[proj]
             kw = tier.split.k_warm
-            # 양자화 스토어는 dequant해서 비교한다 — 레퍼런스는 "살아있는 행의 W 합"이고
-            # W는 dtype에 따라 코드×배율이다.
+            # 양자화 스토어는 dequant해서 비교한다 — 레퍼런스는 "살아있는 행의 x_k·W 합"이고
+            # (페어 커널은 x ≡ 1) W는 dtype에 따라 코드×배율이다.
             w_ref = tier.store.dequant(tier.parts, kw, tier.split.n_cols)
+            xw = xvec[tier.split.warm_rows.to(torch.int64)]
             errs = []
             for j in range(topk):
                 e = int(ids[0, j])
                 keep = tier.a_host[e] > 0
                 block = w_ref[e * kw:(e + 1) * kw]
-                ref = block[keep].sum(0)
+                ref = (block[keep] * xw[keep, None]).sum(0)
                 got = out[0, j, cols[proj]:cols[proj] + width].float().cpu()
                 errs.append(float((got - ref).abs().max()
                                   / ref.abs().max().clamp_min(1e-6)))
@@ -725,10 +820,10 @@ class WarmColdProfiler:
         submit = (cold.wrapper.submit_forward_gateup if group == "gateup"
                   else cold.wrapper.submit_forward_down)
         if group == "gateup":
-            st.fill_x(torch.ones(1, shape.hidden, dtype=torch.bfloat16))
+            st.fill_x(xh)
             cold_in, cold_out = st.x_ptr(), st.partial_gateup_ptr()
         else:
-            st.fill_act(torch.ones(1, topk, shape.inter, dtype=torch.bfloat16))
+            st.fill_act(xh)
             cold_in, cold_out = st.act_ptr(), st.partial_down_ptr()
         submit(self._qlen.data_ptr(), topk, st.expert_ids_ptr(), cold_in,
                cold_out, None, st.topk_w_ptr())
@@ -741,7 +836,8 @@ class WarmColdProfiler:
             for j in range(topk):
                 e = int(ids[0, j])
                 keep = cold.a_host[proj][e] > 0
-                ref = blocks[e][:, keep].sum(1)
+                xc = xvec[cold.band(proj, e).to(torch.int64)]
+                ref = (blocks[e][:, keep] * xc[keep][None, :]).sum(1)
                 got = got_all[0, j, pi * n:(pi + 1) * n]
                 errs.append(float((got - ref).abs().max()
                                   / ref.abs().max().clamp_min(1e-6)))

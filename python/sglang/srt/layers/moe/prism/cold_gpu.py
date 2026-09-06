@@ -121,7 +121,7 @@ def build_cold_gpu_layer(
             raise PlanError(f"{where}: kt n {v['n']} != shard rows {n_rows}")
         if (int(v["n_step"]), int(v["k_step"])) != (32, 32):
             raise PlanError(f"{where}: unexpected kt tile {v['n_step']}x{v['k_step']} (loaders assume 32x32)")
-        if layout in ("kt_tile4", "kt_tile8") and int(v["n_block"]) != 256:
+        if layout in ("kt_tile4", "kt_tile8", "kt_tile8k1") and int(v["n_block"]) != 256:
             raise PlanError(f"{where}: tile slab ({layout}) needs n_block 256 (super), "
                             f"got {v['n_block']}")
         expert_off = [int(o) for o in v["expert_off"]]

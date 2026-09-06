@@ -311,9 +311,10 @@ def test_grouped_fp8_gateup_fused():
 
 
 @cuda_required
+@pytest.mark.parametrize("layout", ["kt_tile8", "kt_tile8k1"])
 @pytest.mark.parametrize("exact", [True, False])
-def test_grouped_fp8_cold_tile_matches_gemv(exact):
-    """KT_TILE8 로더: kt `GemmKernelTileK2FP8B128::BufferB` slab을 제자리 읽어 GEMV와 일치."""
+def test_grouped_fp8_cold_tile_matches_gemv(exact, layout):
+    """KT_TILE8 / KT_TILE8_K1 로더: kt fp8 타일 BufferB slab(k2 / k1 순열)을 제자리 읽어 GEMV와 일치."""
     from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed
     from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_cold
     from sglang.srt.layers.moe.prism.grouping import build_grouping
@@ -327,7 +328,7 @@ def test_grouped_fp8_cold_tile_matches_gemv(exact):
     for _ in range(E):
         c_ck, s_ck = random_expert_ckpt(N, K, g, exact=exact)
         rows = aligned_index(K, k_rows, g)
-        blocks.append(tile_block(c_ck, s_ck, rows))
+        blocks.append(tile_block(c_ck, s_ck, rows, layout))
         c, s = row_store(c_ck, s_ck, rows)
         cs.append(c); ss.append(s); kidx.append(rows)
         wref.append(dequant_ckpt(c_ck, s_ck))
@@ -348,7 +349,7 @@ def test_grouped_fp8_cold_tile_matches_gemv(exact):
 
     cold = _Slab()
     cold.slab, cold.blk_off, cold.row_off, cold.k_index = slab, blk_off, row_off, kidx_t
-    cold.n, cold.n_start, cold.layout = N, 0, "kt_tile8"
+    cold.n, cold.n_start, cold.layout = N, 0, layout
     out = torch.zeros_like(ref)
     grouped_fp8_cold(x.cuda(), build_grouping(ids.cuda(), E), cold, out, 0, False, stream)
     torch.cuda.synchronize()
@@ -356,3 +357,121 @@ def test_grouped_fp8_cold_tile_matches_gemv(exact):
         assert torch.equal(out, ref)
     else:
         torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=2e-2)
+
+
+# ── score k1 (per-k |x| >= thr) — fp8 warm worklist 커널의 per-k 마스크 (2026-09-05) ──────────
+
+
+def _sparse_spec_k1(E_, thr_val):
+    from sglang.srt.layers.moe.prism.tiers import SparseSpec
+
+    return SparseSpec(a=None, c=None, thr=torch.full((E_, 4), thr_val, device="cuda"),
+                      p=0.5, lam=0.0, pmax=0.9, grid=0.1, ng=4, renorm_it=1, per_k=True)
+
+
+def _zero_below(x, kidx_c, ro_c, ids, k_rows, thr):
+    """참조 입력: expert 밴드 안에서 |x_k| < thr 인 k를 0으로 (per-k 마스크의 정의)."""
+    M = x.shape[0]
+    xm = [[None] * TOPK for _ in range(M)]
+    for m in range(M):
+        for j in range(TOPK):
+            e = int(ids[m, j]); o0 = int(ro_c[e])
+            rows = kidx_c[o0:o0 + k_rows].long()
+            xr = x[m].clone()
+            band = xr[rows]
+            band[band.float().abs() < thr] = 0
+            xr[rows] = band
+            xm[m][j] = xr
+    return xm
+
+
+@cuda_required
+@pytest.mark.parametrize("pinned", [False, True])
+def test_gemv_fp8_sparsek1_thr0_bitwise_and_masked(pinned):
+    """per-k: thr=0 ↔ dense 비트일치; thr>0 ↔ dense(|x|<thr 인 k를 0으로 둔 x) **비트일치**
+    (죽은 행을 x=0·w=0으로 두므로 항과 순서가 같다)."""
+    from sglang.jit_kernel.prism_gemv_fp8 import (
+        gemv_fp8_indexed, gemv_fp8_indexed_pinned, gemv_fp8_indexed_pinned_sparse,
+        gemv_fp8_indexed_sparse,
+    )
+
+    dense_fn = gemv_fp8_indexed_pinned if pinned else gemv_fp8_indexed
+    sparse_fn = gemv_fp8_indexed_pinned_sparse if pinned else gemv_fp8_indexed_sparse
+    N, K, k_rows, M = 128, 256, 128, 2
+    codes, scales, row_off, kidx, _ = _store(N, K, k_rows, False, seed=61)
+    if pinned:
+        codes, scales = codes.cpu().pin_memory(), scales.cpu().pin_memory()
+    x, ids = _inputs(M, K, False, False, seed=62)
+    stream = torch.cuda.current_stream()
+    w = torch.rand(M, TOPK, generator=torch.Generator().manual_seed(63)).cuda()
+
+    dense = torch.zeros(M, TOPK, N, dtype=torch.bfloat16, device="cuda")
+    dense_fn(x.cuda(), ids.cuda(), codes, scales, row_off, kidx, dense, 0, False, stream)
+    sp0 = torch.zeros_like(dense)
+    sparse_fn(x.cuda(), ids.cuda(), w, codes, scales, row_off, kidx, sp0, _sparse_spec_k1(E, 0.0),
+              0, False, stream)
+    torch.cuda.synchronize()
+    assert torch.equal(dense, sp0)
+
+    thr = 0.5
+    masked = torch.zeros_like(dense)
+    sparse_fn(x.cuda(), ids.cuda(), w, codes, scales, row_off, kidx, masked, _sparse_spec_k1(E, thr),
+              0, False, stream)
+    torch.cuda.synchronize()
+    # 참조: (m, j)마다 마스킹된 x로 dense를 다시 돈다 — 그 슬롯 행만 취한다.
+    xm = _zero_below(x, kidx.cpu(), row_off.cpu(), ids, k_rows, thr)
+    kept = 0
+    for m in range(M):
+        for j in range(TOPK):
+            ref = torch.zeros(1, TOPK, N, dtype=torch.bfloat16, device="cuda")
+            dense_fn(xm[m][j].unsqueeze(0).cuda(), ids[m:m + 1].cuda(), codes, scales, row_off, kidx,
+                     ref, 0, False, stream)
+            torch.cuda.synchronize()
+            assert torch.equal(masked[m, j], ref[0, j]), f"slot ({m},{j})"
+            kept += int((xm[m][j] != 0).sum())
+    assert not torch.equal(masked, dense) and kept > 0
+
+
+@cuda_required
+def test_gemv_fp8_sparsek1_gateup_fused_bitwise():
+    """per-k 융합(warm의 실제 경로) ↔ per-k 2회 launch 비트일치, device/pinned 양쪽. gate/up thr 상이."""
+    from sglang.jit_kernel.prism_gemv_fp8 import (
+        gemv_fp8_indexed_pinned_sparse, gemv_fp8_indexed_pinned_sparse_gateup,
+        gemv_fp8_indexed_sparse, gemv_fp8_indexed_sparse_gateup,
+    )
+
+    N, K, k_rows, M = 256, 512, 256, 3
+    c1, s1, ro1, ki1, _ = _store(N, K, k_rows, False, seed=71)
+    c2, s2, ro2, ki2, _ = _store(N, K, k_rows, False, seed=72)
+    x, ids = _inputs(M, K, False, False, seed=73)
+    w = torch.rand(M, TOPK, generator=torch.Generator().manual_seed(74)).cuda()
+    stream = torch.cuda.current_stream()
+    spg, spu = _sparse_spec_k1(E, 0.3), _sparse_spec_k1(E, 0.6)
+    for single, fused, pin in ((gemv_fp8_indexed_sparse, gemv_fp8_indexed_sparse_gateup, False),
+                               (gemv_fp8_indexed_pinned_sparse, gemv_fp8_indexed_pinned_sparse_gateup, True)):
+        cg, sg, cu, su = (c1, s1, c2, s2) if not pin else (
+            c1.cpu().pin_memory(), s1.cpu().pin_memory(), c2.cpu().pin_memory(), s2.cpu().pin_memory())
+        ref = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
+        single(x.cuda(), ids.cuda(), w, cg, sg, ro1, ki1, ref, spg, 0, False, stream)
+        single(x.cuda(), ids.cuda(), w, cu, su, ro2, ki2, ref, spu, N, False, stream)
+        out = torch.zeros_like(ref)
+        fused(x.cuda(), ids.cuda(), w, cg, sg, ro1, ki1, cu, su, ro2, ki2, out, spg, spu, 0, N, False, stream)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref), f"pinned={pin}"
+        assert torch.count_nonzero(out) > 0
+
+
+@cuda_required
+def test_gemv_fp8_sparsek1_rejects_mixed_modes():
+    """gate(per-k)와 up(페어)을 한 launch로 융합할 수 없다."""
+    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed_sparse_gateup
+
+    N, K, k_rows, M = 128, 256, 128, 1
+    c1, s1, ro1, ki1, _ = _store(N, K, k_rows, False, seed=81)
+    x, ids = _inputs(M, K, False, False, seed=82)
+    w = torch.rand(M, TOPK).cuda()
+    out = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="per_k"):
+        gemv_fp8_indexed_sparse_gateup(x.cuda(), ids.cuda(), w, c1, s1, ro1, ki1, c1, s1, ro1, ki1, out,
+                                       _sparse_spec_k1(E, 0.3), _sparse_spec(E, E * k_rows, 5, 0.3),
+                                       0, N, False, torch.cuda.current_stream())

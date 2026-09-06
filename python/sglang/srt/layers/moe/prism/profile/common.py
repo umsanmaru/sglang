@@ -419,10 +419,13 @@ def tier_index(k_axis: int, k_rows: int, *, skip: int = 0,
 def sparse_tables(experts: int, k_rows, sparsity, *,
                   pattern: str = "random", seed: int = 0,
                   ng: int = NG, thr: float = THR_CONST):
-    """요청 sparsity를 정확히 실현하는 (a, c, thr_tab, 실현 keep 비율).
+    """요청 sparsity를 정확히 실현하는 (a, c, thr_tab, 실현 keep 비율) — **페어 마스크**(k2wl2).
 
     a: fp32 [Σₑ k(e)] — wn². c: fp32 [Σₑ k(e)/2] — 0. thr_tab: fp32 [E, ng].
     모두 weight 스토어와 같은 오프셋(expert 블록 이어붙인 flat)이다.
+
+    per-k 마스크 커널(score `k1`)은 a/c를 읽지 않으므로 이 함수가 아니라
+    `per_k_levels` + `per_k_thr`로 실현한다 (마스크가 입력 x와 expert별 thr에 실린다).
 
     `k_rows`와 `sparsity`는 스칼라(균일) 또는 expert당 하나의 시퀀스다 — 실제
     plan은 둘 다 expert마다 다르다(티어 경계는 중요도 곡선이, sparsity는 라우터
@@ -465,6 +468,104 @@ def sparse_tables(experts: int, k_rows, sparsity, *,
         torch.full((experts, ng), thr, dtype=torch.float32).contiguous(),
         kept / total if total else 1.0,
     )
+
+
+# ─── per-k 마스크 (score k1) 합성 ────────────────────────────────────────────
+# per-k 커널(kt `kt_tile_k1_fp8b128`, GPU fp8 `*_sparsek1`)의 마스크는 `keep_k = |x_k| ≥ thr[e]`
+# 하나다 — 가중치 통계(a/c)가 없으니 마스크를 심을 자리는 **입력 x**와 **expert별 thr**
+# 둘뿐이다. x는 활성 expert 전부가 공유하므로 x에는 행마다 다른 **레벨**(크기 순위)을 주고,
+# expert·티어마다 자기 밴드 안의 **순서통계**로 thr를 잡는다:
+#
+#   x_k   = level(rank_k)          rank는 K축 순열(random) 또는 위치 순(block)
+#   thr_e = 밴드 B_e 안 레벨의 keep_n(e)번째 큰 값   → keep = {k ∈ B_e : x_k ≥ thr_e}
+#
+# 레벨은 bf16 비트 패턴 연속 구간이라 서로 다른 값이 정확히 표현되고(비교는 비트 동치),
+# 크기는 [0.125, 2)에 머물러 레퍼런스 정밀도를 해치지 않는다. 레벨 수(512)보다 밴드 행이
+# 많으면 같은 레벨의 행(≤ ⌈K_b/512⌉)이 경계에서 묶여 실현 keep이 요청과 그만큼 어긋날 수
+# 있다 — 그래서 `per_k_thr`는 두 후보 thr 중 요청에 가까운 쪽을 고르고 **실현값을 반환**한다.
+# 레퍼런스는 x ≡ 1이 아니므로 "살아있는 행의 x_k·W 합"이다 (죽인 행도 x ≠ 0 → 마스킹이
+# 빠지면 값이 달라져 검출된다. 0/1을 심는 방식은 이 검출력이 없었다).
+PER_K_LEVELS = 512
+_PER_K_BASE_BITS = 0x3E00        # bf16 0.125; +511 → 0x3FFF ≈ 1.996
+
+
+def _bf16_from_bits(bits: torch.Tensor) -> torch.Tensor:
+    return bits.to(torch.int16).view(torch.bfloat16)
+
+
+def per_k_levels(k_axis: int, *, pattern: str = "random", seed: int = 0,
+                 levels: int = PER_K_LEVELS) -> torch.Tensor:
+    """K축 행마다 레벨 값 — bf16 [k_axis], 값은 서로 다른 bf16 `levels`개 중 하나.
+
+    random: 시드 고정 순열의 순위. block: 앞 행이 큰 값(→ 어느 밴드에서든 앞쪽 행이 산다).
+    같은 (k_axis, pattern, seed)면 같은 벡터 — gate/up처럼 K축을 공유하는 proj가 같은 x를 본다.
+    """
+    if pattern not in ("random", "block"):
+        raise ValueError(f"unknown mask pattern {pattern!r} (random|block)")
+    if not 1 <= levels <= 512:
+        raise ValueError(f"levels must be in [1, 512], got {levels}")
+    if pattern == "block":
+        rank = torch.arange(k_axis)                       # 앞 행 = 높은 레벨
+    else:
+        g = torch.Generator().manual_seed(seed)
+        rank = torch.randperm(k_axis, generator=g)
+    lvl = (levels - 1) - (rank * levels) // k_axis          # [0, levels)
+    return _bf16_from_bits(_PER_K_BASE_BITS + lvl).contiguous()
+
+
+def per_k_thr(x_levels: torch.Tensor, bands: Sequence[torch.Tensor], sparsity, *,
+              ng: int = NG) -> tuple:
+    """expert별 밴드에서 요청 sparsity를 실현하는 (thr_tab [E, ng] fp32, keep 목록, 실현 keep 비율).
+
+    `bands[e]`는 expert e의 이 티어 행 번호(K축) [k_e] — expert마다 다른 행 수·집합이어도 된다
+    (full_layer). `keep[e]`는 bands[e]와 같은 순서의 bool [k_e]. 실현 keep 비율은 행 수 가중.
+    thr 곡선은 grid와 무관하게 expert별 상수다 (커널이 어느 grid 점을 읽어도 같은 값).
+    """
+    E = len(bands)
+    sps = per_expert(sparsity, E, "sparsity")
+    lv = x_levels.float()
+    thr = torch.empty(E, ng, dtype=torch.float32)
+    keeps, kept, total = [], 0, 0
+    for e, (idx, sp) in enumerate(zip(bands, sps)):
+        if not 0.0 <= sp <= 1.0:
+            raise ValueError(f"sparsity[{e}] must be in [0, 1], got {sp}")
+        v = lv[idx.to(torch.int64).reshape(-1)]
+        kb = v.numel()
+        keep_n = int(round(kb * (1.0 - sp)))
+        if kb == 0:
+            t = 4.0
+        elif keep_n >= kb:
+            t = float(v.min())                              # 전부 산다
+        elif keep_n <= 0:
+            t = 4.0                                         # 전부 죽는다 (레벨 최대 < 2)
+        else:
+            vs = v.sort(descending=True).values
+            lo = float(vs[keep_n - 1])                      # ≥ lo → keep_n개 + 동률
+            hi = float(_bf16_from_bits(vs[keep_n].to(torch.bfloat16).view(torch.int16) + 1))
+            n_lo = int((v >= lo).sum())
+            n_hi = int((v >= hi).sum())
+            t = lo if abs(n_lo - keep_n) <= abs(n_hi - keep_n) else hi
+        keep = v >= t
+        thr[e].fill_(t)
+        keeps.append(keep)
+        kept += int(keep.sum())
+        total += kb
+    return thr.contiguous(), keeps, (kept / total if total else 1.0)
+
+
+def kernel_mask_per_k(kernel_key: str) -> bool:
+    """이 cold 커널 키의 마스크가 per-k(score k1)인가 — kt 클래스가 선언한 값. 옛 kt(속성 없음)는 False."""
+    try:
+        from kt_kernel.experts_partial import _PARTIAL_MOE_CLASSES
+    except ImportError:
+        return False
+    make = _PARTIAL_MOE_CLASSES.get(kernel_key)
+    if make is None:
+        return False
+    try:
+        return bool(getattr(make(), "mask_per_k", False))
+    except Exception:
+        return False
 
 
 # ─── 타이머 ────────────────────────────────────────────────────────────────

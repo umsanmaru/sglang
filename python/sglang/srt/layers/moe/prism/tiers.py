@@ -50,8 +50,8 @@ class SparseSpec:
     상수 묶음이고, 가중은 스텝마다 갈리므로 `run`의 인자로 온다.
     """
 
-    a: torch.Tensor      # [Σₑ k[e]] fp32 — wn² (weight와 같은 오프셋)
-    c: torch.Tensor      # [Σₑ k[e] / 2] fp32 — 인접열 내적
+    a: Optional[torch.Tensor]  # [Σₑ k[e]] fp32 — wn² (weight와 같은 오프셋). k1이면 None
+    c: Optional[torch.Tensor]  # [Σₑ k[e] / 2] fp32 — 인접열 내적. k1이면 None
     thr: torch.Tensor    # [E, ng] fp32 — sparsity → threshold 곡선
     p: float
     lam: float
@@ -59,6 +59,9 @@ class SparseSpec:
     grid: float
     ng: int
     renorm_it: int
+    # score k1 (2026-09-05): 마스크가 per-k |x_k| >= thr — 커널이 a/c를 읽지 않는다. fp8 worklist
+    # 커널만 per-k 진입점(sparsek1)을 갖는다 (prism_gemv_fp8.py가 이 플래그로 고른다).
+    per_k: bool = False
 
 
 class GpuTier(Protocol):
@@ -593,17 +596,28 @@ def _sparse_spec(
     layer×proj 단위로만 굽는다. expert마다 다른 예산을 쓰려면 양쪽을 같이 고쳐야
     한다.
     """
+    spec = plan.sparsity
+    if spec is None:
+        raise ValueError(f"{where}: sparse tier requested but plan has no sparsity")
+    ep = plan.expert(layer_idx, 0).proj(proj)
+    dev = shard.row_off.device
+    if not spec.uses_weight_stats:
+        # score k1: 재료는 thr 곡선만. per-k 진입점은 fp8 worklist 커널에만 있다.
+        if shard.fmt.name != "fp8":
+            raise NotImplementedError(
+                f"{where}: sparsity score '{spec.score}' (per-k) has a GPU kernel only for the fp8 "
+                f"store, not {shard.fmt.name}")
+        return SparseSpec(
+            a=None, c=None, thr=thr.to(dev, torch.float32),
+            p=float(ep.sparsity_p), lam=float(ep.sparsity_lambda),
+            pmax=spec.pmax, grid=spec.grid, ng=spec.ng, renorm_it=spec.renorm_it, per_k=True,
+        )
     calib = shard.calib
     if calib is None:
         raise ValueError(
             f"{where}: plan has sparsity but this tier carries no calib shard "
             f"— prepare_layer_weights가 calib을 받지 못했다"
         )
-    spec = plan.sparsity
-    if spec is None:
-        raise ValueError(f"{where}: sparse tier requested but plan has no sparsity")
-    ep = plan.expert(layer_idx, 0).proj(proj)
-    dev = shard.row_off.device
     return SparseSpec(
         a=calib.wn_sq.to(dev, torch.float32),
         c=calib.pair_dot.to(dev, torch.float32),
@@ -688,7 +702,9 @@ def build_layer_tiers(
                 raise ValueError(f"layer {layer_idx}: warm-kt {name} needs exactly one slab, got {len(slabs)}")
         if Tier.WARM in gateup or Tier.WARM in down:
             raise ValueError(f"layer {layer_idx}: warm-kt and row-major warm cannot coexist")
-        sparse_warm = sparse_on and Tier.WARM in SPARSE_TIERS and warm_kt_calib is not None
+        # warm-kt(bf16 packed slab)의 sparse 커널은 k2wl2만 있다 — score k1(per-k)이면 dense.
+        sparse_warm = (sparse_on and Tier.WARM in SPARSE_TIERS and warm_kt_calib is not None
+                       and plan.sparsity.uses_weight_stats)
         def spec(proj, slab):
             if not sparse_warm:
                 return None

@@ -48,6 +48,7 @@ def test_gpu_kernel_key_implies_store_format():
     fmt = gpu_store_format("gemv_worklist_mxfp4")
     assert fmt.name == "mxfp4" and fmt.k_align == 32 and fmt.cold_kernels == ("kt_amx_fp4", "kt_tile_k2_mxfp4")
     fmt8 = gpu_store_format("gemv_worklist_fp8")
-    assert fmt8.name == "fp8" and fmt8.k_align == 128 and fmt8.cold_kernels == ("kt_tile_k2_fp8b128",)
+    assert fmt8.name == "fp8" and fmt8.k_align == 128
+    assert fmt8.cold_kernels == ("kt_tile_k2_fp8b128", "kt_tile_k1_fp8b128")  # k2(페어) / k1(per-k) 타일
     with pytest.raises(KernelError):
         gpu_store_format("nope")

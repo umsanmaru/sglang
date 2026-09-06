@@ -15,6 +15,13 @@
   mxfp4    gemv_mxfp4_*          kt_tile_k2_mxfp4     32       codes [Σk/2, N] + E8M0 [Σk/32, N]
   fp8      gemv_fp8_*            kt_tile_k2_fp8b128   128      codes [Σk, N] + fp32 [Σk/128, N/128]
 
+`cpu_kernel=`로 같은 dtype 안의 다른 cold 커널을 고른다. fp8의 `kt_tile_k1_fp8b128`은
+per-k 마스크 커널(score `k1`, `keep_k = |x_k| ≥ thr`)이다. 이때 프로파일은 마스크를 a/c
+테이블이 아니라 **입력 x의 레벨 + expert별 thr(순서통계)** 로 실현하고(`common.per_k_levels`,
+`per_k_thr`), GPU warm도 같은 x·thr로 per-k 커널(`*_sparsek1`)을 쓴다. expert마다 다른
+sparsity·티어 경계(full_layer)도 실현되며, 실현 keep은 레벨 동률만큼 요청과 어긋날 수 있어
+리포트의 `keep_frac`이 진짜 값이다.
+
 정렬이 dtype마다 다른 것은 배율 블록이 원본 행 블록에 걸려 있기 때문이다 (계약 ①) —
 티어가 그 블록을 쪼개면 "블록당 배율 1"이 깨진다. `hot_frac`/`warm_frac`의 행 반올림도
 그 값을 따른다.
@@ -116,6 +123,10 @@ from sglang.srt.layers.moe.prism.profile.common import (
     nvtx,
     select_device,
     per_expert,
+    PER_K_LEVELS,
+    kernel_mask_per_k,
+    per_k_levels,
+    per_k_thr,
     sparse_tables,
     split_rows,
     split_rows_varied,
@@ -162,7 +173,7 @@ __all__ = [
     # 구성 요소 (직접 조립할 때)
     "WarmTier", "ColdTier", "make_split", "footprint", "node_table",
     "GpuTier", "L2Flush", "build_splits",
-    "sparse_tables", "tier_index", "tier_indices", "split_rows",
+    "sparse_tables", "per_k_levels", "per_k_thr", "kernel_mask_per_k", "PER_K_LEVELS", "tier_index", "tier_indices", "split_rows",
     "split_rows_varied", "spread_values", "per_expert",
     "graph_timing", "host_timing", "nvtx",
     # 헬퍼 / 상수

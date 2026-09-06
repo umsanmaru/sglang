@@ -20,8 +20,8 @@ from sglang.jit_kernel.utils import cache_once, load_jit
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# cold slab 레이아웃 (C++ enum Layout): fp8 타일 (tile_k2_fp8b128)만.
-COLD_LAYOUTS = {"kt_tile8": 1}
+# cold slab 레이아웃 (C++ enum Layout): fp8 k2 타일 (tile_k2_fp8b128) / k1 타일 (tile_k1_fp8b128).
+COLD_LAYOUTS = {"kt_tile8": 1, "kt_tile8k1": 2}
 
 _WRAPPERS = (
     "grouped_fp8_indexed",

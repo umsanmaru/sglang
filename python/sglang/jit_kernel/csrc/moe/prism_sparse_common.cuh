@@ -26,14 +26,18 @@ struct SparseIn {
   tvm::ffi::TensorView a, c, thr, topk_w;
   double p, lam, pmax, grid;
   int64_t ng, renorm_it;
+  // score k1 (per-k, 2026-09-05): 마스크가 |x_k| >= thr 하나라 a/c를 쓰지 않는다 — 호출자는
+  // a/c 자리에 아무 텐서(관례상 thr)를 넣고 per_k=true를 준다. fill 쪽이 a/c 검증을 건너뛴다.
+  bool per_k = false;
 };
 
-// 이 (m, j)의 임계값 제곱. 전 스레드가 중복 계산한다 — top_k(≤16)짜리 루프라
+// 이 (m, j)의 임계값(비제곱). 전 스레드가 중복 계산한다 — top_k(≤16)짜리 루프라
 // syncthreads 한 번보다 싸고, 공유 상태가 없어 결정적이다. host RuntimeCheck가
-// top_k ≤ 16을 보증한다.
-__device__ __forceinline__ float sparse_thr2(const SparseArgs& sp, long long m,
-                                             long long pair, long long e,
-                                             long long top_k) {
+// top_k ≤ 16을 보증한다. k2wl2는 thr²와 페어 에너지를, k1은 thr와 |x_k|를 비교한다
+// (kt build_k_mask와 같은 비교 — bf16→fp32는 정확하므로 양쪽 마스크가 비트 동일).
+__device__ __forceinline__ float sparse_thr(const SparseArgs& sp, long long m,
+                                            long long pair, long long e,
+                                            long long top_k) {
   constexpr int MAXK = 16;
   float sv[MAXK];
   const float* wj = sp.topk_w + m * top_k;
@@ -58,9 +62,19 @@ __device__ __forceinline__ float sparse_thr2(const SparseArgs& sp, long long m,
   long long gi = static_cast<long long>(rintf(sv[pair % top_k] / sp.grid));
   if (gi < 0) gi = 0;
   if (gi > static_cast<long long>(sp.ng) - 1) gi = static_cast<long long>(sp.ng) - 1;
-  const float thr = sp.thr_tab[e * static_cast<long long>(sp.ng) + gi];
-  return thr * thr;  // kt도 제곱 비교다 (sqrt를 양쪽 다 생략)
+  return sp.thr_tab[e * static_cast<long long>(sp.ng) + gi];
 }
+
+// k2wl2용 임계값 제곱 (kt도 제곱 비교다 — sqrt를 양쪽 다 생략).
+__device__ __forceinline__ float sparse_thr2(const SparseArgs& sp, long long m,
+                                             long long pair, long long e,
+                                             long long top_k) {
+  const float thr = sparse_thr(sp, m, pair, e, top_k);
+  return thr * thr;
+}
+
+// score k1: keep_k = |x_k| >= thr (kt k_mask.hpp와 같은 판정).
+__device__ __forceinline__ bool keep_k(float x, float thr) { return fabsf(x) >= thr; }
 
 // 페어 (절대 행 ar = 2·pair_id)의 에너지: a[ar]·x0² + a[ar+1]·x1² + 2·c[ar/2]·x0·x1, 음수는 0.
 __device__ __forceinline__ float pair_energy(const SparseArgs& sp, long long ar,

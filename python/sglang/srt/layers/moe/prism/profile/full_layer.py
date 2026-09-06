@@ -158,7 +158,11 @@ class GpuTier:
     def __init__(self, shape: Shape, split: ProjSplit, tier: str, *,
                  sparsity=0.0, pattern: str = "random", device,
                  node: Optional[int] = None, dtype: str = "bf16",
-                 seed: int = 0):
+                 seed: int = 0, per_k: bool = False,
+                 x_levels: Optional[torch.Tensor] = None):
+        """`per_k`(score k1)면 warm 마스크를 a/c 대신 `x_levels`(K축 레벨 x) + expert별 thr
+        (자기 warm 밴드 안 순서통계)로 실현하고 GPU per-k 진입점(fp8 `*_sparsek1`)을 쓴다."""
+        from sglang.srt.layers.moe.prism.profile.common import per_k_thr
         from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
         E = shape.experts
@@ -180,7 +184,20 @@ class GpuTier:
         self.keep_frac = 1.0
         self.spec = None
         self.a_host = None
-        if self.masking:
+        self.per_k = per_k and self.masking
+        if self.per_k:
+            if x_levels is None:
+                raise ValueError("per_k warm tier needs x_levels (common.per_k_levels)")
+            if self.store.name != "fp8":
+                raise ValueError(f"per-k GPU warm exists for fp8 only, not {self.store.name}")
+            idx = split.idx(tier)
+            bands = [idx[int(off[e]):int(off[e + 1])] for e in range(E)]
+            thr, keeps, self.keep_frac = per_k_thr(x_levels, bands, sparsity)
+            self.a_host = torch.cat([k.float() for k in keeps])   # [Σₑ rows] 0/1 (check용)
+            self.spec = SparseSpec(a=None, c=None, thr=thr.to(device),
+                                   p=SPARSITY_P, lam=SPARSITY_LAM, pmax=PMAX,
+                                   grid=GRID, ng=NG, renorm_it=RENORM_IT, per_k=True)
+        elif self.masking:
             a, c, thr, self.keep_frac = sparse_tables(
                 E, self.rows, sparsity, pattern=pattern, seed=seed)
             self.a_host = a           # check의 레퍼런스가 마스크로 쓴다
@@ -315,12 +332,20 @@ class FullLayerProfiler:
             cold_spread=cold_spread, dtype=self.store, shuffle=shuffle_index,
             seed=seed)
 
+        # score는 cold 커널 키가 함의한다 — per-k면 warm GPU도 per-k, 세 티어가 같은 레벨 x를 본다.
+        from sglang.srt.layers.moe.prism.profile.common import kernel_mask_per_k, per_k_levels
+
+        self.per_k = kernel_mask_per_k(cpu_kernel)
+        self.x_levels = ({p: per_k_levels(self.splits[p].k_axis, pattern=mask_pattern, seed=seed)
+                          for p in PROJS} if self.per_k else None)
         self.hot = {p: GpuTier(shape, self.splits[p], "hot", device=self.device,
                                dtype=self.store, seed=seed + 1) for p in PROJS}
         self.warm = {p: GpuTier(shape, self.splits[p], "warm",
                                 sparsity=self.sparsity, pattern=mask_pattern,
                                 device=self.device, node=self.warm_node,
-                                dtype=self.store, seed=seed + 2) for p in PROJS}
+                                dtype=self.store, seed=seed + 2, per_k=self.per_k,
+                                x_levels=None if self.x_levels is None else self.x_levels[p])
+                     for p in PROJS}
         # cold는 `ColdTier`가 굽는다 (kt config 배관을 한 곳에 둔다). 가변 행 수는
         # rows/index를 따로 넘겨서 준다 — kt는 row_off[-1] 기준으로 검증한다.
         cold_splits = {p: Split(proj=p, axis=self.splits[p].k_axis,
@@ -333,7 +358,8 @@ class FullLayerProfiler:
             seed=seed, numa_split=numa_split, threads=self.threads,
             kernel_key=cpu_kernel, dtype=self.store, numa_map=numa_map,
             rows_per_expert={p: self.splits[p].cold for p in PROJS},
-            index_per_expert={p: self.splits[p].cold_idx for p in PROJS})
+            index_per_expert={p: self.splits[p].cold_idx for p in PROJS},
+            x_levels=self.x_levels)
 
         self.res = ExecutionResources(ResourceSpec(
             max_tokens=1, top_k=shape.topk, hidden_size=shape.hidden,
@@ -348,7 +374,7 @@ class FullLayerProfiler:
             "sparsity_min": round(min(self.sparsity), 4),
             "sparsity_max": round(max(self.sparsity), 4),
             "sparsity_spread": sparsity_spread,
-            "mask_pattern": mask_pattern, "cpu_kernel": cpu_kernel,
+            "mask_pattern": mask_pattern, "cpu_kernel": cpu_kernel, "mask_per_k": self.per_k,
             "cpuinfer_threads": self.threads, "numa_split": numa_split,
             "numa_nodes": self.cold.nodes, "numa_map": list(numa_map) if numa_map else None,
             "warm_node": self.warm_node, "node_tables": self.cold.node_tables,
@@ -417,6 +443,16 @@ class FullLayerProfiler:
         with nvtx("full/flush"):
             return graph_timing(lambda i: self.flush(), reps, replays=replays)
 
+    def _x_host(self, group: str) -> torch.Tensor:
+        """세 티어 공용 입력 (host bf16). 페어 커널은 1.0, per-k 커널은 레벨 x."""
+        shape, topk = self.shape, self.shape.topk
+        lv = None if self.x_levels is None else self.x_levels["gate" if group == "gateup" else "down"]
+        if group == "gateup":
+            return (torch.ones(1, shape.hidden, dtype=torch.bfloat16) if lv is None
+                    else lv.reshape(1, shape.hidden).clone())
+        return (torch.ones(1, topk, shape.inter, dtype=torch.bfloat16) if lv is None
+                else lv.reshape(1, 1, shape.inter).expand(1, topk, shape.inter).contiguous())
+
     def measure(self, group: str = "gateup", *, reps: int = 50,
                 replays: int = 10, flush: bool = True, rounds: int = 3,
                 only: Optional[Sequence[str]] = None) -> LayerGroupReport:
@@ -451,20 +487,21 @@ class FullLayerProfiler:
         st.fill_topk_w(tw)
         w_ptr = st.topk_w_ptr()
 
-        # x ≡ 1 — sparsity 합성이 x0=x1=1을 전제한다 (common.py의 역산).
+        # 입력: 페어 커널은 x ≡ 1 (sparsity 합성이 x0=x1=1 전제), per-k는 레벨 x (`_x_host`).
+        xh = self._x_host(group)
         if group == "gateup":
-            x = torch.ones(1, shape.hidden, dtype=torch.bfloat16, device=dev)
+            x = xh.to(dev)
             width = 2 * shape.inter
             submit = self.cold.wrapper.submit_forward_gateup
             cold_in, cold_out = st.x_ptr(), st.partial_gateup_ptr()
-            st.fill_x(torch.ones(1, shape.hidden, dtype=torch.bfloat16))
+            st.fill_x(xh)
             pair = False
         else:
-            x = torch.ones(topk, shape.inter, dtype=torch.bfloat16, device=dev)
+            x = xh.reshape(topk, shape.inter).to(dev)
             width = shape.hidden
             submit = self.cold.wrapper.submit_forward_down
             cold_in, cold_out = st.act_ptr(), st.partial_down_ptr()
-            st.fill_act(torch.ones(1, topk, shape.inter, dtype=torch.bfloat16))
+            st.fill_act(xh)
             pair = True
         out_hot = torch.zeros(1, topk, width, dtype=torch.bfloat16, device=dev)
         out_warm = torch.zeros(1, topk, width, dtype=torch.bfloat16, device=dev)
@@ -620,8 +657,8 @@ class FullLayerProfiler:
     def check(self, group: str = "gateup", *, seed: int = 7) -> dict:
         """세 티어 partial의 합을 합성 마스크 레퍼런스와 대조한다.
 
-        x ≡ 1이므로 레퍼런스는 "살아있는 행의 W 합"이다 — hot은 전 행(dense),
-        warm·cold는 keep 마스크가 산 행만. 마스킹이 조용히 사라지면 성능만
+        레퍼런스는 "살아있는 행의 x_k·W 합"이다 (페어 커널은 x ≡ 1, per-k 커널은 레벨 x) —
+        hot은 전 행(dense), warm·cold는 keep 마스크가 산 행만. 마스킹이 조용히 사라지면 성능만
         달라지므로 이 대조가 유일한 검출기다. 티어 경계가 expert마다 다른
         구성에서는 `row_off`가 어긋나도 여기서 드러난다.
         """
@@ -645,18 +682,20 @@ class FullLayerProfiler:
         tw = torch.full((1, topk), 1.0 / topk, dtype=torch.float32, device=dev)
         st.fill_topk_w(tw)
 
+        xh = self._x_host(group)
         if group == "gateup":
-            x = torch.ones(1, shape.hidden, dtype=torch.bfloat16, device=dev)
+            x = xh.to(dev)
             width = 2 * shape.inter
             submit = self.cold.wrapper.submit_forward_gateup
             cold_in, cold_out = st.x_ptr(), st.partial_gateup_ptr()
-            st.fill_x(torch.ones(1, shape.hidden, dtype=torch.bfloat16))
+            st.fill_x(xh)
         else:
-            x = torch.ones(topk, shape.inter, dtype=torch.bfloat16, device=dev)
+            x = xh.reshape(topk, shape.inter).to(dev)
             width = shape.hidden
             submit = self.cold.wrapper.submit_forward_down
             cold_in, cold_out = st.act_ptr(), st.partial_down_ptr()
-            st.fill_act(torch.ones(1, topk, shape.inter, dtype=torch.bfloat16))
+            st.fill_act(xh)
+        xvec = xh.reshape(-1)[: (shape.hidden if group == "gateup" else shape.inter)].float()
         out_hot = torch.zeros(1, topk, width, dtype=torch.bfloat16, device=dev)
         out_warm = torch.zeros(1, topk, width, dtype=torch.bfloat16, device=dev)
 
@@ -690,18 +729,21 @@ class FullLayerProfiler:
             errs = []
             for j in range(topk):
                 e = int(ids_host[0, j])
+                # 레퍼런스 = 살아있는 행의 x_k·W 합 (페어 커널은 x ≡ 1, per-k는 레벨 x).
                 ref = torch.zeros(n, dtype=torch.float32)
                 for tier in (self.hot[proj], self.warm[proj]):
                     beg = sum(tier.rows[:e])
                     end = beg + tier.rows[e]
                     block = deq(tier.parts[0][beg:end].cpu())      # [k(e), n]
+                    xt = xvec[tier.k_index[beg:end].cpu().to(torch.int64)]
                     if tier.a_host is None:
-                        ref += block.sum(0)
+                        ref += (block * xt[:, None]).sum(0)
                     else:
                         keep = tier.a_host[beg:end] > 0
-                        ref += block[keep].sum(0)
+                        ref += (block[keep] * xt[keep, None]).sum(0)
                 keep_c = self.cold.a_host[proj][e] > 0
-                ref += cold_blocks[e][:, keep_c].sum(1)
+                xc = xvec[self.cold.band(proj, e).to(torch.int64)]
+                ref += (cold_blocks[e][:, keep_c] * xc[keep_c][None, :]).sum(1)
                 col = got[0, j, pi * n:(pi + 1) * n]
                 errs.append(float((col - ref).abs().max()
                                   / ref.abs().max().clamp_min(1e-6)))

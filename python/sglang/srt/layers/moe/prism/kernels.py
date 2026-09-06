@@ -14,6 +14,7 @@ from sglang.srt.layers.prism.kernels import (  # noqa: F401
     cold_n_align,
     cold_pack_tile_rows,
     cold_slab_layout,
+    cold_sparsity_score,
     gpu_store_format_tag,
     known_cpu_kernels,
     known_gpu_kernels,

@@ -74,8 +74,12 @@ SUPPORTED_SCHEMA_VERSIONS = (1, 2)
 SPARSITY_SCHEMA_VERSION = 2
 # sparsity score 변종 — calib 자산의 어느 테이블 계열을 쓰는지.
 # k2wl2 = 인접 페어의 실제 에너지(교차항 포함)이므로 wn(열 노름)과
-# pair_dot(인접열 내적)을 모두 요구한다.
-KNOWN_SPARSITY_SCORES = ("k2wl2",)
+# pair_dot(인접열 내적)을 모두 요구한다. 마스크는 페어(k/2 비트).
+# k1    = 순수 활성값 |x_k| >= thr (2026-09-05 사용자 결정). 가중치 통계를 쓰지 않아 thr 곡선만
+# 요구하고, 마스크는 per-k(k 비트)다. 어느 score를 쓰는지는 **cold 커널 키가 함의**한다
+# (kernels.cold_sparsity_score) — plan.score와 어긋나면 cold_backend가 startup에서 즉사.
+KNOWN_SPARSITY_SCORES = ("k2wl2", "k1")
+SCORES_WITHOUT_WEIGHT_STATS = ("k1",)
 
 
 class Proj(str, Enum):
@@ -144,9 +148,16 @@ class SparsitySpec:
         for proj in Proj:
             K = dims.k_of(proj)
             shapes[f"thr_{proj.value}"] = (L, E, self.ng)
+            if self.score in SCORES_WITHOUT_WEIGHT_STATS:
+                continue  # k1: 활성값만 본다 — 가중치 통계 테이블이 없다
             shapes[f"wn_{proj.value}"] = (L, E, K)
             shapes[f"pair_dot_{proj.value}"] = (L, E, K // PAIR_GROUP)
         return shapes
+
+    @property
+    def uses_weight_stats(self) -> bool:
+        """이 score가 wn/pair_dot 테이블을 요구하는가 (k2wl2 참, k1 거짓)."""
+        return self.score not in SCORES_WITHOUT_WEIGHT_STATS
 
 
 @dataclass(frozen=True)

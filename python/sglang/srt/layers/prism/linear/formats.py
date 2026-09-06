@@ -37,7 +37,7 @@ from sglang.srt.layers.prism.store import IDX_DTYPE
 
 # 이 포맷들이 받아들이는 cold slab 레이아웃 태그 (`kernels.cold_slab_layout`).
 _BF16_COLD_LAYOUTS = ("kt_bf16",)
-_FP8_COLD_LAYOUTS = ("kt_tile8",)
+_FP8_COLD_LAYOUTS = ("kt_tile8", "kt_tile8k1")
 
 
 class LinearStoreFormat:

@@ -474,7 +474,8 @@ class Fp8Format(StoreFormat):
     # kt_tile_k2_fp8b128: cpu-mm tile_k2_fp8b128 포팅 (fp8 타일 레이아웃, 프리페치 커서,
     # sparse plan 경로; N shard 256 배수). kt 원본 fp8 커널(AMX_FP8_MOE_TP)은 Prism partial을
     # 지원하지 않아 cold 후보가 아니다.
-    cold_kernels = ("kt_tile_k2_fp8b128",)
+    # kt_tile_k1_fp8b128: 같은 타일의 k=1 판 — per-k 마스크(score k1), GPU 로더 KT_TILE8_K1.
+    cold_kernels = ("kt_tile_k2_fp8b128", "kt_tile_k1_fp8b128")
     cold_slab_dtype = torch.uint8
     BLOCK = 128
 
