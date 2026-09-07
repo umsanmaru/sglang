@@ -12,8 +12,9 @@
 | 2 | ~60 GiB | ~14 GiB |
 | 8 | ~15 GiB | ~59 GiB |
 
-`run_k3_h100.sh`는 **보이는 GPU 수에서 TP를 자동으로 잡는다**(기동 시 `[run_k3_h100] TP=N` 로 찍는다).
-좁히려면 `CUDA_VISIBLE_DEVICES=0,1` 이나 `TP=2`를 준다. 7b의 hot 비율을 그 TP에 맞춰 고를 것.
+**이 박스는 TP=2로 간다 (사용자 결정 2026-09-07).** GPU가 8장 있어도 2장만 쓴다 —
+스크립트가 `TP=2` + `CUDA_VISIBLE_DEVICES=0,1`을 기본으로 주고 기동 시 그 값을 찍는다.
+따라서 7b의 hot 비율은 **TP=2 행(0.011 / 0.03)** 을 쓴다. 위 표는 나중에 TP를 늘릴 때의 참고다.
 
 **이 디렉터리(`scripts/prism_k3/`)가 브랜치에 함께 들어 있다.** 그래서 nutella3에서 scp로 밀어넣을 것이
 없다 — 체크아웃하면 도구가 같이 온다. 경로는 스크립트가 자기 위치에서 역산하므로 체크아웃 이름·위치가
@@ -126,7 +127,7 @@ mkdir -p modelcfg plans/k3
 python $K3/make_12l_config.py /tmp/k3cfg modelcfg/Kimi-K3-12L --layers 12
 python $K3/gen_k3_plan.py modelcfg/Kimi-K3-12L plans/k3/k3_12L_h03_w05_mxfp4.json
 
-DUMMY=1 MODEL=$PWD/modelcfg/Kimi-K3-12L \
+DUMMY=1 TP=2 MODEL=$PWD/modelcfg/Kimi-K3-12L \
   $K3/run_k3_h100.sh plans/k3/k3_12L_h03_w05_mxfp4.json 30113 2>&1 | tee k3_smoke.log
 ```
 
@@ -191,8 +192,8 @@ hot 상한이 ~12 GiB다. warm은 pinned **호스트** 메모리라 GPU를 안 �
 
 | `--hot-frac`/`--warm-frac` | hot (rank 0 GPU) | warm (pinned host) | cold | 적합 |
 |---|---|---|---|---|
-| 0.011 / 0.03 | 12.70 GiB | 33.41 GiB | 1301 GiB | TP=2 시작점 |
-| 0.04 / 0.06 | 46.11 GiB | 71.50 GiB | 1230 GiB | **TP=8 시작점** |
+| **0.011 / 0.03** | 12.70 GiB | 33.41 GiB | 1301 GiB | **TP=2 — 이 박스가 쓸 값** |
+| 0.04 / 0.06 | 46.11 GiB | 71.50 GiB | 1230 GiB | TP=8 이라면 |
 | 0.05 / 0.08 | 58.80 GiB | 96.89 GiB | 1191 GiB | TP=8 상한 근처 |
 | 0.03 / 0.05 (12층 기본값) | 33.4 GiB | 58.8 GiB | — | TP=2엔 과대 |
 
@@ -202,7 +203,7 @@ warm은 pinned 호스트 메모리이고 cold에서 옮겨오는 것이라 호�
 ### 7c. 기동
 
 ```bash
-MODEL=/data/models/Kimi-K3 MEM_FRAC=0.90 \
+TP=2 MODEL=/data/models/Kimi-K3 MEM_FRAC=0.90 \
   $K3/run_k3_h100.sh plans/k3/k3_full_h011_w03_mocksp50.json 30113
 ```
 
