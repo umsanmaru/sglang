@@ -35,13 +35,33 @@ git clone -b prism-orchestration git@github.com:umsanmaru/ktransformers.git ktra
 cd ktransformers && git submodule update --init third_party/llama.cpp third_party/pybind11
 ```
 
-이미 클론돼 있으면 브랜치만 맞출 것 (ktransformers가 `main`이면 반드시 바꿔야 한다):
+### 이미 체크아웃이 있는 경우 — 브랜치만 가져온다
+
+먼저 remote가 **포크**를 가리키는지 본다. `prism-k3` / `prism-orchestration`은 upstream(sgl-project)에
+없고 `umsanmaru` 포크에만 있다.
 
 ```bash
-git -C sglang-k3     fetch origin prism-k3 && git -C sglang-k3 checkout prism-k3 && git -C sglang-k3 pull
-git -C ktransformers fetch origin prism-orchestration && git -C ktransformers checkout prism-orchestration
-git -C ktransformers submodule update --init third_party/llama.cpp third_party/pybind11
+cd <기존 sglang 체크아웃>
+git remote -v                      # umsanmaru/sglang 이 없으면 아래로 추가
+git remote add fork git@github.com:umsanmaru/sglang.git 2>/dev/null || true
+git fetch fork prism-k3
+git checkout -B prism-k3 fork/prism-k3      # 로컬 변경이 있으면 먼저 커밋/치울 것
+git log --oneline -1                        # 5c44a7f6fb 이상이어야 한다
+ls scripts/prism_k3/                        # 런북·스크립트가 여기 있으면 성공
 ```
+
+remote가 이미 포크면 `fork` 대신 `origin`을 쓰면 된다.
+
+ktransformers도 같은 방식이고, **`main`이면 반드시 바꿔야 한다** (kt cold 커널이 그 브랜치에만 있다):
+
+```bash
+cd <기존 ktransformers 체크아웃>
+git remote add fork git@github.com:umsanmaru/ktransformers.git 2>/dev/null || true
+git fetch fork prism-orchestration && git checkout -B prism-orchestration fork/prism-orchestration
+git submodule update --init third_party/llama.cpp third_party/pybind11
+```
+
+체크아웃이 없으면 위 clone 두 줄을 쓴다.
 
 ## 3. conda env (`prism-k3`)
 
