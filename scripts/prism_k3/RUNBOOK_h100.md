@@ -1,7 +1,18 @@
 # Kimi K3 + Prism on H100 ×2 — 런북
 
-목표: dense(KDA/MLA/shared expert/latent proj ≈120 GB bf16)는 H100 2장에 TP=2로, routed expert
+목표: dense(KDA/MLA/shared expert/latent proj ≈120 GB bf16)는 H100에 TP로, routed expert
 1301 GiB(mxfp4)는 CPU에. sglang은 `prism-k3` 브랜치, ktransformers는 `prism-orchestration`.
+
+**TP는 쓸 수 있는 GPU 수로 정한다.** K3는 head 96개라 2/4/8로 나뉘고, upstream 코드의 빠른 경로 일부는
+`tp_size == 8`에 고정돼 있다(`_gemm_ag_up_eligible`). TP가 커지면 dense가 rank당 얇아져 **rank 0에 hot을
+둘 자리가 늘어난다** — prism은 rank 0이 expert를 전부 소유하므로 그 여유가 곧 hot 예산이다.
+
+| TP | dense/rank | rank 0 hot 여유 (80 GiB − dense − ~6 GiB) |
+|---|---|---|
+| 2 | ~60 GiB | ~14 GiB |
+| 8 | ~15 GiB | ~59 GiB |
+
+스크립트 기본은 `TP=2`다. 8장이면 `TP=8`로 주고 7b의 hot 비율도 그에 맞춰 올릴 것.
 
 **이 디렉터리(`scripts/prism_k3/`)가 브랜치에 함께 들어 있다.** 그래서 nutella3에서 scp로 밀어넣을 것이
 없다 — 체크아웃하면 도구가 같이 온다. 경로는 스크립트가 자기 위치에서 역산하므로 체크아웃 이름·위치가
@@ -17,15 +28,21 @@
 아래 중 하나만 어긋나도 계획이 통째로 바뀐다. 빌드는 오래 걸리므로 먼저 찍고 결과를 보고할 것.
 
 ```bash
-lscpu | grep -o amx_bf16 | head -1     # 비면 여기서 멈춘다 (아래 참조)
+grep -o -E "avx512f|avx512_bf16|avx512_vnni|avx512_vbmi|amx_bf16" /proc/cpuinfo | sort -u | tr '\n' ' '
 nproc; lscpu | grep -E "^(Socket|Core|Model name|NUMA node)"
 free -g | head -2                       # 12층 스모크 ~190 GB / 전체 모델 로딩 피크 1301 GiB
-nvidia-smi -L                           # TP=2 라 2장이어야 한다
+nvidia-smi -L
 df -h .                                 # 체크포인트 1.4 TB 자리
 ```
 
-**`amx_bf16`가 비면 거기서 멈추고 보고할 것.** K3의 routed expert 1301 GiB가 전부 cold(CPU AMX)라,
-없으면 이 런북이 성립하지 않는다 — 빌드도 스모크도 의미가 없다. Sapphire Rapids(4세대 Xeon) 이상 필요.
+**요건은 `avx512f` + `avx512_bf16` 이고 AMX는 필요 없다.** K3의 cold 커널은
+`kt_tile_k2_mxfp4`이고 그 계산 페이로드(`operators/amx/la/tile_k2_mxfp4_port.hpp`)는 cpu-mm-platform의
+**AVX512** 커널 포팅이다 — `_mm512_dpbf16_ps`/`_mm512_fmadd_ps`뿐이고 AMX 타일 명령이 하나도 없다.
+경로와 namespace의 `amx`는 디렉터리 이름일 뿐이다. 등록부(`ext_bindings.cpp:1030`)도
+`USE_AMX_AVX_KERNEL` + `__AVX512F__` 로 게이트돼 있고 `HAVE_AMX`는 모듈 속성 문자열만 정한다.
+그래서 **AMX 없는 KVM 게스트에서도 빌드·등록·실행이 된다** (2026-09-07 소스 확인).
+
+`avx512_bf16`가 없으면 거기서 멈추고 보고할 것 — 그때는 cold 커널이 성립하지 않는다.
 
 ## 2. 체크아웃
 
@@ -85,8 +102,12 @@ export CPUINFER_USE_CUDA=1 CUDA_HOME=/usr/local/cuda
 export PKG_CONFIG_PATH=$CONDA_PREFIX/lib/pkgconfig
 export CMAKE_ARGS="-DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DCMAKE_LIBRARY_PATH=$CONDA_PREFIX/lib -DCMAKE_INCLUDE_PATH=$CONDA_PREFIX/include"
 ./install.sh build
-python -c "from kt_kernel import kt_kernel_ext as k; print(k.moe.TileK2MXFP4_MOE)"   # K3의 cold 커널
+python -c "from kt_kernel import kt_kernel_ext as k; print(k.__cpu_variant__, k.moe.TileK2MXFP4_MOE)"
 ```
+
+`install.sh`의 자동감지가 AMX 유무를 보고 `-mamx-*`를 켜거나 끈다 (AMX 없는 박스에서는 알아서 끈다).
+그 경우 `__cpu_variant__`가 `avx512_bf16`으로 찍히는 것이 정상이고, `TileK2MXFP4_MOE`는 그대로 나와야 한다.
+안 나오면 보고할 것.
 
 ## 5. 더미 12층 TP=2 스모크 — **여기가 관문**
 
@@ -166,13 +187,15 @@ python $K3/gen_k3_plan.py /data/models/Kimi-K3 plans/k3/k3_full_h011_w03_mocksp5
 갈리지 않는다. dense가 rank당 ~60 GiB라 80 GiB 중 남는 것이 ~20 GiB, KV와 CUDA 컨텍스트를 빼면
 hot 상한이 ~12 GiB다. warm은 pinned **호스트** 메모리라 GPU를 안 먹는다.
 
-| `--hot-frac`/`--warm-frac` | hot (rank 0 GPU) | warm (pinned host) | cold |
-|---|---|---|---|
-| 0.011 / 0.03 ← 시작점 | 12.70 GiB | 33.41 GiB | 1301 GiB |
-| 0.01 / 0.01 | 8.02 GiB | 8.02 GiB | 1331 GiB |
-| 0.03 / 0.05 (12층 기본값) | 33.4 GiB ✗ 안 들어간다 | 58.8 GiB | — |
+| `--hot-frac`/`--warm-frac` | hot (rank 0 GPU) | warm (pinned host) | cold | 적합 |
+|---|---|---|---|---|
+| 0.011 / 0.03 | 12.70 GiB | 33.41 GiB | 1301 GiB | TP=2 시작점 |
+| 0.04 / 0.06 | 46.11 GiB | 71.50 GiB | 1230 GiB | **TP=8 시작점** |
+| 0.05 / 0.08 | 58.80 GiB | 96.89 GiB | 1191 GiB | TP=8 상한 근처 |
+| 0.03 / 0.05 (12층 기본값) | 33.4 GiB | 58.8 GiB | — | TP=2엔 과대 |
 
-`--hot-frac 0.01` 이하는 down proj 밴드가 32-정렬에서 0으로 잘려 down이 전부 cold가 된다. 0.011을 쓸 것.
+`--hot-frac 0.01` 이하는 down proj 밴드가 32-정렬에서 0으로 잘려 down이 전부 cold가 된다.
+warm은 pinned 호스트 메모리이고 cold에서 옮겨오는 것이라 호스트 총량을 늘리지 않는다.
 
 ### 7c. 기동
 
