@@ -12,7 +12,8 @@
 | 2 | ~60 GiB | ~14 GiB |
 | 8 | ~15 GiB | ~59 GiB |
 
-스크립트 기본은 `TP=2`다. 8장이면 `TP=8`로 주고 7b의 hot 비율도 그에 맞춰 올릴 것.
+`run_k3_h100.sh`는 **보이는 GPU 수에서 TP를 자동으로 잡는다**(기동 시 `[run_k3_h100] TP=N` 로 찍는다).
+좁히려면 `CUDA_VISIBLE_DEVICES=0,1` 이나 `TP=2`를 준다. 7b의 hot 비율을 그 TP에 맞춰 고를 것.
 
 **이 디렉터리(`scripts/prism_k3/`)가 브랜치에 함께 들어 있다.** 그래서 nutella3에서 scp로 밀어넣을 것이
 없다 — 체크아웃하면 도구가 같이 온다. 경로는 스크립트가 자기 위치에서 역산하므로 체크아웃 이름·위치가
@@ -109,7 +110,7 @@ python -c "from kt_kernel import kt_kernel_ext as k; print(k.__cpu_variant__, k.
 그 경우 `__cpu_variant__`가 `avx512_bf16`으로 찍히는 것이 정상이고, `TileK2MXFP4_MOE`는 그대로 나와야 한다.
 안 나오면 보고할 것.
 
-## 5. 더미 12층 TP=2 스모크 — **여기가 관문**
+## 5. 더미 12층 스모크 — **여기가 관문**
 
 체크포인트 없이 config+tokenizer만으로(3 MB) K3 모델 코드와 prism 경로를 e2e로 돌린다.
 
@@ -125,14 +126,15 @@ mkdir -p modelcfg plans/k3
 python $K3/make_12l_config.py /tmp/k3cfg modelcfg/Kimi-K3-12L --layers 12
 python $K3/gen_k3_plan.py modelcfg/Kimi-K3-12L plans/k3/k3_12L_h03_w05_mxfp4.json
 
-DUMMY=1 TP=2 MODEL=$PWD/modelcfg/Kimi-K3-12L \
+DUMMY=1 MODEL=$PWD/modelcfg/Kimi-K3-12L \
   $K3/run_k3_h100.sh plans/k3/k3_12L_h03_w05_mxfp4.json 30113 2>&1 | tee k3_smoke.log
 ```
 
 로그에서 확인할 네 줄:
 
 - `[prism] MoE activation = situ(alpha=4.0, limit=25.0)`
-- `[prism] layer N: MoE-TP rank 1/2 holds no experts (owner = rank 0)` ← TP 경로가 살아있다는 증거
+- `[prism] layer N: MoE-TP rank k/N holds no experts (owner = rank 0)` ← TP 경로가 살아있다는 증거
+  (rank 0 이외의 모든 rank에서 층마다 나와야 한다)
 - `[prism] layer N registered (hot=True cold=True ...)` 가 rank 0에서 11개
 - `The server is fired up`
 
@@ -200,7 +202,7 @@ warm은 pinned 호스트 메모리이고 cold에서 옮겨오는 것이라 호�
 ### 7c. 기동
 
 ```bash
-TP=2 MODEL=/data/models/Kimi-K3 MEM_FRAC=0.90 \
+MODEL=/data/models/Kimi-K3 MEM_FRAC=0.90 \
   $K3/run_k3_h100.sh plans/k3/k3_full_h011_w03_mocksp50.json 30113
 ```
 

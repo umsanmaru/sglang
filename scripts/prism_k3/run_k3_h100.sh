@@ -3,12 +3,13 @@
 #
 # nutella3(5090/sm_120)와 다른 점:
 #   - TORCH_CUDA_ARCH_LIST / FLASHINFER_CUDA_ARCH_LIST = 9.0 (sm_120 → sm_90)
-#   - TP=2 기본. prism은 MoE-TP owner(rank 0)만 routed expert를 갖고 나머지는 0을 낸다.
+#   - TP 기본 = 보이는 GPU 수. prism은 MoE-TP owner(rank 0)만 routed expert를 갖고 나머지는 0을 낸다.
 #   - tilelang/DSA 관련 sm120 우회 없음 (K3는 DSA를 안 쓴다 — KDA + MLA)
 #
 # 사용:
 #   MODEL=/path/to/Kimi-K3 run_k3_h100.sh <plan.json> [port] [extra args...]
 #   DUMMY=1 MODEL=/path/to/Kimi-K3-12L run_k3_h100.sh <plan.json>     # 가중치 없이 경로/속도만
+#   TP=2 CUDA_VISIBLE_DEVICES=0,1 ... run_k3_h100.sh <plan.json>       # GPU를 좁힐 때
 set -euo pipefail
 PLAN=${1:?plan json}; PORT=${2:-30113}; shift 2 || true
 
@@ -20,8 +21,17 @@ export LD_LIBRARY_PATH=$HOME/miniconda3/envs/$CONDA_ENV/lib${LD_LIBRARY_PATH:+:$
 # editable install이 다른 트리를 가리켜도 이 트리가 이긴다 (PathFinder 순서).
 export PYTHONPATH=$TREE/python${PYTHONPATH:+:$PYTHONPATH}
 
-TP=${TP:-2}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+# TP 기본 = 이 프로세스에 보이는 GPU 수. prism은 rank 0이 routed expert를 전부 소유하므로
+# TP가 크면 dense가 rank당 얇아져 rank 0의 hot 예산이 커진다 (런북 머리말 표). 좁히려면
+# CUDA_VISIBLE_DEVICES=0,1 처럼 주거나 TP=2 로 직접 지정한다.
+if [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+  _NGPU=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .)
+else
+  _NGPU=$(nvidia-smi -L 2>/dev/null | grep -c '^GPU' || true)
+  [ "${_NGPU:-0}" -ge 1 ] || _NGPU=1
+fi
+TP=${TP:-$_NGPU}
+echo "[run_k3_h100] TP=$TP (visible GPUs: $_NGPU)" >&2
 export CUDA_HOME=${CUDA_HOME:-/usr/local/cuda}
 export PATH=$CUDA_HOME/bin:$PATH
 export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-"9.0+PTX"}
