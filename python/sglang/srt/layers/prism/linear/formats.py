@@ -13,7 +13,7 @@ dense에서 그 역할은 `method.py`가 `LinearBase`의 `weight`/`weight_scale_
 | 코드 | `[N, K]` bf16 | `[N, K]` e4m3 (u8로 다룬다) |
 | 배율 | 없음 | `[N/128, K/128]` fp32 `scale_inv` |
 | K 정렬 | 2 (페어) | **128** |
-| cold 커널 | `kt_amx_bf16`, `kt_tile_k2_bf16` | `kt_tile_k2_fp8b128` |
+| cold 커널 | `kt_amx_bf16`, `kt_tile_k2_bf16`(+`_nopf`) | `kt_tile_k2_fp8b128` |
 
 fp8의 128은 임의 상수가 아니다: 배율 하나가 원본 128k × 128n 블록을 덮으므로, 티어
 경계가 블록을 쪼개면 두 티어가 같은 배율을 나눠 갖게 되어 "블록당 배율 1"이 깨진다.
