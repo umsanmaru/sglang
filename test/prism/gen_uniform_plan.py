@@ -100,6 +100,7 @@ def main():
                          "gemv_worklist_fp8 = e4m3 + 128×128 블록 배율(K 정렬 128))")
     ap.add_argument("--cpu-kernel", default="kt_amx_bf16",
                     choices=["kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_fp4", "kt_tile_k2_mxfp4",
+                             "kt_tile_k2_bf16_nopf",
                              "kt_tile_k2_fp8b128"])
     ap.add_argument("--k-align", type=int, default=ROW_GROUP,
                     help="밴드 경계 정렬 (기본 64; mxfp4는 32, fp8은 128 배수여야 한다)")

@@ -85,7 +85,7 @@ def main() -> None:
     p.add_argument("--dtype", default="bf16", choices=("bf16", "mxfp4", "fp8"),
                    help="스토어 dtype = warm GPU 커널 + cold kt 백엔드를 함께 고른다")
     p.add_argument("--cpu-kernel", default=None,
-                   choices=("kt_tile_k2_bf16", "kt_amx_bf16", "kt_amx_fp4",
+                   choices=("kt_tile_k2_bf16", "kt_tile_k2_bf16_nopf", "kt_amx_bf16", "kt_amx_fp4",
                             "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128"),
                    help="기본값은 dtype이 정한다")
     p.add_argument("--threads", type=int, default=None,
