@@ -66,7 +66,7 @@ def main() -> None:
                    help="cold 스토어 dtype = kt 백엔드 (bf16 → TileK2BF16, mxfp4 → "
                         "TileK2MXFP4, fp8 → TileK2FP8B128). --cpu-kernel은 그 안에서만 고른다")
     p.add_argument("--cpu-kernel", default=None,
-                   choices=("kt_tile_k2_bf16", "kt_amx_bf16", "kt_amx_fp4",
+                   choices=("kt_tile_k2_bf16", "kt_tile_k2_bf16_nopf", "kt_amx_bf16", "kt_amx_fp4",
                             "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128"),
                    help="기본값은 dtype이 정한다")
     p.add_argument("--numa-map", default="",
