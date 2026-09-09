@@ -24,7 +24,11 @@ from typing import Tuple
 
 _GPU_WARM_KERNELS: Tuple[str, ...] = ("gemv_worklist", "torch_bmm", "gemv_worklist_mxfp4",
                                       "gemv_worklist_fp8")
-_CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_fp4",
+# `kt_tile_k2_bf16_nopf`는 `kt_tile_k2_bf16`의 **no-SW-pf 형제**다 (kt-kernel
+# `GemmKernelTileK2BF16NoPF`): 소비 커서·prefill B-panel·prep/export 보조 프리페치가
+# 컴파일 타임에 빠진 같은 커널. 레이아웃·정렬·score·자산이 전부 같으므로 아래 모든 표에서
+# 원본과 같은 값을 갖고, "SW 프리페처 없음" ablation은 plan의 커널 키만 바꿔 돌린다.
+_CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_tile_k2_bf16_nopf", "kt_amx_fp4",
                                       "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128",
                                       "kt_tile_k2_fp8pt")
 
@@ -38,9 +42,11 @@ _CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_amx_
 #              64 B 슬롯의 fp32 1개(per-tensor). N shard 256 배수, K 32 배수 (128 제약 없음).
 #              GPU 로더(Layout::KT_TILE8_PT)는 아직 없다 — 지금은 CPU cold 전용 키다.
 _CPU_COLD_SLAB_LAYOUT: dict = {"kt_amx_bf16": "kt_bf16", "kt_tile_k2_bf16": "kt_bf16",
+                               "kt_tile_k2_bf16_nopf": "kt_bf16",
                                "kt_amx_fp4": "kt_fp4", "kt_tile_k2_mxfp4": "kt_tile4",
                                "kt_tile_k2_fp8b128": "kt_tile8", "kt_tile_k2_fp8pt": "kt_tile8pt"}
 _CPU_COLD_N_ALIGN: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_fp4": 32,
+                           "kt_tile_k2_bf16_nopf": 32,
                            "kt_tile_k2_mxfp4": 256, "kt_tile_k2_fp8b128": 256,
                            "kt_tile_k2_fp8pt": 256}
 
@@ -62,6 +68,7 @@ _GPU_STORE_FORMAT: dict = {
 # 채운다. 새 cold 커널은 자기 타일 크기를 여기 등록한다.
 # fp8 타일은 배율 블록이 128 k라 타일 올림도 128이다 (32로 올리면 마지막 블록의 배율이 없다).
 _CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_fp4": 32,
+                             "kt_tile_k2_bf16_nopf": 32,
                              "kt_tile_k2_mxfp4": 32, "kt_tile_k2_fp8b128": 128,
                              "kt_tile_k2_fp8pt": 32}
 
