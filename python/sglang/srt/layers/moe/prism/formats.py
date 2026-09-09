@@ -206,7 +206,7 @@ class Bf16Format(StoreFormat):
     def cold_source(self, src, where):
         return src.w
 
-    cold_kernels = ("kt_amx_bf16", "kt_tile_k2_bf16")
+    cold_kernels = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_tile_k2_bf16_nopf")
     cold_slab_dtype = torch.bfloat16
 
     def cold_flat(self, src, ti, real_rows, tile):

@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 
 # 이 백엔드가 아는 cold 커널. 양자화 키는 배율 셋과 `cold_load_kwargs`가 필요한데
 # dense formats에 아직 그 훅이 없다 (TODO). 조용히 빠지면 pack이 쓰레기를 읽는다.
-_SUPPORTED_KERNELS = frozenset({"kt_amx_bf16", "kt_tile_k2_bf16"})
+_SUPPORTED_KERNELS = frozenset({"kt_amx_bf16", "kt_tile_k2_bf16", "kt_tile_k2_bf16_nopf"})
 
 
 # ---------------------------------------------------------------------------
