@@ -80,6 +80,7 @@ VARIANTS = ("warm_only", "cold_only", "combined", "combined_eager",
 # 붙어 kt 원본과 같은 하한이 됐다. mxfp4/fp8은 각자 gemv_slab·인코더가 따로라
 # 아직 256이다.
 N_ALIGN = {"kt_tile_k2_bf16": 32, "kt_amx_bf16": 32,
+           "kt_tile_k2_bf16_nopf": 32,
            "kt_amx_fp4": 32, "kt_tile_k2_mxfp4": 256,
            "kt_tile_k2_fp8b128": 256}
 
