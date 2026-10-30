@@ -58,8 +58,6 @@ from sglang.srt.layers.moe.prism.index import (
     IDX_DTYPE,
     LayerIndex,
     TierIndex,
-    from_bands,
-    validate_layer,
 )
 from sglang.srt.layers.moe.prism.numa import alloc_pinned_on_node
 from sglang.srt.layers.moe.prism.plan import (
@@ -283,35 +281,19 @@ def _gather_flat(src: torch.Tensor, ti: TierIndex, uniform_k, band_start):
 
 
 def _cold_flat(
-    src: torch.Tensor, ti: TierIndex, real_rows, tile: int
+    src: torch.Tensor, ti: TierIndex, real_rows, tile: int, minimum_rows=None
 ) -> tuple:
     """cold 스토어 [Σₑ N·k_pad(e)]와 패딩된 (row_off, k_index)를 만든다.
 
     expert 블록은 ckpt 방향 `[N, k_pad(e)]`이고 패딩 열은 0이다. 패딩 인덱스는
     아무 열이어도 되지만(weight가 0) 0을 넣는다 — kt가 축 범위를 검증한다.
     """
-    E, N, _ = src.shape
-    pad = [((int(r) + tile - 1) // tile) * tile for r in real_rows]
-    off = torch.zeros(E + 1, dtype=torch.int32)
-    for e, kp in enumerate(pad):
-        off[e + 1] = int(off[e]) + kp
-    total = int(off[-1])
-    flat = torch.zeros(total * N, dtype=src.dtype)
-    idx = torch.zeros(total, dtype=torch.int64)
-    for e in range(E):
-        kr, kp, o0 = int(real_rows[e]), pad[e], int(off[e])
-        if kr == 0:
-            continue
-        rows = ti.for_expert(e)[:kr].to(torch.int64)
-        idx[o0 : o0 + kr] = rows
-        blk = flat[o0 * N : (o0 + kp) * N].view(N, kp)
-        blk[:, :kr] = src[e].index_select(1, rows)
-    return (
-        flat.contiguous(),
-        off,
-        idx.to(IDX_DTYPE),
-        torch.tensor([int(r) for r in real_rows], dtype=torch.int32),
-    )
+    from sglang.srt.layers.moe.prism.loading_gather import gather_padded_columns
+
+    flat, off, idx, real = gather_padded_columns(
+        src, ti, real_rows, tile, minimum_rows=minimum_rows)
+    return flat, off, idx.to(IDX_DTYPE), real
+
 
 
 def _build_shard(
@@ -329,8 +311,10 @@ def _build_shard(
     w_flat, s_flat = fmt.gather(src, ti, uniform_k, band_start)
     ro = ti.row_off
     k_max = int((ro[1:] - ro[:-1]).max()) if ti.num_experts > 0 else 0
+    placed = place(w_flat)
+    placed._prism_prefill_rows = tuple(ti.row_off.tolist())
     return TierShard(
-        w_flat=place(w_flat),
+        w_flat=placed,
         row_off=ti.row_off.to(idx_device),
         k_index=ti.idx.to(idx_device),
         contiguous=ti.contiguous,
@@ -426,14 +410,30 @@ def _index_device(layer_index: LayerIndex, layer_idx: int,
     return device if device is not None else torch.device("cpu")
 
 
+def _warm_kt_minimum_rows(layer_index: LayerIndex, proj: Proj, ti: TierIndex,
+                          num_experts: int, tile_rows: int):
+    """KT는 GU를 융합하므로 한쪽(gate/up)에 warm 행이 있으면 다른 쪽도 packed K가 0이면
+    안 된다. 빠진 쪽은 0 타일 하나로 표현한다 — real_rows=0은 그대로 두어 sparse
+    마스크·calib은 영향을 받지 않는다. down 또는 짝이 없는 proj는 None."""
+    if proj not in (Proj.GATE, Proj.UP):
+        return None
+    other = Proj.UP if proj is Proj.GATE else Proj.GATE
+    other_ti = layer_index.get(other, Tier.WARM)
+    if other_ti is None:
+        return None
+    return [tile_rows if ti.k_rows(e) == 0 and other_ti.k_rows(e) else 0
+            for e in range(num_experts)]
+
+
 def _prepare_warm_kt_shard(src: ProjSource, ti: TierIndex, *, fmt: StoreFormat,
                            num_experts: int, tile_rows: int, where: str,
-                           calib: _CalibGather) -> ColdShard:
+                           calib: _CalibGather, minimum_rows=None) -> ColdShard:
     """warm을 **kt 포맷**으로 절단한다 — cold와 같은 절단(타일 올림, ckpt 방향)이고
     저장(pack)은 kt가 한다. 그래서 산출물도 cold와 같은 ColdShard다."""
     real = [ti.k_rows(e) for e in range(num_experts)]
     flat, off, idx, real_t = _cold_flat(
-        fmt.cold_source(src, f"{where} warm-kt"), ti, real, tile_rows)
+        fmt.cold_source(src, f"{where} warm-kt"), ti, real, tile_rows,
+        minimum_rows=minimum_rows)
     padded = TierIndex(row_off=off, idx=idx, contiguous=ti.contiguous)
     return ColdShard(
         w_flat=flat, row_off=off, k_index=idx, real_rows=real_t,
@@ -512,8 +512,9 @@ def prepare_layer_weights(
 
     # 티어 멤버십을 인덱스로 확정하고 **순열·페어를 검증한다** (계약 ①).
     # 밴드 검증이 plan.py에서 사라진 자리를 여기가 메운다 — 로드마다 돈다.
-    layer_index = from_bands(plan, layer_idx)
-    validate_layer(layer_index, dims, layer_idx)
+    from sglang.srt.layers.moe.prism.loading_cache import load_layer_index
+
+    layer_index = load_layer_index(plan, layer_idx)   # from_bands + validate_layer (+ 캐시)
     idx_device = _index_device(layer_index, layer_idx, device)
     place_hot = _hot_placer(device)
 
@@ -545,6 +546,8 @@ def prepare_layer_weights(
             warm_kt_shards[proj] = None if warm_ti is None else _prepare_warm_kt_shard(
                 src, warm_ti, fmt=fmt, num_experts=dims.num_experts,
                 tile_rows=cold_tile_rows, where=where, calib=gather,
+                minimum_rows=_warm_kt_minimum_rows(layer_index, proj, warm_ti,
+                                                   dims.num_experts, cold_tile_rows),
             )
         else:
             warm_kt_shards[proj] = None
