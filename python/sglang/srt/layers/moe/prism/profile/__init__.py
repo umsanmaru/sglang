@@ -14,7 +14,7 @@
   bf16     gemv_worklist_*       kt_tile_k2_bf16      2        w [Σk, N] bf16
   mxfp4    gemv_mxfp4_*          kt_tile_k2_mxfp4     32       codes [Σk/2, N] + E8M0 [Σk/32, N]
   fp8      gemv_fp8_*            kt_tile_k2_fp8b128   128      codes [Σk, N] + fp32 [Σk/128, N/128]
-  fp8pt    gemv_fp8pt_*          kt_tile_k2_fp8pt     32       codes [Σk, N] + fp32 [E]  (per-tensor; MoE 포맷 아님, common.Fp8PtGpu)
+  fp8pt    gemv_fp8pt_*          kt_tile_k2_fp8pt     32       codes [Σk, N] + fp32 [E]  (per-tensor; formats.FP8PT)
 
 `cpu_kernel=`로 같은 dtype 안의 다른 cold 커널을 고른다. fp8의 `kt_tile_k1_fp8b128`은
 per-k 마스크 커널(score `k1`, `keep_k = |x_k| ≥ thr`)이다. 이때 프로파일은 마스크를 a/c

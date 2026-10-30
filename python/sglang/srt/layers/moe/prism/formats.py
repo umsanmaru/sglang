@@ -15,6 +15,10 @@
   fp8   — `w_flat u8 [Σₑ k[e], N]`(e4m3 코드, 행 = k) + `s_flat fp32 [Σₑ k[e]/128, N/128]`
           (blockwise `scale_inv`, 행 = 128-k 블록, 열 = 128-n 블록). 정렬 = 128, 같은 이유로
           한 단계 거칠다. mxfp4·fp8 둘 다 prefill은 CPU(AMX)를 거치지 않고 전부 GPU다.
+  fp8pt — `w_flat u8 [Σₑ k[e], N]`(fp8과 같은 e4m3 코드) + `s_flat fp32 [E]`(**per-tensor**: 행렬
+          = expert·proj당 배율 스칼라 하나; Mistral static-tensor FP8, `weight_block_size: null`).
+          배율 블록이 없어 정렬 = 32 — GPU gemv의 32-k 청크와 kt 타일 컬럼이 요구하는 값이지
+          배율 때문이 아니다. prefill은 fp8과 같이 전부 GPU.
 
 hot/warm의 계산 계약은 포맷 안에서도 같다: 갈리는 것은 `pinned`(스토어 거처) 하나이고
 그것은 커널 진입점의 host 검증 차이일 뿐이다.
@@ -39,7 +43,9 @@ class FullWeights:
     mxfp4: w13 [E, 2I, H/2] int8(nibble), w2 [E, H, I/2] int8, w13_scale [E, 2I, H/32],
            w2_scale [E, H, I/32] (fp32 = E8M0를 로더가 캐스팅한 값, 또는 u8/e8m0).
     fp8:   w13 [E, 2I, H] float8_e4m3fn, w2 [E, H, I], w13_scale [E, 2I/128, H/128] fp32,
-           w2_scale [E, H/128, I/128] fp32 (blockwise `scale_inv`)."""
+           w2_scale [E, H/128, I/128] fp32 (blockwise `scale_inv`).
+    fp8pt: w13/w2는 fp8과 같고 w13_scale [E, 2] fp32 (열 0 = gate, 1 = up), w2_scale [E] fp32
+           (sglang per-tensor `Fp8MoEMethod`의 `w13_weight_scale`/`w2_weight_scale` 그대로)."""
 
     w13: torch.Tensor
     w2: torch.Tensor
@@ -638,10 +644,153 @@ class Fp8Format(StoreFormat):
         warmup_grouped()
 
 
+class Fp8PtFormat(Fp8Format):
+    """**per-tensor** FP8 routed expert (e4m3 + 행렬당 fp32 배율 1개) — Mistral static-tensor FP8
+    (`weight_block_size: null`). 코드 스토어·GPU 로더·kt 타일 순열은 fp8(블록판)과 같고 배율
+    기하만 다르다: `w13_weight_scale [E, 2]`(gate, up), `w2_weight_scale [E]` — sglang per-tensor
+    `Fp8MoEMethod`가 만드는 파라미터 이름·모양 그대로(`quant_method = TENSOR`)라 그 이름으로
+    로더가 채운다. static activation의 `w13/w2_input_scale [E]`도 등록만 한다(프리즘 티어는 전부
+    W8A16이라 쓰지 않는다 — 체크포인트에 있으면 로더가 채우고 우리는 버린다).
+
+    **K 정렬 32**: 배율 블록이 없으니 배율 때문의 제약은 없다. 32는 GPU gemv의 32-k 청크
+    (`cnt % 32`)와 kt 타일 컬럼(`k % 32`)이 요구하는 값이고, 그래서 검사도 "expert별 행 **수**가
+    32 배수"까지다 — fp8/mxfp4처럼 원본의 통째 블록일 필요는 없다(임의 k 인덱스 가능).
+
+    GPU 진입점은 `gemv_fp8pt_*`/`grouped_fp8pt_*`(ROWMAJOR_PT), cold slab 로더는 `KT_TILE8_PT`
+    (`grouped_fp8_cold`가 layout 태그 `kt_tile8pt`로 고른다 — `prism_grouped_fp8.COLD_LAYOUTS`)."""
+
+    name = "fp8pt"
+    k_align = 32
+    cold_kernels = ("kt_tile_k2_fp8pt",)
+    ALIGN = 32
+
+    def create_params(self, layer, num_experts, hidden, inter, params_dtype, extra_weight_attrs):
+        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
+        from sglang.srt.utils import set_weight_attrs
+
+        A = self.ALIGN
+        if hidden % A or inter % A:
+            raise PlanError(f"fp8pt needs hidden/inter multiples of {A}, got {hidden}/{inter}")
+        w13 = torch.nn.Parameter(
+            torch.empty(num_experts, 2 * inter, hidden, dtype=self._wdtype, device="cpu"),
+            requires_grad=False)
+        w2 = torch.nn.Parameter(
+            torch.empty(num_experts, hidden, inter, dtype=self._wdtype, device="cpu"),
+            requires_grad=False)
+        layer.register_parameter("w13_weight", w13)
+        set_weight_attrs(w13, extra_weight_attrs)
+        layer.register_parameter("w2_weight", w2)
+        set_weight_attrs(w2, extra_weight_attrs)
+        scale_attrs = dict(extra_weight_attrs)
+        scale_attrs["quant_method"] = FusedMoeWeightScaleSupported.TENSOR.value
+        # sglang Fp8MoEMethod(per-tensor)와 같은 이름·모양: w13은 shard(gate, up)당 1개.
+        w13_s = torch.nn.Parameter(torch.ones(num_experts, 2, dtype=torch.float32, device="cpu"),
+                                   requires_grad=False)
+        w2_s = torch.nn.Parameter(torch.ones(num_experts, dtype=torch.float32, device="cpu"),
+                                  requires_grad=False)
+        layer.register_parameter("w13_weight_scale", w13_s)
+        set_weight_attrs(w13_s, scale_attrs)
+        layer.register_parameter("w2_weight_scale", w2_s)
+        set_weight_attrs(w2_s, scale_attrs)
+        # static activation 배율 — 로더가 채울 자리만 (프리즘은 쓰지 않는다).
+        for name in ("w13_input_scale", "w2_input_scale"):
+            p = torch.nn.Parameter(torch.ones(num_experts, dtype=torch.float32, device="cpu"),
+                                   requires_grad=False)
+            layer.register_parameter(name, p)
+            set_weight_attrs(p, scale_attrs)
+
+    def take_full(self, layer) -> FullWeights:
+        return FullWeights(
+            w13=_host(layer.w13_weight.data), w2=_host(layer.w2_weight.data),
+            w13_scale=_host(layer.w13_weight_scale.data),
+            w2_scale=_host(layer.w2_weight_scale.data))
+
+    def release(self, layer) -> None:
+        for name in ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale",
+                     "w13_input_scale", "w2_input_scale"):
+            p = getattr(layer, name, None)
+            if p is not None:
+                p.data = torch.empty(0, dtype=p.dtype)
+
+    def check_full_shapes(self, full, dims, where):
+        E, H, I = dims.num_experts, dims.hidden_size, dims.intermediate_size
+        _check_shapes(where, full.w13, (E, 2 * I, H), full.w2, (E, H, I))
+        if full.w13_scale is None or full.w2_scale is None:
+            raise PlanError(f"{where}: fp8pt store needs w13/w2 per-tensor scales")
+        _check_shapes(where + " scales", full.w13_scale, (E, 2), full.w2_scale, (E,))
+        if full.w13.dtype not in (self._wdtype, torch.int8, torch.uint8):
+            raise PlanError(f"{where}: fp8 codes must be float8_e4m3fn (or raw bytes), got "
+                            f"{full.w13.dtype}")
+        if H % self.ALIGN or I % self.ALIGN:
+            raise PlanError(f"{where}: fp8pt needs hidden/inter multiples of {self.ALIGN}")
+
+    def proj_source(self, full, inter, proj):
+        # 배율은 proj당 [E] 스칼라 — gate = w13_scale[:, 0], up = w13_scale[:, 1], down = w2_scale.
+        if proj is Proj.GATE:
+            sc = full.w13_scale[:, 0]
+        elif proj is Proj.UP:
+            sc = full.w13_scale[:, 1]
+        else:
+            sc = full.w2_scale
+        return ProjSource(w=_proj_view(full.w13, full.w2, inter, proj).view(torch.uint8),
+                          scales=sc.float().contiguous())
+
+    def check_index(self, ti, where):
+        """expert별 행 **수**가 32 배수 (GPU gemv 청크·kt 타일 컬럼). 인덱스 값은 임의."""
+        A = self.ALIGN
+        for e in range(ti.num_experts):
+            o0, o1 = int(ti.row_off[e]), int(ti.row_off[e + 1])
+            if (o1 - o0) % A:
+                raise PlanError(f"{where}: expert {e} has {o1 - o0} rows — fp8pt tiers need a "
+                                f"multiple of {A} rows per expert (gemv 32-k chunk / kt tile column)")
+
+    def gather(self, src, ti, uniform_k, band_start):
+        codes = _gather_rows(src.w, ti, uniform_k, band_start)          # [Σₑ k[e], N] u8
+        return codes, src.scales.float().contiguous()                     # [E]
+
+    def cold_flat(self, src, ti, real_rows, tile):
+        """cold 블록 = e4m3 행 [N, k_pad] u8 (패딩 0x00 = +0.0) + 배율 fp32 [E] (expert당 1개,
+        행 수 0인 expert도 자리를 갖는다 — kt `[E]` 계약)."""
+        codes, off, idx, real_t = _cold_flat_rows(src.w, ti, real_rows, tile, pad_value=0)
+        return codes, src.scales.float().contiguous(), off, idx, real_t
+
+    # GPU 진입점 — per-tensor 쌍둥이 (인자 순서는 블록판과 같고 scales만 [E]).
+    def grouped(self, *, pinned):
+        from sglang.jit_kernel import prism_grouped_fp8 as k
+
+        return k.grouped_fp8pt_indexed_pinned if pinned else k.grouped_fp8pt_indexed
+
+    def grouped_gateup(self, *, pinned):
+        from sglang.jit_kernel import prism_grouped_fp8 as k
+
+        return k.grouped_fp8pt_indexed_pinned_gateup if pinned else k.grouped_fp8pt_indexed_gateup
+
+    def gemv(self, *, pinned, sparse):
+        from sglang.jit_kernel import prism_gemv_fp8 as k
+
+        return {
+            (False, False): k.gemv_fp8pt_indexed,
+            (True, False): k.gemv_fp8pt_indexed_pinned,
+            (False, True): k.gemv_fp8pt_indexed_sparse,
+            (True, True): k.gemv_fp8pt_indexed_pinned_sparse,
+        }[(pinned, sparse)]
+
+    def gemv_gateup(self, *, pinned, sparse):
+        from sglang.jit_kernel import prism_gemv_fp8 as k
+
+        return {
+            (False, False): k.gemv_fp8pt_indexed_gateup,
+            (True, False): k.gemv_fp8pt_indexed_pinned_gateup,
+            (False, True): k.gemv_fp8pt_indexed_sparse_gateup,
+            (True, True): k.gemv_fp8pt_indexed_pinned_sparse_gateup,
+        }[(pinned, sparse)]
+
+
 BF16 = Bf16Format()
 MXFP4 = Mxfp4Format()
 FP8 = Fp8Format()
-FORMATS = {BF16.name: BF16, MXFP4.name: MXFP4, FP8.name: FP8}
+FP8PT = Fp8PtFormat()
+FORMATS = {BF16.name: BF16, MXFP4.name: MXFP4, FP8.name: FP8, FP8PT.name: FP8PT}
 
 
 # ─── 공통 헬퍼 ───────────────────────────────────────────────────────────────

@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Tuple
 
 _GPU_WARM_KERNELS: Tuple[str, ...] = ("gemv_worklist", "torch_bmm", "gemv_worklist_mxfp4",
-                                      "gemv_worklist_fp8")
+                                      "gemv_worklist_fp8", "gemv_worklist_fp8pt")
 # `kt_tile_k2_bf16_nopf`는 `kt_tile_k2_bf16`의 **no-SW-pf 형제**다 (kt-kernel
 # `GemmKernelTileK2BF16NoPF`): 소비 커서·prefill B-panel·prep/export 보조 프리페치가
 # 컴파일 타임에 빠진 같은 커널. 레이아웃·정렬·score·자산이 전부 같으므로 아래 모든 표에서
@@ -58,11 +58,13 @@ _CPU_COLD_N_ALIGN: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_fp4
 #   gemv_worklist / torch_bmm → bf16 [Σₖ, N]  (정렬 2)
 #   gemv_worklist_mxfp4       → mxfp4 pair-row codes u8 [Σₖ/2, N] + E8M0 scales u8 [Σₖ/32, N] (정렬 32)
 #   gemv_worklist_fp8         → fp8 e4m3 codes u8 [Σₖ, N] + fp32 scale_inv [Σₖ/128, N/128] (정렬 128)
+#   gemv_worklist_fp8pt       → fp8 e4m3 codes u8 [Σₖ, N] + fp32 per-tensor scale [E] (정렬 32; Mistral)
 _GPU_STORE_FORMAT: dict = {
     "gemv_worklist": "bf16",
     "torch_bmm": "bf16",
     "gemv_worklist_mxfp4": "mxfp4",
     "gemv_worklist_fp8": "fp8",
+    "gemv_worklist_fp8pt": "fp8pt",
 }
 
 # cold packed 저장의 K축 타일 행 수 — **커널 키가 함의하는 값**이다 (계약 ①:

@@ -11,6 +11,7 @@
 """
 
 import pytest
+import torch
 
 from sglang.srt.layers.moe.prism.kernels import (
     KernelError,
@@ -34,7 +35,7 @@ def test_gpu_kernel_names_validated_only():
     """`torch_bmm`은 기존 plan 40개를 위해 유효한 이름으로 남지만 같은 구현을
     가리킨다 — bmm 경로는 가변 per-expert K를 표현할 수 없어 폐기됐다."""
     assert set(known_gpu_kernels()) == {"gemv_worklist", "torch_bmm", "gemv_worklist_mxfp4",
-                                       "gemv_worklist_fp8"}
+                                       "gemv_worklist_fp8", "gemv_worklist_fp8pt"}
     assert resolve_gpu_kernel("gemv_worklist") == "gemv_worklist"
     assert resolve_gpu_kernel("torch_bmm") == "torch_bmm"
 
@@ -50,5 +51,8 @@ def test_gpu_kernel_key_implies_store_format():
     fmt8 = gpu_store_format("gemv_worklist_fp8")
     assert fmt8.name == "fp8" and fmt8.k_align == 128
     assert fmt8.cold_kernels == ("kt_tile_k2_fp8b128", "kt_tile_k1_fp8b128")  # k2(페어) / k1(per-k) 타일
+    fpt = gpu_store_format("gemv_worklist_fp8pt")
+    assert fpt.name == "fp8pt" and fpt.k_align == 32 and fpt.cold_kernels == ("kt_tile_k2_fp8pt",)
+    assert fpt.has_scales and fpt.cold_slab_dtype is torch.uint8
     with pytest.raises(KernelError):
         gpu_store_format("nope")

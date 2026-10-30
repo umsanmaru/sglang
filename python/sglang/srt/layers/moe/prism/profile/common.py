@@ -95,40 +95,6 @@ class Shape:
                 "hidden": self.hidden, "inter": self.inter}
 
 
-# ─── fp8pt GPU 진입점 (MoE 포맷 없이 프로파일이 직접 든다) ──────────────────
-class Fp8PtGpu:
-    """per-tensor fp8의 GPU 진입점 묶음 — `formats.StoreFormat` 중 프로파일이 쓰는 부분만
-    (`gemv`, `gemv_gateup`, `warmup`, `cold_kernels`). MoE에는 per-tensor fp8 체크포인트가
-    없어 `moe/prism/formats.py`에 포맷을 두지 않는다; 커널은 dense 레인(Mistral)용으로
-    `jit_kernel/prism_gemv_fp8.py`에 있고(`gemv_fp8pt_*` 8개) 인자 순서는 블록판과 같다
-    (배율만 슬롯당 스칼라 `[E]`).
-    """
-
-    name = "fp8pt"
-    cold_kernels = ("kt_tile_k2_fp8pt",)
-
-    def gemv(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_fp8 as k
-
-        return {(False, False): k.gemv_fp8pt_indexed,
-                (True, False): k.gemv_fp8pt_indexed_pinned,
-                (False, True): k.gemv_fp8pt_indexed_sparse,
-                (True, True): k.gemv_fp8pt_indexed_pinned_sparse}[(pinned, sparse)]
-
-    def gemv_gateup(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_fp8 as k
-
-        return {(False, False): k.gemv_fp8pt_indexed_gateup,
-                (True, False): k.gemv_fp8pt_indexed_pinned_gateup,
-                (False, True): k.gemv_fp8pt_indexed_sparse_gateup,
-                (True, True): k.gemv_fp8pt_indexed_pinned_sparse_gateup}[(pinned, sparse)]
-
-    def warmup(self) -> None:
-        from sglang.jit_kernel.prism_gemv_fp8 import warmup_jit
-
-        warmup_jit()
-
-
 # ─── 스토어 dtype (= 백엔드 선택) ──────────────────────────────────────────
 @dataclass(frozen=True)
 class Store:
@@ -149,8 +115,8 @@ class Store:
     k_align: int
     elem_bytes: float          # weight 원소 하나의 바이트 (배율 제외)
     has_vec: bool = False
-    # MoE 포맷(`formats.FORMATS`)이 없는 스토어는 GPU 진입점 묶음을 직접 든다 (fp8pt →
-    # `Fp8PtGpu`). None이면 GPU가 없는 스토어 — cold(kt)만 잴 수 있다.
+    # MoE 포맷(`formats.FORMATS`)이 없는 스토어는 GPU 진입점 묶음을 직접 든다(현재 해당 없음 —
+    # fp8pt도 2026-09-06부터 정식 포맷). None이면 GPU가 없는 스토어 — cold(kt)만 잴 수 있다.
     gpu_adapter: Optional[Callable[[], object]] = None
     gpu: bool = True
 
@@ -346,11 +312,10 @@ STORES = {
                    elem_bytes=0.5),
     "fp8": Store(name="fp8", cpu_kernel="kt_tile_k2_fp8b128", k_align=128,
                  elem_bytes=1.0),
-    # per-tensor fp8 (Mistral-Medium-3.5 dense: weight_block_size null, 선형층당 배율 스칼라).
+    # per-tensor fp8 (Mistral static-tensor FP8: weight_block_size null, 행렬당 배율 스칼라).
     # 배율 블록이 없어 포맷상 K 정렬은 페어지만, GPU gemv의 row_off와 kt pack 타일이 32 배수를
-    # 요구하므로 티어 정렬은 32다. GPU 진입점은 `Fp8PtGpu` (MoE 포맷 아님).
-    "fp8pt": Store(name="fp8pt", cpu_kernel="kt_tile_k2_fp8pt", k_align=32,
-                   elem_bytes=1.0, gpu_adapter=Fp8PtGpu),
+    # 요구하므로 티어 정렬은 32다. GPU 진입점은 MoE 포맷 `formats.FP8PT`(gemv/grouped/grouped_cold).
+    "fp8pt": Store(name="fp8pt", cpu_kernel="kt_tile_k2_fp8pt", k_align=32, elem_bytes=1.0),
 }
 
 
