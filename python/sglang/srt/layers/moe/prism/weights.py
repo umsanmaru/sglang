@@ -58,8 +58,6 @@ from sglang.srt.layers.moe.prism.index import (
     IDX_DTYPE,
     LayerIndex,
     TierIndex,
-    from_bands,
-    validate_layer,
 )
 from sglang.srt.layers.moe.prism.numa import alloc_pinned_on_node
 from sglang.srt.layers.moe.prism.plan import (
@@ -284,35 +282,19 @@ def _gather_flat(src: torch.Tensor, ti: TierIndex, uniform_k, band_start):
 
 
 def _cold_flat(
-    src: torch.Tensor, ti: TierIndex, real_rows, tile: int
+    src: torch.Tensor, ti: TierIndex, real_rows, tile: int, minimum_rows=None
 ) -> tuple:
     """cold 스토어 [Σₑ N·k_pad(e)]와 패딩된 (row_off, k_index)를 만든다.
 
     expert 블록은 ckpt 방향 `[N, k_pad(e)]`이고 패딩 열은 0이다. 패딩 인덱스는
     아무 열이어도 되지만(weight가 0) 0을 넣는다 — kt가 축 범위를 검증한다.
     """
-    E, N, _ = src.shape
-    pad = [((int(r) + tile - 1) // tile) * tile for r in real_rows]
-    off = torch.zeros(E + 1, dtype=torch.int32)
-    for e, kp in enumerate(pad):
-        off[e + 1] = int(off[e]) + kp
-    total = int(off[-1])
-    flat = torch.zeros(total * N, dtype=src.dtype)
-    idx = torch.zeros(total, dtype=torch.int64)
-    for e in range(E):
-        kr, kp, o0 = int(real_rows[e]), pad[e], int(off[e])
-        if kr == 0:
-            continue
-        rows = ti.for_expert(e)[:kr].to(torch.int64)
-        idx[o0 : o0 + kr] = rows
-        blk = flat[o0 * N : (o0 + kp) * N].view(N, kp)
-        blk[:, :kr] = src[e].index_select(1, rows)
-    return (
-        flat.contiguous(),
-        off,
-        idx.to(IDX_DTYPE),
-        torch.tensor([int(r) for r in real_rows], dtype=torch.int32),
-    )
+    from sglang.srt.layers.moe.prism.loading_gather import gather_padded_columns
+
+    flat, off, idx, real = gather_padded_columns(
+        src, ti, real_rows, tile, minimum_rows=minimum_rows)
+    return flat, off, idx.to(IDX_DTYPE), real
+
 
 
 def _build_shard(
@@ -330,8 +312,10 @@ def _build_shard(
     w_flat, s_flat = fmt.gather(src, ti, uniform_k, band_start)
     ro = ti.row_off
     k_max = int((ro[1:] - ro[:-1]).max()) if ti.num_experts > 0 else 0
+    placed = place(w_flat)
+    placed._prism_prefill_rows = tuple(ti.row_off.tolist())
     return TierShard(
-        w_flat=place(w_flat),
+        w_flat=placed,
         row_off=ti.row_off.to(idx_device),
         k_index=ti.idx.to(idx_device),
         contiguous=ti.contiguous,
@@ -410,8 +394,9 @@ def prepare_layer_weights(
 
     # 티어 멤버십을 인덱스로 확정하고 **순열·페어를 검증한다** (계약 ①).
     # 밴드 검증이 plan.py에서 사라진 자리를 여기가 메운다 — 로드마다 돈다.
-    layer_index = from_bands(plan, layer_idx)
-    validate_layer(layer_index, dims, layer_idx)
+    from sglang.srt.layers.moe.prism.loading_cache import load_layer_index
+
+    layer_index = load_layer_index(plan, layer_idx)
 
     hot_shards: dict[Proj, Optional[TierShard]] = {}
     warm_shards: dict[Proj, Optional[TierShard]] = {}
@@ -463,8 +448,19 @@ def prepare_layer_weights(
                 warm_kt_shards[proj] = None
             else:
                 real = [warm_ti.k_rows(e) for e in range(dims.num_experts)]
+                # KT fuses GU and requires both sides to have a nonzero packed
+                # K when either is present. Represent a missing side by one
+                # zero tile; retain real_rows=0 for sparse masks and calibration.
+                minimum = None
+                if proj in (Proj.GATE, Proj.UP):
+                    other = Proj.UP if proj is Proj.GATE else Proj.GATE
+                    other_ti = layer_index.get(other, Tier.WARM)
+                    if other_ti is not None:
+                        minimum = [cold_tile_rows if r == 0 and other_ti.k_rows(e) else 0
+                                   for e, r in enumerate(real)]
                 flat, off, idx, real_t = _cold_flat(
-                    fmt.cold_source(src, f"{where} warm-kt"), warm_ti, real, cold_tile_rows)
+                    fmt.cold_source(src, f"{where} warm-kt"), warm_ti, real, cold_tile_rows,
+                    minimum_rows=minimum)
                 padded = TierIndex(row_off=off, idx=idx, contiguous=warm_ti.contiguous)
                 warm_kt_shards[proj] = ColdShard(
                     w_flat=flat, row_off=off, k_index=idx, real_rows=real_t,
