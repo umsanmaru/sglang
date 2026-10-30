@@ -56,9 +56,9 @@ _ENV_COLD_GPU_MIN_M = "SGLANG_PRISM_COLD_GPU_MIN_M"
 # cold hybrid: cold GPU 조건에서 expert의 이 비율만 GPU, 나머지 CPU 동시 계산 (미설정 = 끔).
 _ENV_COLD_HYBRID_FRAC = "SGLANG_PRISM_COLD_HYBRID_FRAC"
 # warm을 kt 포맷 slab(pinned) 한 벌로 (row-major pinned 대신). GPU는 packed GEMV /
-# cold-layout grouped로 읽는다. cold GPU view가 필요하다 (COLD_GPU_MIN_M=0이면 불가).
+# cold-layout grouped로 읽는다. bf16은 기본 ON; GPU view가 필요하다.
 _ENV_WARM_KT = "SGLANG_PRISM_WARM_KT"
-# warm-kt 모드에서 이 M 이상의 prefill은 warm을 CPU(warm-kt 인스턴스)가 계산 (미설정 = GPU).
+# 명시적 실험 override: 이 M 이상 warm CPU. bf16 미설정 기본은 1 < M < 1536 CPU.
 _ENV_WARM_CPU_MIN_M = "SGLANG_PRISM_WARM_CPU_MIN_M"
 # cold를 전용 stream + 플래그 wait로 (블로킹 콜백 없음). eager 전용. hybrid와 동시 불가.
 _ENV_COLD_ASYNC = "SGLANG_PRISM_COLD_ASYNC"
@@ -107,6 +107,11 @@ def _cold_gpu_min_m():
             PrismExecutor.GROUPED_MIN_M if gmin is None else int(gmin))
     v = int(raw)
     return None if v <= 0 else v
+
+
+def _warm_kt_enabled(fmt):
+    default = "1" if fmt.name == "bf16" and _cold_gpu_min_m() is not None else "0"
+    return os.environ.get(_ENV_WARM_KT, default) == "1"
 
 
 def _sglang_capture_mode() -> bool:
@@ -159,6 +164,10 @@ class _PrismRuntime:
             plan.expert(l, e).proj(p).has_tier(Tier.COLD)
             for (l, e) in plan.experts for p in Proj
         )
+        self.has_warm = any(
+            plan.expert(l, e).proj(p).has_tier(Tier.WARM)
+            for (l, e) in plan.experts for p in Proj
+        )
         if self.has_cold:
             # 스토어 포맷과 cold 커널의 호환 (mxfp4 ↔ kt_amx_fp4 / bf16 ↔ kt_*_bf16) — startup에서 즉사.
             self.fmt.check_cold_kernel(plan.kernels.cpu_cold)
@@ -202,7 +211,9 @@ class _PrismRuntime:
                                        every=int(os.environ.get(_ENV_MASK_STATS_EVERY, "16")),
                                        nan_probe=os.environ.get(_ENV_MASK_STATS_NANPROBE) == "1")
             self._executor = PrismExecutor(
-                self.plan, self._resources, self.cold() if self.has_cold else None,
+                self.plan, self._resources,
+                self.cold() if (self.has_cold or
+                                (self.has_warm and _warm_kt_enabled(self.fmt))) else None,
                 cold_stream=os.environ.get(_ENV_COLD_STREAM) == "1",
                 capture_mode_fn=_sglang_capture_mode,
                 grouped_min_m=None if gmin is None else int(gmin),
@@ -215,6 +226,9 @@ class _PrismRuntime:
                 hybrid_local_node=_hybrid_local_node(device),
                 warm_cpu_min_m=(int(os.environ[_ENV_WARM_CPU_MIN_M])
                                 if os.environ.get(_ENV_WARM_CPU_MIN_M) else None),
+                warm_cpu_max_m=(PrismExecutor.COLD_GPU_MIN_M
+                                if self.fmt.name == "bf16" and not os.environ.get(_ENV_WARM_CPU_MIN_M)
+                                else None),
                 cold_async=os.environ.get(_ENV_COLD_ASYNC) == "1",
                 cold_split=os.environ.get(_ENV_COLD_SPLIT) == "1",
                 mask_stats=mask_stats,
@@ -404,7 +418,8 @@ class PrismMoEMethod(FusedMoEMethodBase):
         # 존립 근거를 무너뜨리는데, 결과는 정확하고 느리기만 해서 어떤 테스트도
         # 잡지 못한다 — 그래서 로더가 배치 후 실제 노드를 검증하고 즉사한다.
         device = torch.device(torch.cuda.current_device())
-        warm_kt = os.environ.get(_ENV_WARM_KT) == "1"
+        # A single packed host copy serves small-prefill CPU and buffered GPU.
+        warm_kt = _warm_kt_enabled(runtime.fmt)
         prepared = prepare_layer_weights(
             self.layer_id, full.w13, full.w2, runtime.plan,
             calib=runtime.calib, device=device,

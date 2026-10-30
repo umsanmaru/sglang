@@ -48,6 +48,7 @@ class ColdSlab:
     k_max: int = 0          # expert당 최대 K(타일 올림) — W-resident 커널의 smem 크기
     fmt: object = None      # StoreFormat — GPU 진입점을 정한다
     layout: str = "kt_bf16"  # slab 레이아웃 태그 (kernels.cold_slab_layout) — 로더 변형 선택
+    expert_offsets: tuple = ()  # host element offsets, including end; staging metadata
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ def build_cold_gpu_layer(
         slab, blk_off = fmt.cold_slab(ptr, nbytes, expert_off, device)
         out[proj][node] = ColdSlab(
             slab=slab, blk_off=blk_off,
+            expert_offsets=tuple(o // slab.element_size() for o in expert_off),
             row_off=row_off_cpu.to(device=device, dtype=torch.int32),
             k_index=shard.k_index.to(device),
             n=int(v["n"]), n_start=n_start,

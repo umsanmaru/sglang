@@ -63,7 +63,6 @@ from sglang.srt.layers.moe.prism.index import (
 )
 from sglang.srt.layers.moe.prism.numa import alloc_pinned_on_node
 from sglang.srt.layers.moe.prism.plan import (
-    ExpertProjPlan,
     Plan,
     PlanError,
     Proj,
@@ -344,6 +343,119 @@ def _build_shard(
     )
 
 
+def _by_proj(shards: Mapping[Proj, object]) -> dict:
+    """proj 키 dict → gate/up/down 키워드. 세 스토어 타입이 같은 세 필드를 받는다."""
+    return {"gate": shards[Proj.GATE], "up": shards[Proj.UP], "down": shards[Proj.DOWN]}
+
+
+@dataclass(frozen=True)
+class _CalibGather:
+    """점수 재료(wn²·pair_dot)를 weight와 **같은 인덱스·같은 오프셋**으로 모으는 창구.
+
+    티어마다 절단이 다르고 cold/warm-kt는 타일 올림까지 받으므로, "어느 인덱스로
+    모으느냐"가 티어별로 갈린다. dense plan(calib 없음)이면 항상 None을 낸다.
+    """
+
+    tables: Optional[CalibTables]
+    layer_idx: int
+    proj: Proj
+    where: str
+
+    def for_tier(self, ti: TierIndex, tier_name: str,
+                 real_rows=None) -> Optional[CalibShard]:
+        if self.tables is None:
+            return None
+        return self.tables.gather_index(
+            self.layer_idx, self.proj, ti, real_rows, f"{self.where} {tier_name}")
+
+
+def _hot_placer(device):
+    """hot 스토어의 거처 — VRAM (계약 ③)."""
+    def place(t: torch.Tensor) -> torch.Tensor:
+        return t.to(device, non_blocking=False)
+    return place
+
+
+def _warm_placer(pin_memory: bool, warm_node: Optional[int], where: str):
+    """warm 스토어의 거처 — `warm_node`에 바인딩된 pinned 메모리. GPU가 UVA로 제자리
+    읽으므로 어느 소켓에 앉느냐가 곧 PCIe 경로다. pin_memory=False는 CUDA 없는
+    테스트용 탈출구다."""
+    def place(t: torch.Tensor) -> torch.Tensor:
+        if not pin_memory:
+            return t.contiguous()
+        store = alloc_pinned_on_node(
+            tuple(t.shape), t.dtype, warm_node, f"{where} warm store")
+        store.copy_(t)
+        return store
+    return place
+
+
+def _resolve_store_format(plan: Plan, fmt: Optional[StoreFormat]) -> StoreFormat:
+    """스토어 포맷 — 주어지지 않으면 plan의 gpu_warm 커널 키가 함의하는 것 (계약 ①)."""
+    if fmt is not None:
+        return fmt
+    from sglang.srt.layers.moe.prism.kernels import gpu_store_format
+
+    return gpu_store_format(plan.kernels.gpu_warm)
+
+
+def _check_calib_pairing(layer_idx: int, plan: Plan,
+                         calib: Optional[CalibTables], dims) -> None:
+    """plan.sparsity와 calib은 all-or-nothing이다 — 한쪽만 있으면 마스킹이 조용히
+    사라지거나 테이블이 통째로 버려지므로 즉사한다."""
+    if (plan.sparsity is None) != (calib is None):
+        raise PlanError(
+            f"layer {layer_idx}: plan.sparsity and calib must both be present "
+            f"or both absent (sparsity={plan.sparsity is not None}, "
+            f"calib={calib is not None})"
+        )
+    if calib is not None:
+        calib.check_dims(dims, plan.sparsity)
+
+
+def _index_device(layer_index: LayerIndex, layer_idx: int,
+                  device: Optional[torch.device]) -> torch.device:
+    """인덱스(row_off·k_index)가 갈 곳 = 커널이 읽는 곳. HOT 행이 있으면 device는
+    **로더의 필수 입력**이다 (계약 ③: hot 스토어는 VRAM 상주라 배치 device를
+    로더가 스스로 정할 수 없다). hot 없는 plan은 CPU로 남아 CUDA 없이도 돈다."""
+    if any(layer_index.get(p, Tier.HOT) is not None for p in Proj) and device is None:
+        raise PlanError(
+            f"layer {layer_idx}: plan has HOT rows but no device was given — "
+            f"hot store는 VRAM 상주라 배치 device가 로더의 입력이어야 한다"
+        )
+    return device if device is not None else torch.device("cpu")
+
+
+def _prepare_warm_kt_shard(src: ProjSource, ti: TierIndex, *, fmt: StoreFormat,
+                           num_experts: int, tile_rows: int, where: str,
+                           calib: _CalibGather) -> ColdShard:
+    """warm을 **kt 포맷**으로 절단한다 — cold와 같은 절단(타일 올림, ckpt 방향)이고
+    저장(pack)은 kt가 한다. 그래서 산출물도 cold와 같은 ColdShard다."""
+    real = [ti.k_rows(e) for e in range(num_experts)]
+    flat, off, idx, real_t = _cold_flat(
+        fmt.cold_source(src, f"{where} warm-kt"), ti, real, tile_rows)
+    padded = TierIndex(row_off=off, idx=idx, contiguous=ti.contiguous)
+    return ColdShard(
+        w_flat=flat, row_off=off, k_index=idx, real_rows=real_t,
+        calib=calib.for_tier(padded, "warm", real_rows=real),
+    )
+
+
+def _prepare_cold_shard(src: ProjSource, ti: TierIndex, *, fmt: StoreFormat,
+                        num_experts: int, tile_rows: int, where: str,
+                        calib: _CalibGather) -> ColdShard:
+    """cold 스토어. 타일 올림은 커널 키가 함의하는 값이고(계약 ①), 패딩 열은 0이다."""
+    real = [ti.k_rows(e) for e in range(num_experts)]
+    fmt.check_index(ti, f"{where} cold")
+    flat, s_flat, off, idx, real_t = fmt.cold_flat(src, ti, real, tile_rows)
+    idx = idx.to(IDX_DTYPE)
+    padded = TierIndex(row_off=off, idx=idx, contiguous=ti.contiguous)
+    return ColdShard(
+        w_flat=flat, row_off=off, k_index=idx, real_rows=real_t,
+        calib=calib.for_tier(padded, "cold", real_rows=real), fmt=fmt, s_flat=s_flat,
+    )
+
+
 def _warm_kt_tensors(enabled: bool, shards: dict, layer_idx: int):
     """warm-kt 인스턴스 입력. kt partial 인스턴스는 세 proj를 모두 요구하므로(cold와
     같은 제약) warm이 일부 proj에만 있는 plan은 이 모드로 실행할 수 없다 — 조용히
@@ -393,117 +505,65 @@ def prepare_layer_weights(
     (kernels.gpu_store_format). mxfp4면 w13_scale/w2_scale([E, N, K/32])이 필수다.
     """
     dims = plan.dims
-    if fmt is None:
-        from sglang.srt.layers.moe.prism.kernels import gpu_store_format
-
-        fmt = gpu_store_format(plan.kernels.gpu_warm)
+    fmt = _resolve_store_format(plan, fmt)
     full = FullWeights(w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale)
-    if (plan.sparsity is None) != (calib is None):
-        raise PlanError(
-            f"layer {layer_idx}: plan.sparsity and calib must both be present "
-            f"or both absent (sparsity={plan.sparsity is not None}, "
-            f"calib={calib is not None})"
-        )
-    if calib is not None:
-        calib.check_dims(dims, plan.sparsity)
+    _check_calib_pairing(layer_idx, plan, calib, dims)
     fmt.check_full_shapes(full, dims, f"layer {layer_idx}")
 
     # 티어 멤버십을 인덱스로 확정하고 **순열·페어를 검증한다** (계약 ①).
     # 밴드 검증이 plan.py에서 사라진 자리를 여기가 메운다 — 로드마다 돈다.
     layer_index = from_bands(plan, layer_idx)
     validate_layer(layer_index, dims, layer_idx)
+    idx_device = _index_device(layer_index, layer_idx, device)
+    place_hot = _hot_placer(device)
 
     hot_shards: dict[Proj, Optional[TierShard]] = {}
     warm_shards: dict[Proj, Optional[TierShard]] = {}
     warm_kt_shards: dict[Proj, Optional[ColdShard]] = {}
     cold_shards: dict[Proj, Optional[ColdShard]] = {}
 
-    if any(layer_index.get(p, Tier.HOT) is not None for p in Proj) and device is None:
-        raise PlanError(
-            f"layer {layer_idx}: plan has HOT rows but no device was given — "
-            f"hot store는 VRAM 상주라 배치 device가 로더의 입력이어야 한다"
-        )
-    idx_device = device if device is not None else torch.device("cpu")
-
     for proj in Proj:
-        pp = plan.expert(layer_idx, 0).proj(proj)
         where = f"layer {layer_idx} {proj.value}"
         src = fmt.proj_source(full, dims.intermediate_size, proj)  # [E, N, K…]
+        gather = _CalibGather(calib, layer_idx, proj, where)
         for tier in (Tier.HOT, Tier.WARM):
             ti_ = layer_index.get(proj, tier)
             if ti_ is not None:
                 fmt.check_index(ti_, f"{where} {tier.value}")
 
-        def tier_calib(ti, tier_name, real_rows=None):
-            """점수 재료는 weight와 **같은 인덱스·같은 오프셋**으로 모인다."""
-            if calib is None:
-                return None
-            return calib.gather_index(
-                layer_idx, proj, ti, real_rows, f"{where} {tier_name}")
-
         hot_ti = layer_index.get(proj, Tier.HOT)
         hot_shards[proj] = None if hot_ti is None else _build_shard(
-            src, hot_ti, fmt=fmt, idx_device=idx_device,
-            place=lambda t: t.to(device, non_blocking=False),
-            calib=tier_calib(hot_ti, "hot"),
+            src, hot_ti, fmt=fmt, idx_device=idx_device, place=place_hot,
+            calib=gather.for_tier(hot_ti, "hot"),
         )
 
+        # warm은 두 갈래다: 기본은 GPU가 읽는 row-major pinned 스토어, warm_kt면
+        # cold와 같은 kt 포맷(그래서 산출물 타입도 cold와 같다).
         warm_ti = layer_index.get(proj, Tier.WARM)
-        def place_warm(t, where=where):
-            if not pin_memory:
-                return t.contiguous()
-            store = alloc_pinned_on_node(
-                tuple(t.shape), t.dtype, warm_node, f"{where} warm store")
-            store.copy_(t)
-            return store
         if warm_kt:
-            # warm = kt 포맷: cold와 같은 절단(타일 올림, ckpt 방향). 저장은 kt가 pack.
             warm_shards[proj] = None
-            if warm_ti is None:
-                warm_kt_shards[proj] = None
-            else:
-                real = [warm_ti.k_rows(e) for e in range(dims.num_experts)]
-                flat, off, idx, real_t = _cold_flat(
-                    fmt.cold_source(src, f"{where} warm-kt"), warm_ti, real, cold_tile_rows)
-                padded = TierIndex(row_off=off, idx=idx, contiguous=warm_ti.contiguous)
-                warm_kt_shards[proj] = ColdShard(
-                    w_flat=flat, row_off=off, k_index=idx, real_rows=real_t,
-                    calib=tier_calib(padded, "warm", real_rows=real),
-                )
+            warm_kt_shards[proj] = None if warm_ti is None else _prepare_warm_kt_shard(
+                src, warm_ti, fmt=fmt, num_experts=dims.num_experts,
+                tile_rows=cold_tile_rows, where=where, calib=gather,
+            )
         else:
+            warm_kt_shards[proj] = None
             warm_shards[proj] = None if warm_ti is None else _build_shard(
-                src, warm_ti, fmt=fmt, idx_device=idx_device, place=place_warm,
-                calib=tier_calib(warm_ti, "warm"),
+                src, warm_ti, fmt=fmt, idx_device=idx_device,
+                place=_warm_placer(pin_memory, warm_node, where),
+                calib=gather.for_tier(warm_ti, "warm"),
             )
 
         cold_ti = layer_index.get(proj, Tier.COLD)
-        if cold_ti is None:
-            cold_shards[proj] = None
-        else:
-            # 타일 올림은 커널 키가 함의하는 값이고(계약 ①), 패딩 열은 0이다.
-            real = [cold_ti.k_rows(e) for e in range(dims.num_experts)]
-            fmt.check_index(cold_ti, f"{where} cold")
-            flat, s_flat, off, idx, real_t = fmt.cold_flat(src, cold_ti, real, cold_tile_rows)
-            idx = idx.to(IDX_DTYPE)
-            padded = TierIndex(row_off=off, idx=idx, contiguous=cold_ti.contiguous)
-            cold_shards[proj] = ColdShard(
-                w_flat=flat, row_off=off, k_index=idx, real_rows=real_t,
-                calib=tier_calib(padded, "cold", real_rows=real), fmt=fmt, s_flat=s_flat,
-            )
+        cold_shards[proj] = None if cold_ti is None else _prepare_cold_shard(
+            src, cold_ti, fmt=fmt, num_experts=dims.num_experts,
+            tile_rows=cold_tile_rows, where=where, calib=gather,
+        )
 
     return PreparedWeights(
-        hot=HotStore(
-            gate=hot_shards[Proj.GATE], up=hot_shards[Proj.UP],
-            down=hot_shards[Proj.DOWN],
-        ),
-        warm=WarmStore(
-            gate=warm_shards[Proj.GATE], up=warm_shards[Proj.UP],
-            down=warm_shards[Proj.DOWN],
-        ),
-        cold=PendingColdTensors(
-            gate=cold_shards[Proj.GATE], up=cold_shards[Proj.UP],
-            down=cold_shards[Proj.DOWN],
-        ),
+        hot=HotStore(**_by_proj(hot_shards)),
+        warm=WarmStore(**_by_proj(warm_shards)),
+        cold=PendingColdTensors(**_by_proj(cold_shards)),
         thr=(
             None if calib is None
             else {proj: calib.thr(layer_idx, proj) for proj in Proj}

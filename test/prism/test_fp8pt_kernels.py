@@ -188,6 +188,67 @@ def test_gemv_fp8pt_sparse_thr0_bitwise_and_masked():
     assert not torch.equal(masked, dense)
 
 
+def _sparse_spec_k1(E_, thr_val, a=None):
+    """per-k spec. `a`(=wn²)를 주면 score k1w1(`x²·a >= thr²`), 안 주면 k1(`|x| >= thr`) —
+    **a의 유무가 곧 점수 선택**이라 k1에서는 반드시 비워야 한다."""
+    from sglang.srt.layers.moe.prism.tiers import SparseSpec
+
+    tab = torch.full((E_, 4), thr_val, device="cuda")
+    return SparseSpec(a=a, c=None, thr=tab, p=0.5, lam=0.0, pmax=0.9, grid=0.1,
+                      ng=4, renorm_it=1, per_k=True)
+
+
+@cuda_required
+@pytest.mark.parametrize("pinned", [False, True])
+def test_gemv_fp8pt_sparsek1_thr0_bitwise_and_masked(pinned):
+    """per-tensor × score k1 (2026-09-07에 열린 조합; kt 짝은 `kt_tile_k1_fp8pt`).
+
+    thr=0 ↔ dense 비트일치, thr>0 ↔ dense(|x|<thr 인 k를 0으로 둔 x)와 **비트일치**.
+    죽은 k는 dense에서 x=0이라 곱이 0이고 커널은 그 라인을 안 읽을 뿐이므로 항과
+    순서가 같다 — tolerance 뒤에 "엉뚱한 k를 죽였다"가 숨지 못한다.
+    """
+    from sglang.jit_kernel.prism_gemv_fp8 import (
+        gemv_fp8pt_indexed, gemv_fp8pt_indexed_pinned,
+        gemv_fp8pt_indexed_pinned_sparse, gemv_fp8pt_indexed_sparse,
+    )
+
+    N, K, k_rows, M = 128, 256, 160, 2
+    codes, scales, row_off, kidx, _ = _store(N, K, k_rows, True, seed=131)
+    x, ids = _inputs(M, K, True, False, seed=132)
+    if pinned:
+        codes, scales = codes.cpu().pin_memory(), scales.cpu().pin_memory()
+    dense_fn = gemv_fp8pt_indexed_pinned if pinned else gemv_fp8pt_indexed
+    sparse_fn = gemv_fp8pt_indexed_pinned_sparse if pinned else gemv_fp8pt_indexed_sparse
+    stream = torch.cuda.current_stream()
+    w = torch.rand(M, TOPK, generator=torch.Generator().manual_seed(133)).cuda()
+    xd, idd = x.cuda(), ids.cuda()
+
+    dense = torch.zeros(M, TOPK, N, dtype=torch.bfloat16, device="cuda")
+    dense_fn(xd, idd, codes, scales, row_off, kidx, dense, 0, False, stream)
+    sp0 = torch.zeros_like(dense)
+    sparse_fn(xd, idd, w, codes, scales, row_off, kidx, sp0, _sparse_spec_k1(E, 0.0),
+              0, False, stream)
+    torch.cuda.synchronize()
+    assert torch.equal(dense, sp0)
+
+    # **0이 아닌** |x| 중앙값 — 0을 죽이는 것은 무의미하다 (곱이 이미 0이라 dense와
+    # 같은 값이 나와 "마스킹이 걸렸는지"를 구분하지 못한다).
+    nz = x.float().abs().reshape(-1)
+    nz = nz[nz > 0].sort().values
+    thr = 0.5 * (float(nz[nz.numel() // 2]) + float(nz[nz.numel() // 2 + 1]))
+    keep = x.float().abs() >= thr
+    assert 0 < int(keep.sum()) < int((x.float().abs() > 0).sum())
+    got = torch.zeros_like(dense)
+    sparse_fn(xd, idd, w, codes, scales, row_off, kidx, got, _sparse_spec_k1(E, thr),
+              0, False, stream)
+    ref = torch.zeros_like(dense)
+    xm = torch.where(keep, x.float(), torch.zeros_like(x.float())).to(torch.bfloat16).cuda()
+    dense_fn(xm, idd, codes, scales, row_off, kidx, ref, 0, False, stream)
+    torch.cuda.synchronize()
+    assert torch.equal(got, ref)
+    assert not torch.equal(got, dense)
+
+
 @cuda_required
 def test_gemv_fp8pt_equals_b128_with_uniform_scales():
     """pt 스토어 ≡ 같은 스칼라를 모든 블록에 채운 b128 스토어 (exact 픽스처 → 비트일치).

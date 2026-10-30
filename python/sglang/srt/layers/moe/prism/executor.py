@@ -30,6 +30,10 @@ sparsity (계약 ①): plan.sparsity가 있으면 **cold만** 마스킹된다. �
 이 모듈은 env/외부 시스템을 직접 읽지 않는다: 모드 결정 입력(cold_stream,
 capture_mode_fn)은 전부 생성자 주입이고, 호출별 모드는 _plan_flow()가
 _LayerFlow 값 객체로 1회 확정한다.
+
+읽는 순서: `CpuDispatch`(CPU가 cold/warm을 어떻게 조달하는가) → `_LayerFlow`
+(한 호출의 실행 계획) → `_plan_flow`(그 계획을 세우는 곳) → `run_layer`(두
+phase가 같은 네 걸음을 밟는 본체) → `_cpu_partials_begin/end`(dispatch별 구현).
 """
 
 from __future__ import annotations
@@ -37,7 +41,8 @@ from __future__ import annotations
 import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
-from typing import Callable, Mapping, Optional
+from enum import Enum
+from typing import Callable, Optional
 
 import torch
 
@@ -77,17 +82,134 @@ from sglang.srt.layers.moe.prism.tiers import LayerTiers, build_layer_tiers
 from sglang.srt.layers.moe.prism.weights import PreparedWeights
 
 
-@dataclass(frozen=True)
-class _LayerFlow:
-    """run_layer 한 호출의 실행 모드 — _plan_flow()가 상단에서 1회 확정하는
-    값 객체. GPU 티어는 여기 없다(모드가 없으므로) — 남은 것은 전부 cold 조달
-    방식이다."""
+class CpuDispatch(Enum):
+    """한 호출에서 **CPU가 cold/warm partial을 어떻게 조달하는가** — 이 값 하나가
+    run_layer의 유일한 CPU-측 분기다.
+
+    NONE 이외의 셋은 "언제 누가 블록되는가"만 다르다. 셋 모두 같은 두 primitive
+    (submit → sync, 계약 ④)를 쓰고 결과 partial의 의미도 같다.
+    """
+
+    #: CPU 작업 없음 — cold 행이 없거나 GPU가 cold slab을 통째로 읽는다(cold_on_gpu).
+    NONE = "none"
+    #: submit → GPU 티어 발행 → 호출 스레드가 블로킹 sync. 기본 경로.
+    HOST_BLOCK = "host_block"
+    #: submit/sync host node를 **곁 스트림**(resources.cold_stream)에 얹는다. sync가
+    #: main의 hot/warm 커널을 기다리지 않는다 (cold 전용 — warm/hybrid와 공존 불가).
+    SIDE_STREAM = "side_stream"
+    #: 전부 cold stream에 enqueue하고 pinned flag wait 커널로 합류 — host가 어디서도
+    #: 블록되지 않는다. ⚠ 실험적·미완 (PrismExecutor.__init__의 경고 참조).
+    ASYNC_FLAG = "async_flag"
+
+
+#: run_layer의 두 phase 이름. staging 버퍼와 submit 진입점을 고르는 키다.
+GATEUP = "gateup"
+DOWN = "down"
+
+
+@dataclass(frozen=True, slots=True)
+class _ColdChannel:
+    """cold 호출을 **어느 통로로** 내보내는가 — graph 캡처 가능성이 정하는 부분.
+
+    graph-safe 경로는 캡처 중 불법 연산(pageable D2H, tolist, event.synchronize,
+    blocking copy)을 전부 우회해야 하므로, 여기서 갈린 결정이 아래 모든 cold
+    호출의 인자(cuda_stream, qlen_ptr, expert_ids 원천)를 결정한다.
+    """
 
     graph_flow: bool                  # graph-safe 경로인가 (캡처/워밍업/강제)
     use_cold_stream: bool             # cold 호출을 stream host node로 보낼 것인가
     stream_arg: Optional[int]         # cold submit/sync의 cudaStream_t (None = host 경로)
     qlen_ptr: int                     # cold task가 역참조할 qlen 버퍼 주소
     ids_cpu: Optional[torch.Tensor]   # eager 경로 expert_ids 원천 / graph는 None
+
+
+@dataclass(frozen=True, slots=True)
+class _LayerFlow:
+    """run_layer 한 호출의 실행 계획 — `_plan_flow()`가 상단에서 **1회** 확정하는
+    값 객체. 본문에는 여기서 정해진 것 말고 다른 분기가 없다.
+
+    네 묶음이다: ① cold 조달 통로, ② 이 호출의 형태, ③ 티어 배치(cold/warm을
+    CPU와 GPU에 어떻게 나눌 것인가), ④ 관측.
+    """
+
+    # ① 통로 (_ColdChannel에서 평탄화 — 본문에서 가장 자주 읽힌다)
+    graph_flow: bool
+    use_cold_stream: bool
+    stream_arg: Optional[int]
+    qlen_ptr: int
+    ids_cpu: Optional[torch.Tensor]
+    # ② 이 호출의 형태
+    m: int                                    # 토큰 수 (decode=1)
+    k: int                                    # top_k
+    masking: bool                             # cold sparsity 적용 (decode 전용, 계약 ①)
+    topk_w32: torch.Tensor                    # 라우터 가중 fp32 — 커널과 rejoin이 공유
+    grouping: Optional[Grouping]              # prefill 형태(expert별 묶음) / None = worklist
+    # ③ 티어 배치
+    cold_on_gpu: bool                         # GPU 티어가 cold slab을 제자리 읽는가
+    hybrid: bool                              # cold를 GPU(expert 일부) ∥ CPU(나머지)로 쪼개는가
+    cpu_dispatch: CpuDispatch                 # CPU 조달 방식 — 본문의 유일한 CPU 분기
+    cpu_cold: bool                            # CPU가 cold partial을 계산하는가
+    cpu_warm: bool                            # CPU(kt warm 인스턴스)가 warm partial을 계산하는가
+    skip_gpu_warm: bool                       # GPU warm 티어를 건너뛰는가 (CPU가 대신 낸다)
+    cold_grouping_gateup: Optional[Grouping]  # hybrid에서 GPU가 맡은 expert로 제한된 그룹핑
+    cold_grouping_down: Optional[Grouping]
+    # ④ 관측 (mask_stats; graph 경로에선 파이썬이 replay되지 않아 항상 꺼진다)
+    probe_on: bool                            # NaN 진단 프로브 (prefill 포함)
+    stats_on: bool                            # effective sparsity 실측 (decode·eager)
+
+
+@dataclass(frozen=True, slots=True)
+class _PhasePorts:
+    """한 phase(gateup/down)의 staging 버퍼와 cold submit 진입점 묶음.
+
+    gateup과 down은 **글자만 다른 같은 절차**다(입력을 내리고 submit하고 partial을
+    올린다). 그 차이를 여기 한 번 적어두면 아래 세 dispatch 경로가 phase를 몰라도
+    된다. staging도 cold backend도 생성 뒤 바뀌지 않으므로 executor당 한 벌만 만든다.
+    """
+
+    name: str                                     # "gateup" | "down"
+    tag: str                                      # nvtx 약칭 ("gu" | "dn")
+    is_gateup: bool
+    fill_label: str                               # nvtx용 입력 D2H 이름
+    fill_inputs: Callable[..., None]              # hidden→_x(+expert_ids) / act→_act
+    input_ptr: Callable[[], int]
+    submit_cold_name: str                         # cold backend 진입점 이름 — 늦게 꺾는다
+    submit_warm_name: str
+    cold_partial_ptr: Callable[[], int]
+    warm_partial_ptr: Callable[[], int]
+    cold_out: Callable[[int], torch.Tensor]
+    warm_out: Callable[[int], torch.Tensor]
+
+
+def _build_phase_ports(staging) -> dict:
+    """phase 이름 → `_PhasePorts`."""
+
+    def fill_gateup(x, expert_ids, non_blocking: bool) -> None:
+        staging.fill_x(x, non_blocking=non_blocking)
+        staging.fill_expert_ids(expert_ids, non_blocking=non_blocking)
+
+    def fill_down(act, _expert_ids, non_blocking: bool) -> None:
+        # expert_ids는 gateup에서 이미 내려갔고 두 phase가 같은 버퍼를 읽는다.
+        staging.fill_act(act, non_blocking=non_blocking)
+
+    return {
+        GATEUP: _PhasePorts(
+            name=GATEUP, tag="gu", is_gateup=True, fill_label="fill_x",
+            fill_inputs=fill_gateup, input_ptr=staging.x_ptr,
+            submit_cold_name="submit_gateup", submit_warm_name="submit_warm_gateup",
+            cold_partial_ptr=staging.partial_gateup_ptr,
+            warm_partial_ptr=staging.warm_partial_gateup_ptr,
+            cold_out=staging.gateup_out, warm_out=staging.warm_gateup_out,
+        ),
+        DOWN: _PhasePorts(
+            name=DOWN, tag="dn", is_gateup=False, fill_label="fill_act",
+            fill_inputs=fill_down, input_ptr=staging.act_ptr,
+            submit_cold_name="submit_down", submit_warm_name="submit_warm_down",
+            cold_partial_ptr=staging.partial_down_ptr,
+            warm_partial_ptr=staging.warm_partial_down_ptr,
+            cold_out=staging.down_out, warm_out=staging.warm_down_out,
+        ),
+    }
 
 
 class PrismExecutor:
@@ -119,6 +241,7 @@ class PrismExecutor:
                  cold_gpu_min_m: Optional[int] = None,
                  cold_hybrid_frac=None, hybrid_local_node: int = 0,
                  warm_cpu_min_m: Optional[int] = None,
+                 warm_cpu_max_m: Optional[int] = None,
                  cold_async: bool = False,
                  cold_split: bool = False,
                  mask_stats=None):
@@ -151,9 +274,10 @@ class PrismExecutor:
         # 조용히 CPU로 돌아 "켰는데 안 켜진" 상태가 된다.
         self._cold_gpu_min_m = cold_gpu_min_m
         self._layer_cold_gpu: dict[int, bool] = {}
-        # warm-kt 모드에서 이 M 이상의 prefill은 warm 행을 GPU 대신 **CPU(warm-kt 인스턴스)**가
-        # 계산한다 — hot=0이면 kt 네이티브와 같은 CPU FLOPs. None = 항상 GPU.
+        # warm_cpu_max_m: 1 < M < max is CPU prefill (exclusive upper bound).
+        # warm_cpu_min_m retains the legacy explicit large-M CPU override.
         self._warm_cpu_min_m = warm_cpu_min_m
+        self._warm_cpu_max_m = warm_cpu_max_m
         # cold_async (2026-08-27): cold 경로를 **전용 stream**에 두고 완료를 블로킹 sync
         # 콜백 대신 pinned 플래그 wait 커널로 받는다 — host 스레드도 CUDA 콜백 스레드도
         # 어디서도 블록되지 않아, hot/warm stream과 직렬화되지 않는다. eager 전용
@@ -200,12 +324,10 @@ class PrismExecutor:
         self._mask_stats = mask_stats
         # cold task가 나중에 읽는 qlen — 주소 고정 멤버 (계약 ④의 포인터 경유)
         self._qlen_pin = torch.zeros(1, dtype=torch.int32)
-        # graph 경로 qlen 버퍼는 **bs별로 격리**한다 (Finding A). 캡처가 baked하는
-        # 포인터를 eager의 _qlen_pin과 공유하면 나중의 eager prefill 쓰기에
-        # 노출돼 replay마다 cold가 L토큰짜리로 돌아 perf가 붕괴한다 (실측 30B
-        # decode graph 328ms/tok vs eager 106ms/tok). bs가 다른 replay끼리도
-        # 절대 공유하지 않는다.
+        # graph/stream 경로의 bs별 qlen 버퍼 — 격리 이유는 `_qlen_pin_for` 참조.
         self._qlen_pins_graph: dict[int, torch.Tensor] = {}
+        # phase(gateup/down)별 staging·submit 진입점 (CPU 경로 전용 어댑터).
+        self._ports = _build_phase_ports(resources.staging)
 
     def register_layer(self, layer_idx: int, prepared: PreparedWeights) -> None:
         """Stage 2 산출물 등록. cold 행이 있으면 backend에 이미 load_layer된
@@ -246,10 +368,9 @@ class PrismExecutor:
         self._layer_warm_kt[layer_idx] = warm_kt is not None
 
     # ── 모드 결정 ──────────────────────────────────────────────────────────
-    def _plan_flow(self, m: int, topk_ids: torch.Tensor) -> _LayerFlow:
-        """호출별 실행 모드를 1회 확정. graph-safe 경로는 캡처 중 불법 연산
-        (pageable D2H, tolist, event.synchronize, blocking copy)을 전부
-        우회해야 하므로, 여기서 갈라진 결정이 본문의 유일한 분기 원천이다."""
+    # ── 모드 결정 ──────────────────────────────────────────────────────────
+    def _plan_cold_channel(self, m: int, topk_ids: torch.Tensor) -> _ColdChannel:
+        """cold 호출을 내보낼 통로를 고른다 (graph-safe 여부와 그 귀결)."""
         graph_flow = (
             torch.cuda.is_current_stream_capturing()
             or self._force_graph_path
@@ -266,14 +387,10 @@ class PrismExecutor:
         # `topk_ids.to("cpu")`가 없어 host가 앞으로 달린다 — 그 blocking이 작은 M에서
         # 층당 4.7 ms의 노출된 파이프라인 대기로 찍혔다 (2026-08-27 nsys). qlen은
         # 매 스텝 host 쓰기(stream 순서 밖) 대신 **고정 pinned 상수 버퍼**를 쓴다.
-        if graph_flow or self._cold_stream:
-            qlen_pin = self._qlen_pins_graph.get(m)
-            if qlen_pin is None:
-                qlen_pin = torch.full((1,), m, dtype=torch.int32)
-                self._qlen_pins_graph[m] = qlen_pin
-            return _LayerFlow(
+        if use_cold_stream:
+            return _ColdChannel(
                 graph_flow=graph_flow, use_cold_stream=True, stream_arg=stream_arg,
-                qlen_ptr=qlen_pin.data_ptr(), ids_cpu=None,
+                qlen_ptr=self._qlen_pin_for(m).data_ptr(), ids_cpu=None,
             )
         # 순수 eager(스트림 통합 없음): cold가 expert_ids를 host에서 읽으므로 blocking
         # D2H 1회. 그 blocking이 뒤따르는 host 쓰기(qlen_pin)의 사실상 throttle이다
@@ -283,10 +400,121 @@ class PrismExecutor:
         else:
             with _nvtx("s1.topk_d2h"):
                 ids_cpu = topk_ids.to("cpu")
-        return _LayerFlow(
+        return _ColdChannel(
             graph_flow=False, use_cold_stream=False,
             stream_arg=stream_arg, qlen_ptr=self._qlen_pin.data_ptr(),
             ids_cpu=ids_cpu,
+        )
+
+    def _qlen_pin_for(self, m: int) -> torch.Tensor:
+        """graph/stream 경로의 qlen 버퍼 — **bs별로 격리**한다 (Finding A). 캡처가
+        baked하는 포인터를 eager의 _qlen_pin과 공유하면 나중의 eager prefill 쓰기에
+        노출돼 replay마다 cold가 L토큰짜리로 돌아 perf가 붕괴한다 (실측 30B decode
+        graph 328ms/tok vs eager 106ms/tok). bs가 다른 replay끼리도 절대 공유하지 않는다."""
+        pin = self._qlen_pins_graph.get(m)
+        if pin is None:
+            pin = torch.full((1,), m, dtype=torch.int32)
+            self._qlen_pins_graph[m] = pin
+        return pin
+
+    def _select_cpu_dispatch(self, channel: _ColdChannel, cpu_cold: bool,
+                             cpu_warm: bool, hybrid: bool) -> CpuDispatch:
+        """남은 CPU 몫을 어느 통로로 보낼지 고른다. 우선순위가 곧 의미다 —
+        실험적 ASYNC_FLAG > 곁 스트림 SIDE_STREAM > 기본 HOST_BLOCK."""
+        if not (cpu_cold or cpu_warm):
+            return CpuDispatch.NONE
+        has_side_stream = self._res.cold_stream is not None
+        if (self._cold_async and has_side_stream
+                and not channel.graph_flow and not hybrid):
+            return CpuDispatch.ASYNC_FLAG
+        # 곁 스트림은 cold 하나만 남았을 때만 — warm·hybrid는 main에서 staging과
+        # 마스크를 공유하므로 함께 옮길 수 없다.
+        if (self._cold_split and has_side_stream and channel.use_cold_stream
+                and cpu_cold and not cpu_warm and not hybrid):
+            return CpuDispatch.SIDE_STREAM
+        return CpuDispatch.HOST_BLOCK
+
+    def _plan_flow(self, layer_idx: int, m: int, k: int, topk_ids: torch.Tensor,
+                   topk_weights: torch.Tensor, device) -> _LayerFlow:
+        """이 호출의 실행 계획을 **1회** 확정한다 — run_layer 본문의 분기는 전부
+        여기서 정해진 `_LayerFlow` 필드를 읽기만 한다.
+
+        순서에 의미가 있다: 통로(graph/stream) → 이 호출의 형태(M·마스킹·그룹핑)
+        → cold를 GPU가 읽는가 → hybrid로 쪼개는가 → 남은 CPU 몫의 dispatch.
+        뒤 단계가 앞 단계를 뒤집는 곳(전량 GPU cold면 CPU는 cold를 내지 않는다)도
+        여기 한곳에 모여 있다.
+        """
+        dims = self._plan.dims
+        channel = self._plan_cold_channel(m, topk_ids)
+
+        # sparsity (계약 ①): cold만, decode에서만 (prefill-dense).
+        masking = self._sparse and m == 1
+        # prefill 형태: pair를 expert로 묶어 GPU 티어가 W를 expert당 한 번 읽는다.
+        # 레이어당 1회 만들어 phase·티어가 공유한다 (topk가 같다).
+        grouping: Optional[Grouping] = (
+            build_grouping(topk_ids, dims.num_experts)
+            if m >= self._grouped_min_m else None
+        )
+        # GPU sparse 티어와 rejoin이 같은 fp32 텐서를 쓴다 — 캐스팅이 두 번
+        # 일어나면 스텝마다 할당이 하나 더 생긴다.
+        topk_w32 = topk_weights if topk_weights.dtype is torch.float32 \
+            else topk_weights.to(torch.float32)
+
+        # cold를 GPU가 읽는가 (대배치 prefill). 이 결정 하나가 "cold partial을
+        # CPU와 GPU가 둘 다 내는" 이중계산을 막는다 — hybrid만이 예외이고,
+        # 거기서는 두 partial의 (m, j) 행이 서로소다.
+        has_cold_rows = self._layer_has_cold[layer_idx]
+        cold_on_gpu = bool(
+            has_cold_rows and grouping is not None
+            and self._cold_gpu_min_m is not None and m >= self._cold_gpu_min_m
+            and self._layer_cold_gpu[layer_idx]
+        )
+        # hybrid: GPU는 마스크된 expert만(제한 그룹핑), CPU는 나머지(kt skip 마스크).
+        # 두 partial은 각자 남의 행을 0으로 두므로 합이 곧 전체다.
+        hybrid = bool(cold_on_gpu and self._hybrid_frac is not None
+                      and not channel.graph_flow and not channel.use_cold_stream
+                      and not self._cold_async)   # 마스크 즉시쓰기가 host 선행과 충돌
+        cold_grouping_gu = cold_grouping_dn = grouping
+        if self._cold is not None and getattr(self._cold, "hybrid_masks", None) is not None:
+            if hybrid:
+                # 패턴은 여기서 정하고 kt 마스크로의 **쓰기**는 각 phase의 submit
+                # 직전이다 (_cpu_partials_begin) — 직전 phase의 kt 작업이 sync로
+                # 끝난 뒤여야 하므로. GPU-local 노드만 채우고 원격 노드 마스크는
+                # 항상 0이다 (그 shard는 CPU 전부).
+                self._hybrid_masks = self._balance_hybrid(
+                    channel.ids_cpu, dims.num_experts, device)
+                cold_grouping_gu = build_grouping(topk_ids, dims.num_experts,
+                                                  expert_mask=self._hybrid_masks["gu"][1])
+                cold_grouping_dn = build_grouping(topk_ids, dims.num_experts,
+                                                  expert_mask=self._hybrid_masks["dn"][1])
+            else:
+                for mk in self._cold.hybrid_masks:
+                    mk.zero_()
+        cpu_cold = has_cold_rows and not (cold_on_gpu and not hybrid)
+
+        # Small prefill uses the warm CPU instance; the upper bound is exclusive.
+        # The legacy minimum remains an explicit experimental override.
+        cpu_warm = bool(
+            self._layer_warm_kt.get(layer_idx, False)
+            and ((self._warm_cpu_max_m is not None and 1 < m < self._warm_cpu_max_m)
+                 or (self._warm_cpu_min_m is not None and m >= self._warm_cpu_min_m
+                     and grouping is not None and not channel.graph_flow
+                     and not channel.use_cold_stream))
+        )
+
+        probe_on = self._mask_stats is not None and not channel.graph_flow
+        return _LayerFlow(
+            graph_flow=channel.graph_flow, use_cold_stream=channel.use_cold_stream,
+            stream_arg=channel.stream_arg, qlen_ptr=channel.qlen_ptr,
+            ids_cpu=channel.ids_cpu,
+            m=m, k=k, masking=masking, topk_w32=topk_w32, grouping=grouping,
+            cold_on_gpu=cold_on_gpu, hybrid=hybrid,
+            cpu_dispatch=self._select_cpu_dispatch(channel, cpu_cold, cpu_warm, hybrid),
+            cpu_cold=cpu_cold, cpu_warm=cpu_warm,
+            # GPU warm 티어는 CPU가 warm을 내는 호출에서만 빠진다 (이중계산 방지).
+            skip_gpu_warm=cpu_warm,
+            cold_grouping_gateup=cold_grouping_gu, cold_grouping_down=cold_grouping_dn,
+            probe_on=probe_on, stats_on=bool(masking and probe_on),
         )
 
     # ── 본체 ──────────────────────────────────────────────────────────────
@@ -295,162 +523,28 @@ class PrismExecutor:
                   swiglu_limit: Optional[float] = None) -> torch.Tensor:
         """hidden [M, H] bf16 cuda, topk_ids [M, k] int64, topk_weights [M, k].
         swiglu_limit: 모델의 SwiGLU clamp (DSV4-Flash 10.0; None = 없음) — rejoin#1에서 적용.
-        반환 [M, H] bf16 cuda (router 가중 expert 합 완료)."""
-        has_cold = self._layer_has_cold[layer_idx]
+        반환 [M, H] bf16 cuda (router 가중 expert 합 완료).
+
+        두 phase가 같은 네 걸음을 밟는다: 관측 → CPU 몫 개시 → GPU 티어 발행 →
+        CPU 몫 합류 → rejoin. 실행 모드는 상단의 `_plan_flow()`가 전부 확정한다.
+        """
         tiers = self._tiers[layer_idx]
-        res, dims = self._res, self._plan.dims
-        m, k = hidden.shape[0], topk_ids.shape[1]
+        dims = self._plan.dims
         inter, h = dims.intermediate_size, dims.hidden_size
 
         _nvtx_push(f"prism.L{layer_idx}")
-        flow = self._plan_flow(m, topk_ids)
-        # sparsity는 cold만, decode에서만 (prefill-dense).
-        masking = self._sparse and m == 1
-        # prefill 형태: pair를 expert로 묶어 GPU 티어가 W를 expert당 한 번 읽는다.
-        # 레이어당 1회 만들어 phase·티어가 공유한다 (topk가 같다).
-        grouping: Optional[Grouping] = (
-            build_grouping(topk_ids, dims.num_experts)
-            if m >= self._grouped_min_m else None
-        )
-        # cold를 GPU가 읽는가 (대배치 prefill). 이 분기 하나가 "cold partial을
-        # CPU와 GPU가 둘 다 내는" 이중계산을 막는다 — 아래 has_cold 블록 전부가
-        # CPU 경로이고, GPU 경로는 _run_gateup/_run_down의 Tier.COLD 항목이다.
-        cold_gpu = bool(
-            has_cold and grouping is not None
-            and self._cold_gpu_min_m is not None and m >= self._cold_gpu_min_m
-            and self._layer_cold_gpu[layer_idx]
-        )
-        # hybrid: GPU는 마스크된 expert만(제한 그룹핑), CPU는 나머지(kt skip 마스크).
-        # 두 partial은 (m, j) 행이 서로소이고 각자 남의 행을 0으로 두므로 합이 곧 전체다.
-        hybrid = bool(cold_gpu and self._hybrid_frac is not None
-                      and not flow.graph_flow and not flow.use_cold_stream
-                      and not self._cold_async)   # 마스크 즉시쓰기가 host 선행과 충돌
-        cold_grouping_gu = cold_grouping_dn = grouping
-        if self._cold is not None and getattr(self._cold, "hybrid_masks", None) is not None:
-            # host 즉시쓰기: 각 phase의 cold submit 직전에 그 phase의 패턴을 쓴다 —
-            # 이전 phase/층의 kt 작업은 sync로 끝났다 (eager). graph/stream 모드는
-            # 항상 0이라 쓰기가 값을 바꾸지 않는다. GPU-local 노드 마스크만 채우고
-            # 원격 노드 마스크는 항상 0(그 shard는 CPU 전부).
-            if hybrid:
-                self._hybrid_masks = self._balance_hybrid(flow.ids_cpu, dims.num_experts,
-                                                          hidden.device)
-                self._cold.hybrid_masks[self._hybrid_local_node].copy_(self._hybrid_masks["gu"][0])
-                cold_grouping_gu = build_grouping(topk_ids, dims.num_experts,
-                                                  expert_mask=self._hybrid_masks["gu"][1])
-                cold_grouping_dn = build_grouping(topk_ids, dims.num_experts,
-                                                  expert_mask=self._hybrid_masks["dn"][1])
-            else:
-                for mk in self._cold.hybrid_masks:
-                    mk.zero_()
-        if cold_gpu and not hybrid:
-            has_cold = False
-        # warm-kt CPU 계산 (prefill): warm GPU 티어를 건너뛰고 warm-kt 인스턴스를 cold와 나란히
-        # submit한다. eager·비-stream·grouped 호출에서만 (cold와 같은 이유).
-        warm_cpu = bool(
-            self._warm_cpu_min_m is not None and m >= self._warm_cpu_min_m
-            and self._layer_warm_kt.get(layer_idx, False) and grouping is not None
-            and not flow.graph_flow and not flow.use_cold_stream
-        )
-        # GPU sparse 티어와 rejoin이 같은 fp32 텐서를 쓴다 — 캐스팅이 두 번
-        # 일어나면 스텝마다 할당이 하나 더 생긴다.
-        w32 = topk_weights if topk_weights.dtype is torch.float32 \
-            else topk_weights.to(torch.float32)
-        cold_async = bool(self._cold_async and (has_cold or warm_cpu) and not flow.graph_flow
-                          and not hybrid and res.cold_stream is not None)
-        async_has_cold, async_warm_cpu = has_cold, warm_cpu
-        if cold_async:
-            has_cold = False   # 아래 host-block 경로를 전부 건너뛴다
-            warm_cpu_legacy = False
-        else:
-            warm_cpu_legacy = warm_cpu
-        # cold를 곁 스트림으로 (P2). use_cold_stream 경로에서만이고, 그 경로는
-        # hybrid·warm_cpu가 모두 꺼져 있으므로 cold 하나만 옮기면 된다.
-        cold_split = bool(
-            self._cold_split and has_cold and flow.use_cold_stream
-            and res.cold_stream is not None and not warm_cpu_legacy and not hybrid
-        )
-        # host-block 경로: split이 켜지면 그쪽이 대신한다.
-        cold_host_block = (has_cold or warm_cpu_legacy) and not cold_split
+        flow = self._plan_flow(layer_idx, hidden.shape[0], topk_ids.shape[1],
+                               topk_ids, topk_weights, hidden.device)
 
-        # effective sparsity 실측 — 커널과 같은 입력으로 마스크를 재계산해 누적 (eager decode만;
-        # graph 경로는 파이썬이 replay되지 않으므로 캡처 중 관측하면 워밍업 토큰이 섞인다).
-        stats_on = masking and self._mask_stats is not None and not flow.graph_flow
-        if self._mask_stats is not None and not flow.graph_flow:
-            # NaN 진단은 prefill(m>1)에서도 돈다 — decode 전용 관측이 못 보는 구간이다.
-            self._mask_stats.probe_calls += 1
-            self._mask_stats.probe(layer_idx, "gateup_in", hidden, m)
-        if stats_on:
-            self._mask_stats.observe_gateup(layer_idx, hidden, topk_ids, w32)
         # ── Phase 1: gateup ──────────────────────────────────────────────
-        w_ptr = 0
-        cold_gu = warm_gu = None
-        if cold_async:
-            cold_gu, warm_gu = self._cold_phase_async(
-                layer_idx, "gateup", hidden, topk_ids, w32, m, k, masking,
-                async_has_cold, async_warm_cpu)
-        if cold_split:
-            self._cold_split_submit(layer_idx, "gateup", hidden, topk_ids, w32,
-                                    m, k, masking, flow)
-        if cold_host_block:
-            with _nvtx("cold.gu.fill_x(D2H-block)"):
-                # stream 통합 시 non_blocking: kt host node가 같은 stream에
-                # 순서대로 실행되므로 host-측 완료 보장이 불필요하다.
-                res.staging.fill_x(hidden, non_blocking=flow.use_cold_stream)
-                if flow.use_cold_stream:
-                    # device topk_ids → pinned int64 async D2H (graph·stream 공통).
-                    # qlen은 고정 pinned 버퍼라 여기서 쓰지 않는다.
-                    res.staging.fill_expert_ids(topk_ids, non_blocking=True)
-                    pin = self._qlen_pins_graph[m]
-                    assert int(pin[0]) == m, (
-                        f"qlen_pin_graph[{m}]={int(pin[0])} != {m} — "
-                        f"stream/graph path must never write this buffer"
-                    )
-                else:
-                    res.staging.fill_expert_ids(flow.ids_cpu)
-                    self._qlen_pin[0] = m
-            if masking:
-                with _nvtx("cold.fill_topk_w"):
-                    res.staging.fill_topk_w(
-                        topk_weights, non_blocking=flow.use_cold_stream)
-                w_ptr = res.staging.topk_w_ptr()
-            if has_cold:
-                with _nvtx("cold.gu.submit"):
-                    self._cold.submit_gateup(         # enqueue-only, 즉시 반환
-                        layer_idx, flow.qlen_ptr, k,
-                        res.staging.expert_ids_ptr(), res.staging.x_ptr(),
-                        res.staging.partial_gateup_ptr(),
-                        cuda_stream=flow.stream_arg,
-                        weights_ptr=w_ptr,
-                    )
-            if warm_cpu_legacy:
-                with _nvtx("warm.gu.submit"):
-                    self._cold.submit_warm_gateup(
-                        layer_idx, flow.qlen_ptr, k,
-                        res.staging.expert_ids_ptr(), res.staging.x_ptr(),
-                        res.staging.warm_partial_gateup_ptr(),
-                        cuda_stream=flow.stream_arg, weights_ptr=0,
-                    )
-            _nvtx_push("cold.gu.window")          # CPU expert 연산 재실 구간
-
-        gu_parts = self._run_gateup(tiers, hidden, topk_ids, w32, m, k, inter,
-                                    masking, grouping, cold_gpu, cold_grouping_gu, hybrid,
-                                    skip_warm=warm_cpu)
-        if cold_async:
-            torch.cuda.current_stream().wait_stream(res.cold_stream)   # partial H2D 완료
-
-        if cold_split:
-            cold_gu = self._cold_split_join("gateup", m, hidden.device)
-        if cold_host_block:
-            with _nvtx("cold.gu.sync(host-block)"):
-                self._cold.sync(cuda_stream=flow.stream_arg)   # 두 인스턴스 모두 (같은 풀)
-            _nvtx_pop()                           # cold.gu.window
-            with _nvtx("cold.gu.h2d_out"):
-                if has_cold:
-                    cold_gu = res.staging.gateup_out(m).to(
-                        hidden.device, non_blocking=flow.use_cold_stream)
-                if warm_cpu_legacy:
-                    warm_gu = res.staging.warm_gateup_out(m).to(
-                        hidden.device, non_blocking=flow.use_cold_stream)
+        self._observe(layer_idx, GATEUP, hidden, topk_ids, flow)
+        pending = self._cpu_partials_begin(layer_idx, GATEUP, hidden, topk_ids, flow)
+        gu_parts = self._run_gateup(
+            tiers, hidden, topk_ids, flow.topk_w32, flow.m, flow.k, inter,
+            flow.masking, grouping=flow.grouping, cold_gpu=flow.cold_on_gpu,
+            cold_grouping=flow.cold_grouping_gateup, cold_partial=flow.hybrid,
+            skip_warm=flow.skip_gpu_warm)
+        cold_gu, warm_gu = self._cpu_partials_end(GATEUP, pending, flow, hidden.device)
 
         # rejoin#1: fp32 합 → act → bf16 (계약 ⑤)
         # 융합 커널 한 launch: Σ partial(fp32) → silu·up → bf16 (rejoin.py). torch
@@ -458,69 +552,145 @@ class PrismExecutor:
         # ~10번 왕복해 층당 2.5 ms였다 (2026-08-27 nsys).
         with _nvtx("rejoin1.acc+silu"):
             act = rejoin_gateup(gu_parts + [cold_gu, warm_gu], inter, swiglu_limit)
-        if self._mask_stats is not None and not flow.graph_flow:
-            self._mask_stats.probe(layer_idx, "act_after_rejoin1", act, m)
-        if stats_on:
-            self._mask_stats.observe_down(layer_idx, act, topk_ids, w32)
 
         # ── Phase 2: down ────────────────────────────────────────────────
-        if hybrid:
-            self._cold.hybrid_masks[self._hybrid_local_node].copy_(self._hybrid_masks["dn"][0])  # down의 GPU 몫
-        cold_down = warm_down = None
-        if cold_async:
-            cold_down, warm_down = self._cold_phase_async(
-                layer_idx, "down", act, topk_ids, w32, m, k, masking,
-                async_has_cold, async_warm_cpu)
-        if cold_split:
-            self._cold_split_submit(layer_idx, "down", act, topk_ids, w32,
-                                    m, k, masking, flow)
-        if cold_host_block:
-            with _nvtx("cold.dn.fill_act(D2H-block)"):
-                res.staging.fill_act(act, non_blocking=flow.use_cold_stream)
-            if has_cold:
-                with _nvtx("cold.dn.submit"):
-                    self._cold.submit_down(
-                        layer_idx, flow.qlen_ptr, k,
-                        res.staging.expert_ids_ptr(), res.staging.act_ptr(),
-                        res.staging.partial_down_ptr(),
-                        cuda_stream=flow.stream_arg,
-                        weights_ptr=w_ptr,
-                    )
-            if warm_cpu_legacy:
-                with _nvtx("warm.dn.submit"):
-                    self._cold.submit_warm_down(
-                        layer_idx, flow.qlen_ptr, k,
-                        res.staging.expert_ids_ptr(), res.staging.act_ptr(),
-                        res.staging.warm_partial_down_ptr(),
-                        cuda_stream=flow.stream_arg, weights_ptr=0,
-                    )
-            _nvtx_push("cold.dn.window")
-
-        down_parts = self._run_down(tiers, act, topk_ids, w32, m, k, inter, h,
-                                    masking, grouping, cold_gpu, cold_grouping_dn, hybrid,
-                                    skip_warm=warm_cpu)
-        if cold_async:
-            torch.cuda.current_stream().wait_stream(res.cold_stream)
-
-        if cold_split:
-            cold_down = self._cold_split_join("down", m, act.device)
-        if cold_host_block:
-            with _nvtx("cold.dn.sync(host-block)"):
-                self._cold.sync(cuda_stream=flow.stream_arg)
-            _nvtx_pop()                           # cold.dn.window
-            with _nvtx("cold.dn.h2d_out"):
-                if has_cold:
-                    cold_down = res.staging.down_out(m).to(
-                        hidden.device, non_blocking=flow.use_cold_stream)
-                if warm_cpu_legacy:
-                    warm_down = res.staging.warm_down_out(m).to(
-                        hidden.device, non_blocking=flow.use_cold_stream)
+        self._observe(layer_idx, DOWN, act, topk_ids, flow)
+        pending = self._cpu_partials_begin(layer_idx, DOWN, act, topk_ids, flow)
+        down_parts = self._run_down(
+            tiers, act, topk_ids, flow.topk_w32, flow.m, flow.k, inter, h,
+            flow.masking, grouping=flow.grouping, cold_gpu=flow.cold_on_gpu,
+            cold_grouping=flow.cold_grouping_down, cold_partial=flow.hybrid,
+            skip_warm=flow.skip_gpu_warm)
+        cold_dn, warm_dn = self._cpu_partials_end(DOWN, pending, flow, act.device)
 
         # rejoin#2: fp32 합 → router 가중 expert합 → bf16
         with _nvtx("rejoin2.acc+wsum"):
-            out = rejoin_down(down_parts + [cold_down, warm_down], w32)
+            out = rejoin_down(down_parts + [cold_dn, warm_dn], flow.topk_w32)
         _nvtx_pop()                               # prism.L{layer_idx}
         return out
+
+    # ── 관측 ─────────────────────────────────────────────────────────────
+    def _observe(self, layer_idx: int, phase: str, x: torch.Tensor,
+                 topk_ids: torch.Tensor, flow: _LayerFlow) -> None:
+        """effective sparsity 실측 + NaN 진단 프로브 — 커널과 **같은 입력**으로
+        마스크를 재계산해 누적한다. eager에서만 돈다 (graph 경로는 파이썬이
+        replay되지 않으므로 캡처 중 관측하면 워밍업 토큰이 섞인다)."""
+        if not flow.probe_on:
+            return
+        stats = self._mask_stats
+        if phase == GATEUP:
+            # NaN 진단은 prefill(m>1)에서도 돈다 — decode 전용 관측이 못 보는 구간이다.
+            stats.probe_calls += 1
+            stats.probe(layer_idx, "gateup_in", x, flow.m)
+            if flow.stats_on:
+                stats.observe_gateup(layer_idx, x, topk_ids, flow.topk_w32)
+        else:
+            stats.probe(layer_idx, "act_after_rejoin1", x, flow.m)
+            if flow.stats_on:
+                stats.observe_down(layer_idx, x, topk_ids, flow.topk_w32)
+
+    # ── CPU partial 조달 (begin/end 쌍) ────────────────────────────────────
+    def _cold_entry(self, port: _PhasePorts, warm: bool = False):
+        """cold backend의 이 phase submit 진입점. **호출 시점에** 이름으로 꺾는다 —
+        backend를 런타임에 감싸는 테스트·프로파일러가 있으므로 생성 시점에
+        메서드를 붙들어두면 안 된다."""
+        return getattr(self._cold, port.submit_warm_name if warm else port.submit_cold_name)
+
+    def _cpu_partials_begin(self, layer_idx: int, phase: str, x: torch.Tensor,
+                            topk_ids: torch.Tensor, flow: _LayerFlow):
+        """이 phase의 CPU(cold/warm) 작업을 **개시**한다 — dispatch별로 enqueue
+        방식만 다르다. 반환은 `_cpu_partials_end`에 그대로 넘길 진행 중 상태로,
+        ASYNC_FLAG만 여기서 device partial을 내고 나머지는 (None, None)이다.
+
+        호출자는 이 사이에 GPU 티어를 발행한다 — 그 겹침이 2-phase의 전부다.
+        """
+        dispatch = flow.cpu_dispatch
+        if dispatch is CpuDispatch.NONE:
+            return None, None
+        port = self._ports[phase]
+        if flow.hybrid:
+            # host 즉시쓰기: 이 phase의 GPU 몫 패턴을 submit 직전에 쓴다 —
+            # 직전 phase/층의 kt 작업은 sync로 끝났다 (HOST_BLOCK 전용 경로).
+            self._cold.hybrid_masks[self._hybrid_local_node].copy_(
+                self._hybrid_masks["gu" if port.is_gateup else "dn"][0])
+        if dispatch is CpuDispatch.ASYNC_FLAG:
+            return self._cold_phase_async(layer_idx, port, x, topk_ids, flow)
+        if dispatch is CpuDispatch.SIDE_STREAM:
+            self._cold_side_stream_submit(layer_idx, port, x, topk_ids, flow)
+            return None, None
+        self._cold_host_block_submit(layer_idx, port, x, topk_ids, flow)
+        return None, None
+
+    def _cpu_partials_end(self, phase: str, pending, flow: _LayerFlow, device):
+        """개시한 CPU 작업을 **합류**시키고 (cold_partial, warm_partial)을 낸다.
+        둘 다 device 텐서이거나 None이며, rejoin이 곧바로 fp32로 누산한다."""
+        dispatch = flow.cpu_dispatch
+        if dispatch is CpuDispatch.NONE:
+            return None, None
+        if dispatch is CpuDispatch.ASYNC_FLAG:
+            torch.cuda.current_stream().wait_stream(self._res.cold_stream)  # partial H2D 완료
+            return pending
+        port = self._ports[phase]
+        if dispatch is CpuDispatch.SIDE_STREAM:
+            return self._cold_side_stream_join(port, flow.m, device), None
+        return self._cold_host_block_collect(port, flow, device)
+
+    # ── dispatch: HOST_BLOCK ─────────────────────────────────────────────
+    def _cold_host_block_submit(self, layer_idx: int, port: _PhasePorts,
+                                x: torch.Tensor, topk_ids: torch.Tensor,
+                                flow: _LayerFlow) -> None:
+        """[입력 D2H] → [submit] (enqueue-only, 즉시 반환). `cold.{tag}.window`
+        nvtx 구간을 열고 나간다 — 닫는 쪽은 collect다."""
+        st = self._res.staging
+        with _nvtx(f"cold.{port.tag}.{port.fill_label}(D2H-block)"):
+            # stream 통합 시 non_blocking: kt host node가 같은 stream에 순서대로
+            # 실행되므로 host-측 완료 보장이 불필요하다. expert_ids도 device
+            # 텐서에서 pinned로 async D2H한다 (graph·stream 공통).
+            port.fill_inputs(x, topk_ids if flow.use_cold_stream else flow.ids_cpu,
+                             flow.use_cold_stream)
+            if port.is_gateup:
+                if flow.use_cold_stream:
+                    # qlen은 고정 pinned 상수 버퍼라 여기서 쓰지 않는다.
+                    pin = self._qlen_pins_graph[flow.m]
+                    assert int(pin[0]) == flow.m, (
+                        f"qlen_pin_graph[{flow.m}]={int(pin[0])} != {flow.m} — "
+                        f"stream/graph path must never write this buffer"
+                    )
+                else:
+                    self._qlen_pin[0] = flow.m
+        if port.is_gateup and flow.masking:
+            with _nvtx("cold.fill_topk_w"):
+                st.fill_topk_w(flow.topk_w32, non_blocking=flow.use_cold_stream)
+        w_ptr = st.topk_w_ptr() if flow.masking else 0
+        if flow.cpu_cold:
+            with _nvtx(f"cold.{port.tag}.submit"):
+                self._cold_entry(port)(
+                    layer_idx, flow.qlen_ptr, flow.k, st.expert_ids_ptr(),
+                    port.input_ptr(), port.cold_partial_ptr(),
+                    cuda_stream=flow.stream_arg, weights_ptr=w_ptr)
+        if flow.cpu_warm:
+            with _nvtx(f"warm.{port.tag}.submit"):
+                self._cold_entry(port, warm=True)(
+                    layer_idx, flow.qlen_ptr, flow.k, st.expert_ids_ptr(),
+                    port.input_ptr(), port.warm_partial_ptr(),
+                    cuda_stream=flow.stream_arg, weights_ptr=0)
+        _nvtx_push(f"cold.{port.tag}.window")     # CPU expert 연산 재실 구간
+
+    def _cold_host_block_collect(self, port: _PhasePorts, flow: _LayerFlow, device):
+        """[블로킹 sync] → [partial H2D]. sync는 두 인스턴스(cold·warm) 모두를
+        기다린다 — 같은 CPUInfer 풀이다."""
+        with _nvtx(f"cold.{port.tag}.sync(host-block)"):
+            self._cold.sync(cuda_stream=flow.stream_arg)
+        _nvtx_pop()                               # cold.{tag}.window
+        cold_p = warm_p = None
+        with _nvtx(f"cold.{port.tag}.h2d_out"):
+            if flow.cpu_cold:
+                cold_p = port.cold_out(flow.m).to(
+                    device, non_blocking=flow.use_cold_stream)
+            if flow.cpu_warm:
+                warm_p = port.warm_out(flow.m).to(
+                    device, non_blocking=flow.use_cold_stream)
+        return cold_p, warm_p
 
     def _balance_hybrid(self, ids_cpu: torch.Tensor, num_experts: int, device) -> dict:
         """phase별 GPU expert 마스크 — **비용 모델**로 나눈다.
@@ -560,49 +730,40 @@ class PrismExecutor:
             out[phase] = (pattern, pattern.bool().to(device))
         return out
 
-    # ── cold_async ──────────────────────────────────────────────────────
-    def _cold_split_submit(self, layer_idx, phase, x_or_act, topk_ids, w32, m, k,
-                           masking: bool, flow: "_LayerFlow") -> None:
+    # ── dispatch: SIDE_STREAM ────────────────────────────────────────────
+    def _cold_side_stream_submit(self, layer_idx: int, port: _PhasePorts,
+                                 x: torch.Tensor, topk_ids: torch.Tensor,
+                                 flow: _LayerFlow) -> None:
         """cold 한 phase의 [입력 D2H] → [submit host node]를 **곁 스트림**에 얹는다.
 
         host node 방식은 그대로다 — 바뀌는 것은 그것이 어느 stream에 붙느냐뿐이다.
         곁 스트림에 두면 뒤따르는 sync가 main의 hot/warm 커널 완료를 기다리지 않는다.
-        `use_cold_stream` 경로에서만 부른다 (그 경로에서는 hybrid·warm_cpu가 모두
-        꺼져 있으므로 cold 하나만 다루면 된다).
+        `use_cold_stream` 경로에서만 고른다 (그 경로에서는 warm·hybrid가 모두 꺼져
+        있으므로 cold 하나만 다루면 된다 — `_select_cpu_dispatch` 참조).
         """
-        res, cs = self._res, self._res.cold_stream
-        st = res.staging
+        st, cs = self._res.staging, self._res.cold_stream
         cs.wait_stream(torch.cuda.current_stream())   # hidden/act·topk 준비 완료
-        with torch.cuda.stream(cs), _nvtx(f"cold.{phase}.split.submit"):
-            sarg = cs.cuda_stream
+        with torch.cuda.stream(cs), _nvtx(f"cold.{port.name}.split.submit"):
             w_ptr = 0
-            if masking:
-                st.fill_topk_w(w32, non_blocking=True)
+            if flow.masking:
+                st.fill_topk_w(flow.topk_w32, non_blocking=True)
                 w_ptr = st.topk_w_ptr()
-            if phase == "gateup":
-                st.fill_x(x_or_act, non_blocking=True)
-                st.fill_expert_ids(topk_ids, non_blocking=True)
-                self._cold.submit_gateup(
-                    layer_idx, flow.qlen_ptr, k, st.expert_ids_ptr(), st.x_ptr(),
-                    st.partial_gateup_ptr(), cuda_stream=sarg, weights_ptr=w_ptr)
-            else:
-                st.fill_act(x_or_act, non_blocking=True)
-                self._cold.submit_down(
-                    layer_idx, flow.qlen_ptr, k, st.expert_ids_ptr(), st.act_ptr(),
-                    st.partial_down_ptr(), cuda_stream=sarg, weights_ptr=w_ptr)
+            port.fill_inputs(x, topk_ids, True)
+            self._cold_entry(port)(
+                layer_idx, flow.qlen_ptr, flow.k, st.expert_ids_ptr(),
+                port.input_ptr(), port.cold_partial_ptr(),
+                cuda_stream=cs.cuda_stream, weights_ptr=w_ptr)
 
-    def _cold_split_join(self, phase: str, m: int, device) -> torch.Tensor:
+    def _cold_side_stream_join(self, port: _PhasePorts, m: int, device) -> torch.Tensor:
         """곁 스트림의 [sync host node] → [partial H2D]를 마치고 main에 합류시킨다.
 
         rejoin이 이 partial을 main에서 읽으므로 합류는 없앨 수 없다 — 없앨 수 있는
         것은 sync가 GPU 커널을 기다리던 쪽이었다.
         """
-        res, cs = self._res, self._res.cold_stream
-        st = res.staging
-        with torch.cuda.stream(cs), _nvtx(f"cold.{phase}.split.join"):
+        cs = self._res.cold_stream
+        with torch.cuda.stream(cs), _nvtx(f"cold.{port.name}.split.join"):
             self._cold.sync(cuda_stream=cs.cuda_stream)
-            src = st.gateup_out(m) if phase == "gateup" else st.down_out(m)
-            out = src.to(device, non_blocking=True)
+            out = port.cold_out(m).to(device, non_blocking=True)
         main = torch.cuda.current_stream()
         main.wait_stream(cs)
         # 캡처 밖에서만: 이 블록은 cs에서 할당됐고 main이 읽는다 — 할당자가 cs의
@@ -612,59 +773,38 @@ class PrismExecutor:
             out.record_stream(main)
         return out
 
-    def _cold_phase_async(self, layer_idx, phase, x_or_act, topk_ids, w32, m, k, masking,
-                          has_cold: bool, warm_cpu: bool):
+    # ── dispatch: ASYNC_FLAG ─────────────────────────────────────────────
+    def _cold_phase_async(self, layer_idx: int, port: _PhasePorts, x: torch.Tensor,
+                          topk_ids: torch.Tensor, flow: _LayerFlow):
         """cold(+warm-kt) 한 phase를 cold stream에 **enqueue만** 하고 partial(device)을
         돌려준다. 순서: [입력 D2H] → [submit host node] → [signal host node] →
         [wait_flag 커널] → [partial H2D]. 호출자는 rejoin 전에 current stream이
         cold stream을 기다리게 한다. host는 어디서도 블록되지 않는다."""
         res, cs = self._res, self._res.cold_stream
-        main = torch.cuda.current_stream()
-        cs.wait_stream(main)  # 입력(hidden/act, topk) 준비 완료
-        qlen_pin = self._qlen_pins_graph.get(m)
-        if qlen_pin is None:
-            qlen_pin = torch.full((1,), m, dtype=torch.int32)
-            self._qlen_pins_graph[m] = qlen_pin
-        with torch.cuda.stream(cs), _nvtx(f"cold.{phase}.async"):
-            st = res.staging
-            if phase == "gateup":
-                st.fill_x(x_or_act, non_blocking=True)
-                st.fill_expert_ids(topk_ids, non_blocking=True)   # device → pinned async
-                if masking:
-                    st.fill_topk_w(w32, non_blocking=True)
-            else:
-                st.fill_act(x_or_act, non_blocking=True)
-            w_ptr = st.topk_w_ptr() if masking else 0
+        st = res.staging
+        cs.wait_stream(torch.cuda.current_stream())  # 입력(hidden/act, topk) 준비 완료
+        qlen_ptr = self._qlen_pin_for(flow.m).data_ptr()
+        with torch.cuda.stream(cs), _nvtx(f"cold.{port.name}.async"):
+            port.fill_inputs(x, topk_ids, True)      # device → pinned async
+            if port.is_gateup and flow.masking:
+                st.fill_topk_w(flow.topk_w32, non_blocking=True)
+            w_ptr = st.topk_w_ptr() if flow.masking else 0
             sarg = cs.cuda_stream
-            if has_cold:
-                if phase == "gateup":
-                    self._cold.submit_gateup(layer_idx, qlen_pin.data_ptr(), k, st.expert_ids_ptr(),
-                                             st.x_ptr(), st.partial_gateup_ptr(),
-                                             cuda_stream=sarg, weights_ptr=w_ptr)
-                else:
-                    self._cold.submit_down(layer_idx, qlen_pin.data_ptr(), k, st.expert_ids_ptr(),
-                                           st.act_ptr(), st.partial_down_ptr(),
-                                           cuda_stream=sarg, weights_ptr=w_ptr)
-            if warm_cpu:
-                if phase == "gateup":
-                    self._cold.submit_warm_gateup(layer_idx, qlen_pin.data_ptr(), k, st.expert_ids_ptr(),
-                                                  st.x_ptr(), st.warm_partial_gateup_ptr(),
-                                                  cuda_stream=sarg, weights_ptr=0)
-                else:
-                    self._cold.submit_warm_down(layer_idx, qlen_pin.data_ptr(), k, st.expert_ids_ptr(),
-                                                st.act_ptr(), st.warm_partial_down_ptr(),
-                                                cuda_stream=sarg, weights_ptr=0)
+            if flow.cpu_cold:
+                self._cold_entry(port)(layer_idx, qlen_ptr, flow.k, st.expert_ids_ptr(),
+                                 port.input_ptr(), port.cold_partial_ptr(),
+                                 cuda_stream=sarg, weights_ptr=w_ptr)
+            if flow.cpu_warm:
+                self._cold_entry(port, warm=True)(layer_idx, qlen_ptr, flow.k, st.expert_ids_ptr(),
+                                 port.input_ptr(), port.warm_partial_ptr(),
+                                 cuda_stream=sarg, weights_ptr=0)
             res.cold_seq += 1
             self._cold.submit_signal(sarg, res.cold_flag.data_ptr(), res.cold_seq)
             from sglang.jit_kernel.prism_grouped import wait_flag
             wait_flag(res.cold_flag, res.cold_seq, cs)
-            dev = x_or_act.device
-            if phase == "gateup":
-                cold_p = st.gateup_out(m).to(dev, non_blocking=True) if has_cold else None
-                warm_p = st.warm_gateup_out(m).to(dev, non_blocking=True) if warm_cpu else None
-            else:
-                cold_p = st.down_out(m).to(dev, non_blocking=True) if has_cold else None
-                warm_p = st.warm_down_out(m).to(dev, non_blocking=True) if warm_cpu else None
+            dev = x.device
+            cold_p = port.cold_out(flow.m).to(dev, non_blocking=True) if flow.cpu_cold else None
+            warm_p = port.warm_out(flow.m).to(dev, non_blocking=True) if flow.cpu_warm else None
         return cold_p, warm_p
 
     # ── GPU 티어 ─────────────────────────────────────────────────────────

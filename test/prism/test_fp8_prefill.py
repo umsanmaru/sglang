@@ -15,6 +15,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
 from fp8_ref import dequant_ckpt, random_expert_ckpt  # noqa: E402
+from kt_support import cold_kernel_param, requires_cold_kernel  # noqa: E402
 
 cuda_required = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -52,7 +53,9 @@ def _inputs(m, seed, exact):
     return x.cuda(), ids.cuda(), w.cuda()
 
 
-FP8_COLD_KERNELS = ["kt_tile_k2_fp8b128", "kt_tile_k1_fp8b128"]  # 페어(k2) / per-k(k1) 타일
+# 페어(k2) / per-k(k1) 타일. 둘 중 한쪽만 담은 kt 빌드에서는 그 파라미터만 skip된다.
+FP8_COLD_KERNELS = [cold_kernel_param(k)
+                    for k in ("kt_tile_k2_fp8b128", "kt_tile_k1_fp8b128")]
 
 
 def _plan3(gpu_kernel, cpu_kernel, n_align, sparsity=None):
@@ -167,6 +170,7 @@ def _k1_calib(tmp_path, thr):
 
 
 @cuda_required
+@requires_cold_kernel("kt_tile_k1_fp8b128")
 @pytest.mark.parametrize("thr", [0.0, 1e9])
 def test_fp8_k1_sparse_decode_matches_masked_dense(tmp_path, thr):
     """score k1 e2e: plan.sparsity(k1) + thr-only calib → cold(kt_tile_k1) per-k 마스크.

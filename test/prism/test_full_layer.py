@@ -7,8 +7,14 @@ per-expert 구성이 조용히 균일로 되돌아가거나 평균이 어긋나�
 검출기다.
 """
 
+import os
+import sys
+
 import pytest
 import torch
+
+sys.path.insert(0, os.path.dirname(__file__))
+from kt_support import profile_dtype_param  # noqa: E402
 
 from sglang.srt.layers.moe.prism.profile import (
     Shape,
@@ -130,7 +136,7 @@ needs_rig = pytest.mark.skipif(
 
 
 @needs_rig
-@pytest.mark.parametrize("dtype", ["fp8", "bf16", "fp8pt"])
+@pytest.mark.parametrize("dtype", [profile_dtype_param(d) for d in ("fp8", "bf16", "fp8pt")])
 @pytest.mark.parametrize("group", ["gateup", "down"])
 def test_check_matches_masked_reference(dtype, group):
     """세 티어 partial의 합이 합성 마스크 레퍼런스와 맞아야 한다.

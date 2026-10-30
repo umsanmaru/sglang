@@ -271,6 +271,57 @@ def test_warm_kt_cpu_prefill_matches(kind):
 
 
 @cuda_required
+@pytest.mark.parametrize("stream", [False, True])
+def test_warm_cpu_small_prefill_boundary(monkeypatch, stream):
+    monkeypatch.setattr(__import__(__name__, fromlist=["MAX_TOKENS"]), "MAX_TOKENS", 1536)
+    plan = make_plan("mixed")
+    w13, w2 = make_weights(seed=17)
+    ex = build_executor(plan, w13, w2, warm_kt=True, cold_gpu_view=True,
+                        warm_cpu_max_m=1536, cold_gpu_min_m=1536,
+                        cold_stream=stream)
+    calls = []
+    submit = ex._cold.submit_warm_gateup
+
+    def tracked(*args, **kwargs):
+        calls.append(True)
+        return submit(*args, **kwargs)
+
+    monkeypatch.setattr(ex._cold, "submit_warm_gateup", tracked)
+    for m in [1, 7, 1535, 1536]:
+        x, ids, w = make_inputs(m, seed=m)
+        calls.clear()
+        out = run(ex, x, ids, w)
+        assert bool(calls) == (1 < m < 1536)
+        # Compare to the same executor with warm forced onto GPU.
+        ex._warm_cpu_max_m = None
+        ref = run(ex, x, ids, w)
+        ex._warm_cpu_max_m = 1536
+        assert rel_diff(out, ref) < 1e-3
+
+
+@cuda_required
+def test_warm_cpu_small_prefill_graph_replay():
+    plan = make_plan("mixed")
+    w13, w2 = make_weights(seed=18)
+    ex = build_executor(plan, w13, w2, warm_kt=True, warm_cpu_max_m=1536,
+                        force_graph_path=True)
+    x, ids, weights = [t.cuda() for t in make_inputs(7, seed=19)]
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        expected = ex.run_layer(0, x, ids, weights)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        out = ex.run_layer(0, x, ids, weights)
+    for _ in range(2):
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, expected)
+
+
+@cuda_required
 @pytest.mark.parametrize("kind", ["mixed", "three_tier"])
 def test_cold_hybrid_matches_cpu_cold(kind):
     """cold hybrid(expert를 GPU/CPU로 분할, 비용 모델)는 CPU cold와 같은 값 — 두 partial의
