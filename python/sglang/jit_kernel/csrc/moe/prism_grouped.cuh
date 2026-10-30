@@ -62,6 +62,7 @@ struct Slot {
   const uint16_t* kidx;      // [Σₑ k[e]] (COLD: 타일 올림 패딩 포함, 패딩은 0을 가리킨다)
   long long out_off;         // out3d 열 오프셋 (COLD: 노드 N shard 시작이 더해져 온다)
   const int64_t* blk_off;    // COLD 전용: [E] expert 블록의 slab 내 원소 오프셋
+  bool n_contiguous = false;
 };
 
 // B 타일 레이아웃.
@@ -82,14 +83,15 @@ constexpr int kColdStep = 32;
 // n_begin*k_block_size + k_begin*N_STEP.
 __device__ __forceinline__ long long cold_tile_base(
     long long n, long long k, long long n_total, long long k_total,
-    int n_block, int k_block) {
+    int n_block, int k_block, bool n_contiguous) {
   const long long nb = (n / n_block) * n_block;
   const long long nbs = min(static_cast<long long>(n_block), n_total - nb);
   const long long kb = (k / k_block) * k_block;
   const long long kbs = min(static_cast<long long>(k_block), k_total - kb);
   const long long ns = ((n - nb) / kColdStep) * kColdStep;
   const long long ks = ((k - kb) / kColdStep) * kColdStep;
-  return nb * k_total + kb * nbs + ns * kbs + ks * kColdStep;
+  return nb * k_total + kb * nbs +
+         (n_contiguous ? ks * nbs + ns * kColdStep : ns * kbs + ks * kColdStep);
 }
 
 template <int LAYOUT>
@@ -180,7 +182,7 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm(
       // 타일 단위 유효성만 본다. kb+32 ≤ kr 은 루프 조건이 보장한다.
       const long long nt = n0 + cj * kColdStep;
       if (nt < n_cols) {
-        const long long base = cold_tile_base(nt, kb, n_cols, kr, n_block, k_block);
+        const long long base = cold_tile_base(nt, kb, n_cols, kr, n_block, k_block, s.n_contiguous);
         breg = *reinterpret_cast<const uint4*>(wblk + base + ch * 512 + cd * 2);
       } else {
         breg = make_uint4(0u, 0u, 0u, 0u);
@@ -339,6 +341,23 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_wres(
     const long long o0 = s.row_off[e];
     const int kr = static_cast<int>(s.row_off[e + 1] - o0);
     const int ntiles = (npairs + kBM - 1) / kBM;
+    // 이 티어에 행이 **하나도 없는** expert (expert별로 예산이 갈리는 plan에서 나온다:
+    // 전량을 다른 티어가 가진 expert). partial은 0이지만 아래 K 조각 루프가 한 번도
+    // 돌지 않아 out 쓰기(조각 루프 **안**에 있다)가 통째로 건너뛰어진다 — rejoin은
+    // 그 자리에 남은 **이전 스텝의 값**을 그대로 더한다. 스트리밍 변형은 acc를 0으로
+    // 채우고 K 루프 밖에서 store하므로 이 구멍이 없다. 여기서 0을 명시적으로 쓴다.
+    if (kr == 0) {
+      constexpr int CH0 = BN / 8;
+      for (int idx = tid; idx < npairs * CH0; idx += kThreads) {
+        const int i = idx / CH0;
+        const long long c = static_cast<long long>(idx % CH0) * 8;
+        if (n0 + c < n_cols) {
+          *reinterpret_cast<uint4*>(out + static_cast<long long>(pair_sorted[pbeg + i]) * out_row +
+                                    s.out_off + n0 + c) = make_uint4(0u, 0u, 0u, 0u);
+        }
+      }
+      continue;
+    }
     for (int kc0 = 0; kc0 < kr; kc0 += k_chunk) {
     const int kcnt = min(k_chunk, kr - kc0);         // 이 조각의 K 행 수 (32의 배수)
     const bool first = (kc0 == 0), last = (kc0 + kcnt >= kr);
@@ -372,7 +391,7 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_wres(
         const long long nt = nbase + ns * kColdStep;
         uint4 v = make_uint4(0u, 0u, 0u, 0u);
         if (nt < n_cols) {
-          const long long base = cold_tile_base(nt, (long long)kc0 + (long long)ks * kColdStep, n_cols, kr, n_block, k_block);
+          const long long base = cold_tile_base(nt, (long long)kc0 + (long long)ks * kColdStep, n_cols, kr, n_block, k_block, s.n_contiguous);
           v = *reinterpret_cast<const uint4*>(wblk + base + ch * 512 + cd * 2);
         }
         const __nv_bfloat16* vv = reinterpret_cast<const __nv_bfloat16*>(&v);
@@ -585,7 +604,8 @@ inline void grouped_gemm_impl(
     const tvm::ffi::TensorView* blk_off = nullptr,
     const tvm::ffi::TensorView* blk_off_up = nullptr,
     int64_t n_block = 0, int64_t k_block = 0, int64_t cold_n_cols = 0,
-    int64_t wres_k_max = 0, const tvm::ffi::TensorView* scratch = nullptr) {
+    int64_t wres_k_max = 0, const tvm::ffi::TensorView* scratch = nullptr,
+    bool n_contiguous = false) {
   using namespace host;
 
   auto Rx = SymbolicSize{"x_rows"};
@@ -611,7 +631,7 @@ inline void grouped_gemm_impl(
   // n_cols는 인자로 받는다 (노드 N shard 행 수).
   auto S = SymbolicSize{"slab_elems"};
   if (layout == COLD) {
-    TensorMatcher({S}).with_dtype<bf16_t>().with_device<kDLCPU, kDLCUDAHost>().verify(w);
+    TensorMatcher({S}).with_dtype<bf16_t>().with_device<kDLCPU, kDLCUDAHost, kDLCUDA>().verify(w);
     RuntimeCheck(cold_n_cols > 0, "grouped_gemm_cold: n_cols must be given");
     N.set_value(cold_n_cols);
   } else if (w_on_device) {
@@ -661,7 +681,7 @@ inline void grouped_gemm_impl(
   Slot s0{static_cast<const __nv_bfloat16*>(w.data_ptr()),
           static_cast<const int32_t*>(row_off.data_ptr()),
           static_cast<const uint16_t*>(kidx.data_ptr()), out_col_offset,
-          blk_off ? static_cast<const int64_t*>(blk_off->data_ptr()) : nullptr};
+          blk_off ? static_cast<const int64_t*>(blk_off->data_ptr()) : nullptr, n_contiguous};
   Slot s1 = s0;
   const bool fused = (w_up != nullptr);
   if (fused) {
@@ -671,7 +691,7 @@ inline void grouped_gemm_impl(
     TensorMatcher({R2}).with_dtype<uint16_t>().with_device(cuda_device).verify(*kidx_up);
     if (layout == COLD) {
       auto S2 = SymbolicSize{"slab_elems_up"};
-      TensorMatcher({S2}).with_dtype<bf16_t>().with_device<kDLCPU, kDLCUDAHost>().verify(*w_up);
+      TensorMatcher({S2}).with_dtype<bf16_t>().with_device<kDLCPU, kDLCUDAHost, kDLCUDA>().verify(*w_up);
     } else if (w_on_device) {
       TensorMatcher({R2, N}).with_dtype<bf16_t>().with_device(cuda_device).verify(*w_up);
     } else {
@@ -690,7 +710,7 @@ inline void grouped_gemm_impl(
     s1 = Slot{static_cast<const __nv_bfloat16*>(w_up->data_ptr()),
               static_cast<const int32_t*>(row_off_up->data_ptr()),
               static_cast<const uint16_t*>(kidx_up->data_ptr()), out_col_offset_up,
-              blk_off_up ? static_cast<const int64_t*>(blk_off_up->data_ptr()) : nullptr};
+              blk_off_up ? static_cast<const int64_t*>(blk_off_up->data_ptr()) : nullptr, n_contiguous};
   }
 
   const DLDevice device = cuda_device.unwrap();
@@ -791,12 +811,12 @@ void grouped_gemm_cold(
     tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
     tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
     int64_t max_blocks, int64_t n_block, int64_t k_block, int64_t n_cols, int64_t wres_k_max,
-    tvm::ffi::TensorView scratch) {
+    tvm::ffi::TensorView scratch, int64_t n_contiguous) {
   const tvm::ffi::TensorView* sc = scratch.numel() > 0 ? &scratch : nullptr;
   grouped_gemm_impl(x, pair_sorted, pair_off, tile_off, w, row_off, kidx, out,
                     out_col_offset, x_row_is_pair, false, max_blocks,
                     nullptr, nullptr, nullptr, 0, COLD, &blk_off, nullptr,
-                    n_block, k_block, n_cols, wres_k_max, sc);
+                    n_block, k_block, n_cols, wres_k_max, sc, n_contiguous != 0);
 }
 
 void grouped_gemm_cold_gateup(
@@ -809,12 +829,12 @@ void grouped_gemm_cold_gateup(
     tvm::ffi::TensorView out, int64_t out_col_offset_gate,
     int64_t out_col_offset_up, int64_t x_row_is_pair,
     int64_t max_blocks, int64_t n_block, int64_t k_block, int64_t n_cols, int64_t wres_k_max,
-    tvm::ffi::TensorView scratch) {
+    tvm::ffi::TensorView scratch, int64_t n_contiguous) {
   const tvm::ffi::TensorView* sc = scratch.numel() > 0 ? &scratch : nullptr;
   grouped_gemm_impl(x, pair_sorted, pair_off, tile_off, w_gate, row_off_gate,
                     kidx_gate, out, out_col_offset_gate, x_row_is_pair, false,
                     max_blocks, &w_up, &row_off_up, &kidx_up, out_col_offset_up,
-                    COLD, &blk_off_gate, &blk_off_up, n_block, k_block, n_cols, wres_k_max, sc);
+                    COLD, &blk_off_gate, &blk_off_up, n_block, k_block, n_cols, wres_k_max, sc, n_contiguous != 0);
 }
 
 void grouped_gemm_indexed_gateup(

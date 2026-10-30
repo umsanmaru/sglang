@@ -60,6 +60,7 @@ _ENV_COLD_HYBRID_FRAC = "SGLANG_PRISM_COLD_HYBRID_FRAC"
 _ENV_WARM_KT = "SGLANG_PRISM_WARM_KT"
 # warm-kt 모드에서 이 M 이상의 prefill은 warm을 CPU(warm-kt 인스턴스)가 계산 (미설정 = GPU).
 _ENV_WARM_CPU_MIN_M = "SGLANG_PRISM_WARM_CPU_MIN_M"
+_ENV_WARM_CPU_MAX_M = "SGLANG_PRISM_WARM_CPU_MAX_M"
 # cold를 전용 stream + 플래그 wait로 (블로킹 콜백 없음). eager 전용. hybrid와 동시 불가.
 _ENV_COLD_ASYNC = "SGLANG_PRISM_COLD_ASYNC"
 # cold submit/sync host node를 곁 스트림에 얹는다 (P2). graph decode에서
@@ -72,6 +73,11 @@ _ENV_COLD_SPLIT = "SGLANG_PRISM_COLD_SPLIT"
 # 미설정 = 물리 코어 수(HT 제외). cold_load 시점의 kt 워커들은 50 ms 뒤 condvar에서
 # 잠들므로(worker_pool.cpp) prepare 구간에 코어를 다 써도 경합하지 않는다.
 _ENV_LOAD_THREADS = "SGLANG_PRISM_LOAD_THREADS"
+# effective sparsity 실측 (mask_stats.py): 출력 json 경로. sparse plan + eager decode에서만 값이 쌓인다.
+_ENV_MASK_STATS = "SGLANG_PRISM_MASK_STATS"
+_ENV_MASK_STATS_EVERY = "SGLANG_PRISM_MASK_STATS_EVERY"
+# NaN 진단: 층 입력/act의 유한성을 prefill 포함해 검사 (층당 GPU 리덕션 + 동기).
+_ENV_MASK_STATS_NANPROBE = "SGLANG_PRISM_MASK_STATS_NANPROBE"
 
 
 def _load_threads() -> int:
@@ -189,6 +195,13 @@ class _PrismRuntime:
             # 조립 지점: env·runner 같은 외부 입력은 전부 여기서 읽어 명시
             # 인자로 주입한다 (executor는 hidden input 없음).
             gmin = os.environ.get(_ENV_GROUPED_MIN_M)
+            mask_stats = None
+            if os.environ.get(_ENV_MASK_STATS):
+                from sglang.srt.layers.moe.prism.mask_stats import MaskStats
+
+                mask_stats = MaskStats(self.plan, self.calib, os.environ[_ENV_MASK_STATS],
+                                       every=int(os.environ.get(_ENV_MASK_STATS_EVERY, "16")),
+                                       nan_probe=os.environ.get(_ENV_MASK_STATS_NANPROBE) == "1")
             self._executor = PrismExecutor(
                 self.plan, self._resources, self.cold() if self.has_cold else None,
                 cold_stream=os.environ.get(_ENV_COLD_STREAM) == "1",
@@ -203,8 +216,12 @@ class _PrismRuntime:
                 hybrid_local_node=_hybrid_local_node(device),
                 warm_cpu_min_m=(int(os.environ[_ENV_WARM_CPU_MIN_M])
                                 if os.environ.get(_ENV_WARM_CPU_MIN_M) else None),
+                warm_cpu_max_m=(int(os.environ.get(_ENV_WARM_CPU_MAX_M, "1536"))
+                                if self.fmt.name == "bf16" and
+                                not os.environ.get(_ENV_WARM_CPU_MIN_M) else None),
                 cold_async=os.environ.get(_ENV_COLD_ASYNC) == "1",
                 cold_split=os.environ.get(_ENV_COLD_SPLIT) == "1",
+                mask_stats=mask_stats,
             )
         return self._executor
 
@@ -262,7 +279,13 @@ def _get_runtime() -> _PrismRuntime:
     global _RUNTIME
     if _RUNTIME is None:
         plan_path = os.environ[_ENV_PLAN]
-        plan = parse_plan(plan_path)
+        from sglang.srt.layers.moe.prism.loading_cache import load_plan_cached
+
+        import time
+
+        metadata_start = time.perf_counter()
+        plan = load_plan_cached(plan_path)
+        plan_ready = time.perf_counter()
         # sparsity plan이면 자산을 먼저 열어 shape까지 검증한다 (계약 ①):
         # 다른 모델의 calib을 적용하는 것은 dims 불일치와 같은 급의 silent
         # failure이므로 startup에서 죽는 편이 낫다.
@@ -271,9 +294,13 @@ def _get_runtime() -> _PrismRuntime:
             from sglang.srt.layers.moe.prism.calib import CalibTables
 
             calib = CalibTables.load(plan.sparsity)
+        calib_ready = time.perf_counter()
         validate_static(
             plan, calib_probe=None if calib is None else calib.probe()
         )
+        logger.info("[prism] metadata loading: plan %.2fs calibration %.2fs validation %.2fs",
+                    plan_ready - metadata_start, calib_ready - plan_ready,
+                    time.perf_counter() - calib_ready)
         logger.info(
             "[prism] plan loaded: %s (model_id=%s, sparsity=%s)",
             plan_path, plan.model_id,
@@ -391,7 +418,11 @@ class PrismMoEMethod(FusedMoEMethodBase):
         # 존립 근거를 무너뜨리는데, 결과는 정확하고 느리기만 해서 어떤 테스트도
         # 잡지 못한다 — 그래서 로더가 배치 후 실제 노드를 검증하고 즉사한다.
         device = torch.device(torch.cuda.current_device())
-        warm_kt = os.environ.get(_ENV_WARM_KT) == "1"
+        auto_warm_kt = (runtime.fmt.name == "bf16" and runtime.has_cold
+                        and _cold_gpu_min_m() is not None
+                        and all(any(runtime.plan.expert(self.layer_id, e).proj(p).has_tier(Tier.WARM)
+                                    for e in range(runtime.plan.dims.num_experts)) for p in Proj))
+        warm_kt = os.environ.get(_ENV_WARM_KT, "1" if auto_warm_kt else "0") == "1"
         prepared = prepare_layer_weights(
             self.layer_id, full.w13, full.w2, runtime.plan,
             calib=runtime.calib, device=device,

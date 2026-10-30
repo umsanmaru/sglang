@@ -98,7 +98,8 @@ class ColdCpuProfiler:
                  mask_pattern: str = "random", numa_split: float = 0.5,
                  threads: Optional[int] = None,
                  cpu_kernel: Optional[str] = None, dtype: str = "bf16",
-                 seed: int = 0, numa_map: Optional[Sequence[int]] = None):
+                 seed: int = 0, numa_map: Optional[Sequence[int]] = None,
+                 max_len: int = 1, sparse: bool = True):
         from kt_kernel import kt_kernel_ext
         from kt_kernel.experts_partial import PartialMoEWrapper
 
@@ -149,7 +150,11 @@ class ColdCpuProfiler:
         else:
             self.cpuinfer = kt_kernel_ext.CPUInfer(self.threads)
         cfg = kt_kernel_ext.moe.MOEConfig(E, topk, H, I, 0)
-        cfg.max_len = 1
+        # max_len은 kt가 받아들이는 최대 qlen이다. 이 프로파일은 decode(M=1) 전용으로
+        # 태어나 1로 박혀 있었는데, prefill(M>1)을 재려면 그만큼 열어야 한다
+        # (kt: "forward_gateup_partial: qlen out of range [1, max_len]").
+        # 로컬 패치, 2026-09-09 -- prism-eval/runs/bench_cold_prefill.py가 쓴다.
+        cfg.max_len = max_len
         cfg.layer_idx = 0
         cfg.partial.enabled = True
         cfg.partial.n_total = I
@@ -186,11 +191,18 @@ class ColdCpuProfiler:
         sp.p_down, sp.lam_down = SPARSITY_P, SPARSITY_LAM
         cfg.pool = self.cpuinfer.backend_
 
+        # sparse=False: sparsity 테이블을 아예 만들지 않는다. 테이블을 넘기는 순간 kt가
+        # sparse 경로로 굳고 qlen > 1을 거절하므로("sparsity is decode-only"), PREFILL을
+        # 재려면 이 길이 필요하다 -- executor도 prefill에서는 sparsity를 쓰지 않는다
+        # (masking = self._sparse and m == 1). 로컬 패치, 2026-09-09.
         weights, scales, tables, keep = {}, {}, {}, {}
         for p in PROJS:
             n = shape.n_cols(p)
             weights[p], scales[p] = self.store.cold_store(
                 E, n, self.k_cold[p], seed=seed + hash(p) % 97)
+            if not sparse:
+                keep[p] = 1.0
+                continue
             a, c, thr, frac = sparse_tables(E, self.k_cold[p], sparsity,
                                             pattern=mask_pattern, seed=seed)
             tables[f"{p}_wn_sq"] = a
@@ -205,7 +217,7 @@ class ColdCpuProfiler:
                          down_scale=scales["down"]))
         self.wrapper.load_weights_from_tensors(
             weights["gate"], weights["up"], weights["down"],
-            sparsity_tables=tables, **scale_kw)
+            **({"sparsity_tables": tables} if sparse else {}), **scale_kw)
 
     def close(self) -> None:
         self.wrapper = None

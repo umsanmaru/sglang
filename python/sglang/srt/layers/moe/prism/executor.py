@@ -119,8 +119,10 @@ class PrismExecutor:
                  cold_gpu_min_m: Optional[int] = None,
                  cold_hybrid_frac=None, hybrid_local_node: int = 0,
                  warm_cpu_min_m: Optional[int] = None,
+                 warm_cpu_max_m: Optional[int] = None,
                  cold_async: bool = False,
-                 cold_split: bool = False):
+                 cold_split: bool = False,
+                 mask_stats=None):
         """cold_stream: eager에서도 cold submit/sync를 stream 통합으로 (opt-in).
         force_graph_path: 캡처 없이 graph-safe 경로 강제 (테스트/디버그).
         capture_mode_fn: sglang CudaGraphRunner의 capture 구간(캡처 전 워밍업
@@ -153,6 +155,7 @@ class PrismExecutor:
         # warm-kt 모드에서 이 M 이상의 prefill은 warm 행을 GPU 대신 **CPU(warm-kt 인스턴스)**가
         # 계산한다 — hot=0이면 kt 네이티브와 같은 CPU FLOPs. None = 항상 GPU.
         self._warm_cpu_min_m = warm_cpu_min_m
+        self._warm_cpu_max_m = warm_cpu_max_m
         # cold_async (2026-08-27): cold 경로를 **전용 stream**에 두고 완료를 블로킹 sync
         # 콜백 대신 pinned 플래그 wait 커널로 받는다 — host 스레드도 CUDA 콜백 스레드도
         # 어디서도 블록되지 않아, hot/warm stream과 직렬화되지 않는다. eager 전용
@@ -195,6 +198,8 @@ class PrismExecutor:
         self._tiers: dict[int, LayerTiers] = {}
         self._layer_has_cold: dict[int, bool] = {}
         self._sparse = plan.sparsity is not None
+        # effective sparsity 실측기 (mask_stats.MaskStats; None = 끔). decode·eager에서만 관측.
+        self._mask_stats = mask_stats
         # cold task가 나중에 읽는 qlen — 주소 고정 멤버 (계약 ④의 포인터 경유)
         self._qlen_pin = torch.zeros(1, dtype=torch.int32)
         # graph 경로 qlen 버퍼는 **bs별로 격리**한다 (Finding A). 캡처가 baked하는
@@ -236,12 +241,20 @@ class PrismExecutor:
         self._tiers[layer_idx] = build_layer_tiers(
             prepared, self._plan, layer_idx, cold_gpu=cold_gpu,
             warm_kt=warm_kt, warm_kt_calib=warm_kt_calib)
+        # load_warm_layer has synchronously packed these source weights into
+        # C++ slabs. Tier construction above consumes their calibration; the
+        # executor must not retain a second full warm weight store per layer.
+        if warm_kt is not None:
+            prepared.warm_kt = None
         self._layer_has_cold[layer_idx] = has_cold
+        if self._mask_stats is not None:
+            self._mask_stats.register_layer(layer_idx)
         self._layer_cold_gpu[layer_idx] = cold_gpu is not None
         self._layer_warm_kt[layer_idx] = warm_kt is not None
 
     # ── 모드 결정 ──────────────────────────────────────────────────────────
-    def _plan_flow(self, m: int, topk_ids: torch.Tensor) -> _LayerFlow:
+    def _plan_flow(self, m: int, topk_ids: torch.Tensor, *,
+                   needs_host_ids: bool = True) -> _LayerFlow:
         """호출별 실행 모드를 1회 확정. graph-safe 경로는 캡처 중 불법 연산
         (pageable D2H, tolist, event.synchronize, blocking copy)을 전부
         우회해야 하므로, 여기서 갈라진 결정이 본문의 유일한 분기 원천이다."""
@@ -273,7 +286,7 @@ class PrismExecutor:
         # 순수 eager(스트림 통합 없음): cold가 expert_ids를 host에서 읽으므로 blocking
         # D2H 1회. 그 blocking이 뒤따르는 host 쓰기(qlen_pin)의 사실상 throttle이다
         # (계약 ④ Task8-3). cold_async는 자기 stream에서 async로 내린다.
-        if self._cold_async:
+        if self._cold_async or not needs_host_ids:
             ids_cpu = None
         else:
             with _nvtx("s1.topk_d2h"):
@@ -298,23 +311,39 @@ class PrismExecutor:
         inter, h = dims.intermediate_size, dims.hidden_size
 
         _nvtx_push(f"prism.L{layer_idx}")
-        flow = self._plan_flow(m, topk_ids)
+        # Decide GPU eligibility before the eager D2H. A pure GPU prefill has
+        # no host consumer of topk_ids; copying them only drains queued work.
+        cold_gpu = bool(
+            has_cold and m >= self._grouped_min_m
+            and self._cold_gpu_min_m is not None and m >= self._cold_gpu_min_m
+            and self._layer_cold_gpu[layer_idx]
+        )
+        warm_cpu_eligible = bool(
+            ((self._warm_cpu_max_m is not None and m < self._warm_cpu_max_m)
+             or (self._warm_cpu_max_m is None and self._warm_cpu_min_m is not None
+                 and m >= self._warm_cpu_min_m))
+            and self._layer_warm_kt.get(layer_idx, False)
+            and m >= self._grouped_min_m
+        )
+        # Keep the existing copy for CPU fallback, hybrid balancing, and warm
+        # CPU execution. Stream/graph/async paths retain their own ID transport.
+        flow = self._plan_flow(
+            m, topk_ids,
+            needs_host_ids=(not cold_gpu or self._hybrid_frac is not None
+                            or warm_cpu_eligible),
+        )
         # sparsity는 cold만, decode에서만 (prefill-dense).
         masking = self._sparse and m == 1
         # prefill 형태: pair를 expert로 묶어 GPU 티어가 W를 expert당 한 번 읽는다.
         # 레이어당 1회 만들어 phase·티어가 공유한다 (topk가 같다).
-        grouping: Optional[Grouping] = (
-            build_grouping(topk_ids, dims.num_experts)
-            if m >= self._grouped_min_m else None
-        )
+        with _nvtx("s0.build_grouping"):
+            grouping: Optional[Grouping] = (
+                build_grouping(topk_ids, dims.num_experts)
+                if m >= self._grouped_min_m else None
+            )
         # cold를 GPU가 읽는가 (대배치 prefill). 이 분기 하나가 "cold partial을
         # CPU와 GPU가 둘 다 내는" 이중계산을 막는다 — 아래 has_cold 블록 전부가
         # CPU 경로이고, GPU 경로는 _run_gateup/_run_down의 Tier.COLD 항목이다.
-        cold_gpu = bool(
-            has_cold and grouping is not None
-            and self._cold_gpu_min_m is not None and m >= self._cold_gpu_min_m
-            and self._layer_cold_gpu[layer_idx]
-        )
         # hybrid: GPU는 마스크된 expert만(제한 그룹핑), CPU는 나머지(kt skip 마스크).
         # 두 partial은 (m, j) 행이 서로소이고 각자 남의 행을 0으로 두므로 합이 곧 전체다.
         hybrid = bool(cold_gpu and self._hybrid_frac is not None
@@ -342,8 +371,7 @@ class PrismExecutor:
         # warm-kt CPU 계산 (prefill): warm GPU 티어를 건너뛰고 warm-kt 인스턴스를 cold와 나란히
         # submit한다. eager·비-stream·grouped 호출에서만 (cold와 같은 이유).
         warm_cpu = bool(
-            self._warm_cpu_min_m is not None and m >= self._warm_cpu_min_m
-            and self._layer_warm_kt.get(layer_idx, False) and grouping is not None
+            warm_cpu_eligible
             and not flow.graph_flow and not flow.use_cold_stream
         )
         # GPU sparse 티어와 rejoin이 같은 fp32 텐서를 쓴다 — 캐스팅이 두 번
@@ -367,6 +395,15 @@ class PrismExecutor:
         # host-block 경로: split이 켜지면 그쪽이 대신한다.
         cold_host_block = (has_cold or warm_cpu_legacy) and not cold_split
 
+        # effective sparsity 실측 — 커널과 같은 입력으로 마스크를 재계산해 누적 (eager decode만;
+        # graph 경로는 파이썬이 replay되지 않으므로 캡처 중 관측하면 워밍업 토큰이 섞인다).
+        stats_on = masking and self._mask_stats is not None and not flow.graph_flow
+        if self._mask_stats is not None and not flow.graph_flow:
+            # NaN 진단은 prefill(m>1)에서도 돈다 — decode 전용 관측이 못 보는 구간이다.
+            self._mask_stats.probe_calls += 1
+            self._mask_stats.probe(layer_idx, "gateup_in", hidden, m)
+        if stats_on:
+            self._mask_stats.observe_gateup(layer_idx, hidden, topk_ids, w32)
         # ── Phase 1: gateup ──────────────────────────────────────────────
         w_ptr = 0
         cold_gu = warm_gu = None
@@ -444,6 +481,10 @@ class PrismExecutor:
         # ~10번 왕복해 층당 2.5 ms였다 (2026-08-27 nsys).
         with _nvtx("rejoin1.acc+silu"):
             act = rejoin_gateup(gu_parts + [cold_gu, warm_gu], inter, swiglu_limit)
+        if self._mask_stats is not None and not flow.graph_flow:
+            self._mask_stats.probe(layer_idx, "act_after_rejoin1", act, m)
+        if stats_on:
+            self._mask_stats.observe_down(layer_idx, act, topk_ids, w32)
 
         # ── Phase 2: down ────────────────────────────────────────────────
         if hybrid:

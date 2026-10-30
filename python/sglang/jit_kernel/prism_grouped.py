@@ -35,7 +35,33 @@ WARM_MAX_BLOCKS = 128
 WRES_PCIE = True
 
 
+import contextlib as _ctx
+import os as _os
+
+import torch as _torch
+
+# nsys 구간 태그 — executor와 같은 스위치(SGLANG_PRISM_NVTX=1)를 쓴다. 평시 no-op.
+_NVTX = _os.environ.get("SGLANG_PRISM_NVTX") == "1"
+
+
+@_ctx.contextmanager
+def _nvtx(msg: str):
+    if not _NVTX:
+        yield
+        return
+    _torch.cuda.nvtx.range_push(msg)
+    try:
+        yield
+    finally:
+        _torch.cuda.nvtx.range_pop()
+
+
 def _scratch(out3d, wres_k_max):
+    with _nvtx("wres.scratch_alloc"):
+        return _scratch_impl(out3d, wres_k_max)
+
+
+def _scratch_impl(out3d, wres_k_max):
     """K-chunk 누산용 fp32 scratch [P, out_row]. wres가 아니면 빈 텐서(커널이 무시)."""
     if not wres_k_max:
         return torch.empty(0, dtype=torch.float32, device=out3d.device)
@@ -85,6 +111,12 @@ def grouped_gemm_indexed_pinned(x2d, grouping, w_flat, row_off, kidx, out3d,
                          out_col_offset, x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
     """위의 쌍둥이 — W가 pinned CPU(UVA 제자리 읽기, WARM). expert당 W를 **한 번만**
     PCIe로 읽는다 — worklist의 pair당 재읽기(중복도 M·k/E)가 사라진 자리다."""
+    from sglang.jit_kernel.prism_prefill import enabled, grouped_prefill, Projection
+    if enabled(out3d, grouping, stream):
+        p = Projection(w_flat, row_off, kidx, w_flat.shape[1],
+                       rows_host=getattr(w_flat, "_prism_prefill_rows", ()))
+        grouped_prefill(x2d, grouping, [(p, out_col_offset)], out3d, x_row_is_pair, stream)
+        return
     module = _jit_prism_grouped_module()
     with torch.cuda.stream(stream):
         module.grouped_gemm_indexed_pinned(
@@ -112,6 +144,15 @@ def grouped_gemm_indexed_pinned_gateup(x2d, grouping, w_gate, row_off_gate,
                                        out3d, out_col_gate, out_col_up,
                                        x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
     """gate+up 융합의 warm 짝 (pinned W)."""
+    from sglang.jit_kernel.prism_prefill import enabled, grouped_prefill, Projection
+    if enabled(out3d, grouping, stream):
+        gate = Projection(w_gate, row_off_gate, kidx_gate, w_gate.shape[1],
+                          rows_host=getattr(w_gate, "_prism_prefill_rows", ()))
+        up = Projection(w_up, row_off_up, kidx_up, w_up.shape[1],
+                        rows_host=getattr(w_up, "_prism_prefill_rows", ()))
+        grouped_prefill(x2d, grouping, [(gate, out_col_gate), (up, out_col_up)],
+                        out3d, x_row_is_pair, stream)
+        return
     module = _jit_prism_grouped_module()
     with torch.cuda.stream(stream):
         module.grouped_gemm_indexed_pinned_gateup(
@@ -127,6 +168,11 @@ def grouped_gemm_cold(x2d, grouping, cold, out3d, out_col_offset, x_row_is_pair,
     grouped GEMM. `cold`는 `ColdSlab`(weights.py) — slab 텐서 뷰, blk_off, 타일
     올림된 row_off/kidx, 노드 N shard 시작, n_block/k_block을 든다.
     출력 열은 `out_col_offset + cold.n_start`부터 이 노드의 n열이다."""
+    from sglang.jit_kernel.prism_prefill import enabled, grouped_prefill
+    if enabled(out3d, grouping, stream):
+        grouped_prefill(x2d, grouping, [(cold.prefill, out_col_offset + cold.n_start)],
+                        out3d, x_row_is_pair, stream)
+        return
     module = _jit_prism_grouped_module()
     with torch.cuda.stream(stream):
         module.grouped_gemm_cold(
@@ -134,15 +180,22 @@ def grouped_gemm_cold(x2d, grouping, cold, out3d, out_col_offset, x_row_is_pair,
             cold.slab, cold.blk_off, cold.row_off, cold.k_index, out3d,
             int(out_col_offset) + int(cold.n_start), int(bool(x_row_is_pair)),
             int(max_blocks), int(cold.n_block), int(cold.k_block), int(cold.n), int(wres_k_max),
-            _scratch(out3d, wres_k_max))
+            _scratch(out3d, wres_k_max), int(cold.layout == "kt_bf16_nc"))
 
 
 def grouped_gemm_cold_gateup(x2d, grouping, gate, up, out3d, out_col_gate,
                              out_col_up, x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
     """cold gate+up 한 launch (같은 노드의 두 slab). 두 slab의 n/n_start/블록
     상수는 같아야 한다 — 같은 kt 인스턴스가 만든 것이므로 그렇다."""
-    if (gate.n_start, gate.n_block, gate.k_block) != (up.n_start, up.n_block, up.k_block):
+    if (gate.n, gate.n_start, gate.n_block, gate.k_block, gate.layout) != (up.n, up.n_start, up.n_block, up.k_block, up.layout):
         raise ValueError("cold gateup fusion requires gate/up slabs of the same node instance")
+    from sglang.jit_kernel.prism_prefill import enabled, grouped_prefill
+    if enabled(out3d, grouping, stream):
+        grouped_prefill(x2d, grouping,
+                        [(gate.prefill, out_col_gate + gate.n_start),
+                         (up.prefill, out_col_up + up.n_start)],
+                        out3d, x_row_is_pair, stream)
+        return
     module = _jit_prism_grouped_module()
     with torch.cuda.stream(stream):
         module.grouped_gemm_cold_gateup(
@@ -151,7 +204,8 @@ def grouped_gemm_cold_gateup(x2d, grouping, gate, up, out3d, out_col_gate,
             up.slab, up.blk_off, up.row_off, up.k_index, out3d,
             int(out_col_gate) + int(gate.n_start), int(out_col_up) + int(up.n_start),
             int(bool(x_row_is_pair)), int(max_blocks), int(gate.n_block), int(gate.k_block),
-            int(gate.n), int(wres_k_max), _scratch(out3d, wres_k_max))
+            int(gate.n), int(wres_k_max), _scratch(out3d, wres_k_max),
+            int(gate.layout == "kt_bf16_nc"))
 
 
 def wait_flag(flag_pinned: torch.Tensor, target: int, stream) -> None:

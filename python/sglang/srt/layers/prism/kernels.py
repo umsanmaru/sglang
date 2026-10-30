@@ -26,9 +26,10 @@ _GPU_WARM_KERNELS: Tuple[str, ...] = ("gemv_worklist", "torch_bmm", "gemv_workli
                                       "gemv_worklist_fp8")
 # `kt_tile_k2_bf16_nopf`는 `kt_tile_k2_bf16`의 **no-SW-pf 형제**다 (kt-kernel
 # `GemmKernelTileK2BF16NoPF`): 소비 커서·prefill B-panel·prep/export 보조 프리페치가
-# 컴파일 타임에 빠진 같은 커널. 레이아웃·정렬·score·자산이 전부 같으므로 아래 모든 표에서
-# 원본과 같은 값을 갖고, "SW 프리페처 없음" ablation은 plan의 커널 키만 바꿔 돌린다.
-_CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_tile_k2_bf16_nopf", "kt_amx_fp4",
+# 컴파일 타임에 빠진 같은 커널. 레이아웃·정렬·자산이 전부 같아서 아래 표에서 원본과 같은
+# 값을 갖고, "SW 프리페처 없음" ablation은 plan의 커널 키만 바꿔 돌린다.
+_CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_tile_k2_bf16_nopf",
+                                      "kt_amx_fp4",
                                       "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128")
 
 # cold 커널 키가 함의하는 **slab 레이아웃**(GPU 제자리 읽기 로더가 해석) 과 노드 N shard 정렬.
@@ -41,8 +42,8 @@ _CPU_COLD_SLAB_LAYOUT: dict = {"kt_amx_bf16": "kt_bf16", "kt_tile_k2_bf16": "kt_
                                "kt_tile_k2_bf16_nopf": "kt_bf16",
                                "kt_amx_fp4": "kt_fp4", "kt_tile_k2_mxfp4": "kt_tile4",
                                "kt_tile_k2_fp8b128": "kt_tile8"}
-_CPU_COLD_N_ALIGN: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_fp4": 32,
-                           "kt_tile_k2_bf16_nopf": 32,
+_CPU_COLD_N_ALIGN: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32,
+                           "kt_tile_k2_bf16_nopf": 32, "kt_amx_fp4": 32,
                            "kt_tile_k2_mxfp4": 256, "kt_tile_k2_fp8b128": 256}
 
 # GPU 커널 키가 함의하는 **스토어 포맷** (formats.py). 키 하나가 스토어 형식·K 정렬·커널
@@ -62,8 +63,8 @@ _GPU_STORE_FORMAT: dict = {
 # plan/자산이 지키는 정렬은 페어(%2)뿐이므로, 로더가 여기까지 올리고 0 행을
 # 채운다. 새 cold 커널은 자기 타일 크기를 여기 등록한다.
 # fp8 타일은 배율 블록이 128 k라 타일 올림도 128이다 (32로 올리면 마지막 블록의 배율이 없다).
-_CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32, "kt_amx_fp4": 32,
-                             "kt_tile_k2_bf16_nopf": 32,
+_CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32,
+                             "kt_tile_k2_bf16_nopf": 32, "kt_amx_fp4": 32,
                              "kt_tile_k2_mxfp4": 32, "kt_tile_k2_fp8b128": 128}
 
 

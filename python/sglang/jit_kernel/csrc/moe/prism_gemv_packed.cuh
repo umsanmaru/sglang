@@ -41,6 +41,7 @@ struct PackedSlot {
   long long out_off;          // out3d 열 오프셋 (노드 shard 시작 포함)
   long long n_cols;           // 이 slab의 N (노드 shard 행 수)
   int n_block, k_block;
+  bool n_contiguous;
 };
 
 struct PackedSparse {
@@ -53,14 +54,15 @@ struct PackedSparse {
 };
 
 __device__ __forceinline__ long long packed_tile_base(
-    long long n, long long k, long long n_total, long long k_total, int n_block, int k_block) {
+    long long n, long long k, long long n_total, long long k_total, int n_block, int k_block, bool n_contiguous) {
   const long long nb = (n / n_block) * n_block;
   const long long nbs = min(static_cast<long long>(n_block), n_total - nb);
   const long long kb = (k / k_block) * k_block;
   const long long kbs = min(static_cast<long long>(k_block), k_total - kb);
   const long long ns = ((n - nb) / kPackedStep) * kPackedStep;
   const long long ks = ((k - kb) / kPackedStep) * kPackedStep;
-  return nb * k_total + kb * nbs + ns * kbs + ks * kPackedStep;
+  return nb * k_total + kb * nbs +
+         (n_contiguous ? ks * nbs + ns * kPackedStep : ns * kbs + ks * kPackedStep);
 }
 
 template <typename IdxT, bool SPARSE>
@@ -152,7 +154,7 @@ __global__ void __launch_bounds__(kPackedThreads) prism_gemv_packed(
           if (!keep[lk >> 1]) continue;
         }
         const long long k_abs = base + kk;
-        const long long tb = packed_tile_base(nt, k_abs, s.n_cols, kr, s.n_block, s.k_block);
+        const long long tb = packed_tile_base(nt, k_abs, s.n_cols, kr, s.n_block, s.k_block, s.n_contiguous);
         // 타일 안: half*512 + (kp*16 + i16)*2, i16 = half 안의 n (ng*4 .. +3)
         const uint4 v = *reinterpret_cast<const uint4*>(wblk + tb + half * 512 + (kp * 16 + ng * 4) * 2);
         const __nv_bfloat16* vv = reinterpret_cast<const __nv_bfloat16*>(&v);
@@ -185,6 +187,7 @@ __global__ void __launch_bounds__(kPackedThreads) prism_gemv_packed(
 struct PackedIn {
   tvm::ffi::TensorView w, blk_off, row_off, kidx;
   int64_t out_col_offset, n_cols, n_block, k_block;
+  bool n_contiguous;
 };
 struct PackedSparseIn {
   tvm::ffi::TensorView a, c, thr, topk_w;
@@ -211,7 +214,7 @@ inline PackedSlot make_slot(const PackedIn& in, const DLDevice& dev, int64_t E1)
                     static_cast<const int64_t*>(in.blk_off.data_ptr()),
                     static_cast<const int32_t*>(in.row_off.data_ptr()),
                     static_cast<const uint16_t*>(in.kidx.data_ptr()),
-                    in.out_col_offset, in.n_cols, static_cast<int>(in.n_block), static_cast<int>(in.k_block)};
+                    in.out_col_offset, in.n_cols, static_cast<int>(in.n_block), static_cast<int>(in.k_block), in.n_contiguous};
 }
 
 inline void gemv_packed_impl(
@@ -280,8 +283,8 @@ void gemv_packed(
     tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView out,
     tvm::ffi::TensorView w, tvm::ffi::TensorView blk_off, tvm::ffi::TensorView row_off,
     tvm::ffi::TensorView kidx, int64_t out_col_offset, int64_t n_cols, int64_t n_block,
-    int64_t k_block, int64_t x_row_is_pair) {
-  const PackedIn s0{w, blk_off, row_off, kidx, out_col_offset, n_cols, n_block, k_block};
+    int64_t k_block, int64_t x_row_is_pair, int64_t n_contiguous) {
+  const PackedIn s0{w, blk_off, row_off, kidx, out_col_offset, n_cols, n_block, k_block, n_contiguous != 0};
   gemv_packed_impl(x, topk, out, x_row_is_pair, s0, nullptr, nullptr, nullptr);
 }
 
@@ -291,9 +294,9 @@ void gemv_packed_gateup(
     tvm::ffi::TensorView w_g, tvm::ffi::TensorView blk_g, tvm::ffi::TensorView ro_g, tvm::ffi::TensorView ki_g,
     tvm::ffi::TensorView w_u, tvm::ffi::TensorView blk_u, tvm::ffi::TensorView ro_u, tvm::ffi::TensorView ki_u,
     int64_t out_col_g, int64_t out_col_u, int64_t n_cols, int64_t n_block, int64_t k_block,
-    int64_t x_row_is_pair) {
-  const PackedIn s0{w_g, blk_g, ro_g, ki_g, out_col_g, n_cols, n_block, k_block};
-  const PackedIn s1{w_u, blk_u, ro_u, ki_u, out_col_u, n_cols, n_block, k_block};
+    int64_t x_row_is_pair, int64_t n_contiguous) {
+  const PackedIn s0{w_g, blk_g, ro_g, ki_g, out_col_g, n_cols, n_block, k_block, n_contiguous != 0};
+  const PackedIn s1{w_u, blk_u, ro_u, ki_u, out_col_u, n_cols, n_block, k_block, n_contiguous != 0};
   gemv_packed_impl(x, topk, out, x_row_is_pair, s0, &s1, nullptr, nullptr);
 }
 
@@ -305,8 +308,8 @@ void gemv_packed_sparse(
     tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,
     int64_t out_col_offset, int64_t n_cols, int64_t n_block, int64_t k_block,
     int64_t x_row_is_pair, double p, double lam, double pmax, double grid,
-    int64_t ng, int64_t renorm_it) {
-  const PackedIn s0{w, blk_off, row_off, kidx, out_col_offset, n_cols, n_block, k_block};
+    int64_t ng, int64_t renorm_it, int64_t n_contiguous) {
+  const PackedIn s0{w, blk_off, row_off, kidx, out_col_offset, n_cols, n_block, k_block, n_contiguous != 0};
   const PackedSparseIn sp{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
   gemv_packed_impl(x, topk, out, x_row_is_pair, s0, nullptr, &sp, nullptr);
 }
@@ -321,9 +324,9 @@ void gemv_packed_sparse_gateup(
     tvm::ffi::TensorView topk_w,
     int64_t out_col_g, int64_t out_col_u, int64_t n_cols, int64_t n_block, int64_t k_block,
     int64_t x_row_is_pair, double p_g, double lam_g, double p_u, double lam_u,
-    double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  const PackedIn s0{w_g, blk_g, ro_g, ki_g, out_col_g, n_cols, n_block, k_block};
-  const PackedIn s1{w_u, blk_u, ro_u, ki_u, out_col_u, n_cols, n_block, k_block};
+    double pmax, double grid, int64_t ng, int64_t renorm_it, int64_t n_contiguous) {
+  const PackedIn s0{w_g, blk_g, ro_g, ki_g, out_col_g, n_cols, n_block, k_block, n_contiguous != 0};
+  const PackedIn s1{w_u, blk_u, ro_u, ki_u, out_col_u, n_cols, n_block, k_block, n_contiguous != 0};
   const PackedSparseIn sp0{a_g, c_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it};
   const PackedSparseIn sp1{a_u, c_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it};
   gemv_packed_impl(x, topk, out, x_row_is_pair, s0, &s1, &sp0, &sp1);

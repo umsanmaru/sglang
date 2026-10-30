@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Optional, Sequence
 
 import torch
@@ -48,6 +49,15 @@ class ColdSlab:
     k_max: int = 0          # expert당 최대 K(타일 올림) — W-resident 커널의 smem 크기
     fmt: object = None      # StoreFormat — GPU 진입점을 정한다
     layout: str = "kt_bf16"  # slab 레이아웃 태그 (kernels.cold_slab_layout) — 로더 변형 선택
+
+    rows_host: tuple = ()  # immutable load-time K offsets, no per-step D2H
+
+    @cached_property
+    def prefill(self):
+        from sglang.jit_kernel.prism_prefill import Projection
+        return Projection(self.slab, self.row_off, self.k_index, self.n,
+                          self.layout, self.blk_off, self.n_block, self.k_block,
+                          self.rows_host)
 
 
 @dataclass(frozen=True)
@@ -97,6 +107,9 @@ def build_cold_gpu_layer(
     from sglang.srt.layers.moe.prism.kernels import cold_slab_layout
 
     layout = cold_slab_layout(plan.kernels.cpu_cold)
+    # The installed MoE TileK2 producer uses BufferBNC (N-contiguous tiles).
+    if plan.kernels.cpu_cold == "kt_tile_k2_bf16":
+        layout = "kt_bf16_nc"
     ep = plan.expert(layer_idx, 0)
     E = plan.dims.num_experts
     out: dict = {Proj.GATE: {}, Proj.UP: {}, Proj.DOWN: {}}
@@ -139,6 +152,7 @@ def build_cold_gpu_layer(
             n=int(v["n"]), n_start=n_start,
             n_block=int(v["n_block"]), k_block=int(v["k_block"]),
             node=node, proj=proj, k_max=max(k_pad) if k_pad else 0, fmt=fmt, layout=layout,
+            rows_host=tuple(row_off_cpu.tolist()),
         )
     for proj in Proj:
         nodes = sorted(out[proj])

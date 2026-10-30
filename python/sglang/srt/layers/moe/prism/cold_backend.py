@@ -107,6 +107,11 @@ class KtColdBackend:
         dst.row_off = shard.row_off.tolist()
         dst.idx = shard.k_index.to(torch.int32).tolist()
         real = shard.real_rows.tolist()
+        # A one-sided empty warm GU is encoded as an all-zero tile. KT requires
+        # padding < one tile, so expose one zero-valued dummy pair as real rows.
+        # The shard/calibration retain real_rows=0; no nonzero weight is added.
+        real = [2 if r == 0 and int(shard.row_off[e + 1] - shard.row_off[e]) > 0 else r
+                for e, r in enumerate(real)]
         # 패딩이 없으면 real_rows를 비워 둔다 — kt가 k(e)와 같다고 읽는다.
         if any(r != shard.row_off[e + 1] - shard.row_off[e] for e, r in enumerate(real)):
             dst.real_rows = real
