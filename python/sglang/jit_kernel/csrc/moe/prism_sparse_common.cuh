@@ -29,6 +29,10 @@ struct SparseIn {
   // score k1 (per-k, 2026-09-05): 마스크가 |x_k| >= thr 하나라 a/c를 쓰지 않는다 — 호출자는
   // a/c 자리에 아무 텐서(관례상 thr)를 넣고 per_k=true를 준다. fill 쪽이 a/c 검증을 건너뛴다.
   bool per_k = false;
+  // score k1w1 (2026-09-07): per-k 마스크에 **열 노름을 곱한다** — `a`(=wn²)를 읽고
+  // `x²·a >= thr²`로 판정한다. `c`는 여전히 안 읽는다. per_k=false일 때는 의미가 없다
+  // (페어 score는 항상 a와 c를 쓴다).
+  bool use_wn = false;
 };
 
 // 이 (m, j)의 임계값(비제곱). 전 스레드가 중복 계산한다 — top_k(≤16)짜리 루프라
@@ -75,6 +79,12 @@ __device__ __forceinline__ float sparse_thr2(const SparseArgs& sp, long long m,
 
 // score k1: keep_k = |x_k| >= thr (kt k_mask.hpp와 같은 판정).
 __device__ __forceinline__ bool keep_k(float x, float thr) { return fabsf(x) >= thr; }
+
+// score k1w1: keep_k = |x_k|·wn_k >= thr  ⇔  x²·a >= thr² (a = wn²). 제곱으로 비교하는
+// 것은 kt `build_k_mask_w`와 같은 규약이고(sqrt 없음), 둘 다 음이 아니라 동치다.
+__device__ __forceinline__ bool keep_k_w(float x, float a, float thr2) {
+  return x * x * a >= thr2;
+}
 
 // 페어 (절대 행 ar = 2·pair_id)의 에너지: a[ar]·x0² + a[ar+1]·x1² + 2·c[ar/2]·x0·x1, 음수는 0.
 __device__ __forceinline__ float pair_energy(const SparseArgs& sp, long long ar,

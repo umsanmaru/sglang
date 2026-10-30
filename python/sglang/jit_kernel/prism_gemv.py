@@ -30,6 +30,23 @@ def _jit_prism_gemv_module() -> Module:
             ("gemv_worklist_indexed_sparse", "gemv_worklist_indexed_sparse"),
             ("gemv_worklist_indexed_pinned_sparse",
              "gemv_worklist_indexed_pinned_sparse"),
+            # score k1 (per-k |x| >= thr) — a/c를 받지 않는다. `SparseSpec.per_k`가
+            # 참이면 `_sparse_call`이 이쪽으로 보낸다 (fp8 판과 같은 규약).
+            ("gemv_worklist_indexed_sparsek1", "gemv_worklist_indexed_sparsek1"),
+            ("gemv_worklist_indexed_pinned_sparsek1",
+             "gemv_worklist_indexed_pinned_sparsek1"),
+            ("gemv_worklist_indexed_sparsek1_gateup",
+             "gemv_worklist_indexed_sparsek1_gateup"),
+            ("gemv_worklist_indexed_pinned_sparsek1_gateup",
+             "gemv_worklist_indexed_pinned_sparsek1_gateup"),
+            # score k1w1 (per-k × 열 노름: x²·a >= thr²) — a를 받는다.
+            ("gemv_worklist_indexed_sparsek1w", "gemv_worklist_indexed_sparsek1w"),
+            ("gemv_worklist_indexed_pinned_sparsek1w",
+             "gemv_worklist_indexed_pinned_sparsek1w"),
+            ("gemv_worklist_indexed_sparsek1w_gateup",
+             "gemv_worklist_indexed_sparsek1w_gateup"),
+            ("gemv_worklist_indexed_pinned_sparsek1w_gateup",
+             "gemv_worklist_indexed_pinned_sparsek1w_gateup"),
         ],
     )
 
@@ -103,19 +120,39 @@ def gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx, out3d,
                                             int(bool(x_row_is_pair)), int(vec))
 
 
-def _sparse_call(fn, x2d, topk_ids, topk_weights, w_flat, row_off, kidx, out3d,
+def _per_k(sp) -> bool:
+    """이 spec이 per-k 마스크인가 (k1 또는 k1w1). 없으면 페어(k2wl2)로 본다."""
+    return bool(getattr(sp, "per_k", False))
+
+
+def _per_k_w(sp) -> bool:
+    """per-k에 **열 노름을 곱하는가** (score k1w1). `a`의 유무가 그 표식이다 —
+    커널도 같은 규칙으로 가른다 (`sp.a != nullptr`)."""
+    return _per_k(sp) and getattr(sp, "a", None) is not None
+
+
+def _sparse_call(fn, fn_k1, fn_k1w, x2d, topk_ids, topk_weights, w_flat, row_off, kidx, out3d,
                  sp, out_col_offset, x_row_is_pair, stream, vec) -> None:
     """sparse 두 래퍼의 공통 본체 — 갈리는 것은 FFI 심볼 하나뿐이다.
 
     `topk_weights`가 `sp`에 들어가지 않는 이유: sp는 로드 타임에 한 번 만들어
     영구 보관하는 물건이고(a/c/thr는 device 상주 상수), 라우터 가중은 스텝마다
     갈린다. 섞으면 스텝마다 spec을 복제하거나 공유 객체를 변조해야 한다."""
+    tail = (int(out_col_offset), int(bool(x_row_is_pair)), int(vec),
+            float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid),
+            int(sp.ng), int(sp.renorm_it))
     with torch.cuda.stream(stream):
+        if _per_k_w(sp):
+            # score k1w1: a(wn²) + thr. 커널이 x²·a >= thr²로 판정한다.
+            fn_k1w(x2d, topk_ids, w_flat, row_off, kidx, out3d, sp.a, sp.thr,
+                   topk_weights, *tail)
+            return
+        if _per_k(sp):
+            # score k1: 진입점이 a/c를 받지 않는다 (마스크가 |x_k| >= thr 하나).
+            fn_k1(x2d, topk_ids, w_flat, row_off, kidx, out3d, sp.thr, topk_weights, *tail)
+            return
         fn(x2d, topk_ids, w_flat, row_off, kidx, out3d,
-           sp.a, sp.c, sp.thr, topk_weights,
-           int(out_col_offset), int(bool(x_row_is_pair)), int(vec),
-           float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid),
-           int(sp.ng), int(sp.renorm_it))
+           sp.a, sp.c, sp.thr, topk_weights, *tail)
 
 
 def gemv_worklist_indexed_sparse(x2d, topk_ids, topk_weights, w_flat, row_off,
@@ -132,7 +169,9 @@ def gemv_worklist_indexed_sparse(x2d, topk_ids, topk_weights, w_flat, row_off,
     않는다) — 그래서 전부 keep인 경우 dense와 **비트일치**한다.
     """
     module = _jit_prism_gemv_module()
-    _sparse_call(module.gemv_worklist_indexed_sparse, x2d, topk_ids,
+    _sparse_call(module.gemv_worklist_indexed_sparse,
+                 module.gemv_worklist_indexed_sparsek1,
+                 module.gemv_worklist_indexed_sparsek1w, x2d, topk_ids,
                  topk_weights, w_flat, row_off, kidx, out3d, sp,
                  out_col_offset, x_row_is_pair, stream, vec)
 
@@ -143,7 +182,9 @@ def gemv_worklist_indexed_pinned_sparse(x2d, topk_ids, topk_weights, w_flat,
                                         vec=0) -> None:
     """위의 쌍둥이 — W가 pinned CPU(WARM). 건너뛴 로드가 그대로 PCIe 절약이다."""
     module = _jit_prism_gemv_module()
-    _sparse_call(module.gemv_worklist_indexed_pinned_sparse, x2d, topk_ids,
+    _sparse_call(module.gemv_worklist_indexed_pinned_sparse,
+                 module.gemv_worklist_indexed_pinned_sparsek1,
+                 module.gemv_worklist_indexed_pinned_sparsek1w, x2d, topk_ids,
                  topk_weights, w_flat, row_off, kidx, out3d, sp,
                  out_col_offset, x_row_is_pair, stream, vec)
 
@@ -192,17 +233,31 @@ def gemv_worklist_indexed_sparse_gateup(
         if getattr(sp_gate, f) != getattr(sp_up, f):
             raise ValueError(f"gateup fusion requires a shared sparsity budget; "
                              f"{f} differs ({getattr(sp_gate, f)} vs {getattr(sp_up, f)})")
+    if _per_k(sp_gate) != _per_k(sp_up):
+        raise ValueError("gateup fusion requires the same sparsity score on gate and up")
     module = _jit_prism_gemv_module()
+    tail = (int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), int(vec),
+            float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
+            float(sp_gate.pmax), float(sp_gate.grid),
+            int(sp_gate.ng), int(sp_gate.renorm_it))
     with torch.cuda.stream(stream):
+        if _per_k_w(sp_gate):
+            module.gemv_worklist_indexed_sparsek1w_gateup(
+                x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
+                w_up, row_off_up, kidx_up, out3d,
+                sp_gate.a, sp_gate.thr, sp_up.a, sp_up.thr, topk_weights, *tail)
+            return
+        if _per_k(sp_gate):
+            module.gemv_worklist_indexed_sparsek1_gateup(
+                x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
+                w_up, row_off_up, kidx_up, out3d,
+                sp_gate.thr, sp_up.thr, topk_weights, *tail)
+            return
         module.gemv_worklist_indexed_sparse_gateup(
             x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
             w_up, row_off_up, kidx_up, out3d,
             sp_gate.a, sp_gate.c, sp_gate.thr,
-            sp_up.a, sp_up.c, sp_up.thr, topk_weights,
-            int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), int(vec),
-            float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
-            float(sp_gate.pmax), float(sp_gate.grid),
-            int(sp_gate.ng), int(sp_gate.renorm_it))
+            sp_up.a, sp_up.c, sp_up.thr, topk_weights, *tail)
 
 
 def gemv_worklist_indexed_pinned_sparse_gateup(
@@ -219,14 +274,28 @@ def gemv_worklist_indexed_pinned_sparse_gateup(
         if getattr(sp_gate, f) != getattr(sp_up, f):
             raise ValueError(f"gateup fusion requires a shared sparsity budget; "
                              f"{f} differs ({getattr(sp_gate, f)} vs {getattr(sp_up, f)})")
+    if _per_k(sp_gate) != _per_k(sp_up):
+        raise ValueError("gateup fusion requires the same sparsity score on gate and up")
     module = _jit_prism_gemv_module()
+    tail = (int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), int(vec),
+            float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
+            float(sp_gate.pmax), float(sp_gate.grid),
+            int(sp_gate.ng), int(sp_gate.renorm_it))
     with torch.cuda.stream(stream):
+        if _per_k_w(sp_gate):
+            module.gemv_worklist_indexed_pinned_sparsek1w_gateup(
+                x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
+                w_up, row_off_up, kidx_up, out3d,
+                sp_gate.a, sp_gate.thr, sp_up.a, sp_up.thr, topk_weights, *tail)
+            return
+        if _per_k(sp_gate):
+            module.gemv_worklist_indexed_pinned_sparsek1_gateup(
+                x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
+                w_up, row_off_up, kidx_up, out3d,
+                sp_gate.thr, sp_up.thr, topk_weights, *tail)
+            return
         module.gemv_worklist_indexed_pinned_sparse_gateup(
             x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
             w_up, row_off_up, kidx_up, out3d,
             sp_gate.a, sp_gate.c, sp_gate.thr,
-            sp_up.a, sp_up.c, sp_up.thr, topk_weights,
-            int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), int(vec),
-            float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
-            float(sp_gate.pmax), float(sp_gate.grid),
-            int(sp_gate.ng), int(sp_gate.renorm_it))
+            sp_up.a, sp_up.c, sp_up.thr, topk_weights, *tail)

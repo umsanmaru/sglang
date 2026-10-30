@@ -179,7 +179,7 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm(
       // COLD: kr은 32의 배수(kt K_STEP 올림), n_cols는 32의 배수(COL_GROUP) —
       // 타일 단위 유효성만 본다. kb+32 ≤ kr 은 루프 조건이 보장한다.
       const long long nt = n0 + cj * kColdStep;
-      if (nt < n_cols) {
+      if (nt < n_cols && kb < kr) {
         const long long base = cold_tile_base(nt, kb, n_cols, kr, n_block, k_block);
         breg = *reinterpret_cast<const uint4*>(wblk + base + ch * 512 + cd * 2);
       } else {
@@ -628,7 +628,7 @@ inline void grouped_gemm_impl(
   // n_cols는 인자로 받는다 (노드 N shard 행 수).
   auto S = SymbolicSize{"slab_elems"};
   if (layout == COLD) {
-    TensorMatcher({S}).with_dtype<bf16_t>().with_device<kDLCPU, kDLCUDAHost>().verify(w);
+    TensorMatcher({S}).with_dtype<bf16_t>().with_device<kDLCPU, kDLCUDAHost, kDLCUDA>().verify(w);
     RuntimeCheck(cold_n_cols > 0, "grouped_gemm_cold: n_cols must be given");
     N.set_value(cold_n_cols);
   } else if (w_on_device) {
@@ -688,7 +688,7 @@ inline void grouped_gemm_impl(
     TensorMatcher({R2}).with_dtype<uint16_t>().with_device(cuda_device).verify(*kidx_up);
     if (layout == COLD) {
       auto S2 = SymbolicSize{"slab_elems_up"};
-      TensorMatcher({S2}).with_dtype<bf16_t>().with_device<kDLCPU, kDLCUDAHost>().verify(*w_up);
+      TensorMatcher({S2}).with_dtype<bf16_t>().with_device<kDLCPU, kDLCUDAHost, kDLCUDA>().verify(*w_up);
     } else if (w_on_device) {
       TensorMatcher({R2, N}).with_dtype<bf16_t>().with_device(cuda_device).verify(*w_up);
     } else {

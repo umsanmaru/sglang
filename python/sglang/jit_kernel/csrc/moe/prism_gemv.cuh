@@ -87,7 +87,12 @@ using prism_sparse::SparseIn;
 // 라인 크기에 맞춰 다시 정해야 한다.
 constexpr int kNCol = 64;
 
-template <typename IdxT, bool INDEXED, int V, bool SPARSE, int NCOL_, int NYMUL>
+// PER_K: score k1 (per-k 마스크). SPARSE와 함께만 의미가 있고, 바뀌는 것은 셋이다 —
+// 임계값이 비제곱(`sparse_thr`), keep 배열이 페어가 아니라 k 하나당 한 칸, 행 루프의
+// 첨자가 `r >> 1`이 아니라 `r`. 누산 순서·루프 모양은 그대로라 p=0에서 dense와의
+// 비트일치가 유지된다 (계약 ⑤).
+template <typename IdxT, bool INDEXED, int V, bool SPARSE, int NCOL_, int NYMUL,
+          bool PER_K = false>
 __global__ void prism_gemv_worklist(
     const __nv_bfloat16* __restrict__ x,
     const IdxT* __restrict__ topk,
@@ -149,8 +154,15 @@ __global__ void prism_gemv_worklist(
 
   // 이 (m, j)의 임계값. 전 스레드가 중복 계산한다 — top_k(보통 8)짜리 루프라
   // syncthreads 한 번보다 싸고, 공유 상태가 없어 결정적이다.
+  // 비교 대상은 셋이다 — k2wl2/k1w1은 thr²(에너지·x²a와 비교), k1은 thr(|x|와 비교).
+  // per-k에서 어느 쪽인지는 **테이블이** 정한다: sp.a가 있으면 k1w1이다 (kt moe_base의
+  // `build_mask`와 같은 규약 — 마스크 종류를 커널이 아니라 주입된 표가 정한다).
+  const bool per_k_w = PER_K && SPARSE && sp.a != nullptr;
   float thr2 = 0.f;
-  if constexpr (SPARSE) thr2 = prism_sparse::sparse_thr2(sp, m, pair, e, top_k);
+  if constexpr (SPARSE) {
+    thr2 = (PER_K && !per_k_w) ? prism_sparse::sparse_thr(sp, m, pair, e, top_k)
+                               : prism_sparse::sparse_thr2(sp, m, pair, e, top_k);
+  }
 
   // 이 블록이 쓰는 activation 조각을 smem에 한 번 모은다.
   //
@@ -195,8 +207,9 @@ __global__ void prism_gemv_worklist(
 
   if constexpr (INDEXED) {
     __shared__ __nv_bfloat16 xs[KTILE];
-    // 페어 마스크. 한 페어를 정확히 한 스레드가 판정하고 전 스레드가 읽는다.
-    __shared__ uint8_t keep[SPARSE ? KTILE / 2 : 1];
+    // 마스크. 한 칸을 정확히 한 스레드가 판정하고 전 스레드가 읽는다. k2wl2는 페어당
+    // 한 칸(KTILE/2), k1은 k당 한 칸(KTILE)이다 — smem 1 KB 차이.
+    __shared__ uint8_t keep[SPARSE ? (PER_K ? KTILE : KTILE / 2) : 1];
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
     const int nthreads = blockDim.x * blockDim.y;
     for (long long base = 0; base < kr; base += KTILE) {
@@ -207,7 +220,20 @@ __global__ void prism_gemv_worklist(
       }
       __syncthreads();
       int np = 0;
-      if constexpr (SPARSE) {
+      if constexpr (SPARSE && PER_K) {
+        // score k1: keep_k = |x_k| >= thr. 가중치 통계를 읽지 않으므로 a/c가 nullptr여도
+        // 된다 (host가 그렇게 넘긴다). kt `k_mask.hpp`와 같은 판정이고 bf16→fp32가
+        // 정확하므로 CPU cold와 GPU warm의 마스크가 **비트 동일**하다.
+        np = cnt;
+        for (int i = tid; i < cnt; i += nthreads) {
+          const float xv = __bfloat162float(xs[i]);
+          // a는 weight와 **같은 오프셋 표**를 쓴다 (절대 행 = o0 + base + i).
+          const bool k = per_k_w ? prism_sparse::keep_k_w(xv, sp.a[o0 + base + i], thr2)
+                                 : prism_sparse::keep_k(xv, thr2);
+          keep[i] = k ? uint8_t{1} : uint8_t{0};
+        }
+        __syncthreads();
+      } else if constexpr (SPARSE) {
         // 페어가 타일을 가로지르지 않는다: KTILE이 짝수이고 row_off가
         // ROW_GROUP=2 정렬이라 base가 항상 짝수다. 따라서 gather된 짝수/홀수
         // 위치가 같은 원본 페어의 두 반쪽이고 (index.py의 페어 무결성 검사),
@@ -229,7 +255,9 @@ __global__ void prism_gemv_worklist(
         // 대역폭 절약은 압축과 동일하다 — 잃는 것은 NY 스레드 간 부하 균형뿐이고,
         // 마스크가 페어 단위라 그 편차는 스레드마다 같은 비율이다.
         for (int r = threadIdx.y; r < cnt; r += NY) {
-          if constexpr (SPARSE) {
+          if constexpr (SPARSE && PER_K) {
+            if (!keep[r]) continue;
+          } else if constexpr (SPARSE) {
             // (r >> 1) == np는 cnt가 홀수인 경우의 반쪽 페어다 — 불변식상
             // 도달 불가지만, 도달하면 마스킹하지 않고 계산한다 (느릴 뿐 안전).
             if ((r >> 1) < np && !keep[r >> 1]) continue;
@@ -283,7 +311,8 @@ __global__ void prism_gemv_worklist(
 
 // topk dtype 디스패치. 나머지 인자는 두 경로가 공유한다 (비인덱스는
 // row_off/kidx가 nullptr, 인덱스는 k_offset/k_rows가 무시된다).
-template <bool INDEXED, int V, bool SPARSE, int NCOL_ = kNCol, int NYMUL = 1>
+template <bool INDEXED, int V, bool SPARSE, int NCOL_ = kNCol, int NYMUL = 1,
+          bool PER_K = false>
 inline void launch_gemv_worklist(
     const dim3& grid, const DLDevice& device,
     tvm::ffi::TensorView topk,
@@ -300,7 +329,7 @@ inline void launch_gemv_worklist(
   const dim3 block(NCOL_ / V, 4 * V * NYMUL);  // 열 타일은 NCOL_ (커널 주석 참조)
   if (is_type<int32_t>(topk.dtype())) {
     LaunchKernel(grid, block, device)(
-        prism_gemv_worklist<int32_t, INDEXED, V, SPARSE, NCOL_, NYMUL>, x,
+        prism_gemv_worklist<int32_t, INDEXED, V, SPARSE, NCOL_, NYMUL, PER_K>, x,
         static_cast<const int32_t*>(topk.data_ptr()), w, out, row_off, kidx,
         x_kx, k_offset, k_rows, n_cols, out_row, out_col_offset, top_k,
         x_row_is_pair, w1 ? w1 : w, row_off1 ? row_off1 : row_off,
@@ -308,7 +337,7 @@ inline void launch_gemv_worklist(
         sp, sp1 ? *sp1 : sp);
   } else {
     LaunchKernel(grid, block, device)(
-        prism_gemv_worklist<int64_t, INDEXED, V, SPARSE, NCOL_, NYMUL>, x,
+        prism_gemv_worklist<int64_t, INDEXED, V, SPARSE, NCOL_, NYMUL, PER_K>, x,
         static_cast<const int64_t*>(topk.data_ptr()), w, out, row_off, kidx,
         x_kx, k_offset, k_rows, n_cols, out_row, out_col_offset, top_k,
         x_row_is_pair, w1 ? w1 : w, row_off1 ? row_off1 : row_off,
@@ -400,7 +429,7 @@ inline void gemv_worklist_impl(
                   static_cast<unsigned int>(m * top_k));
 
   // 밴드 경로는 V=1 고정 — 인덱스 전환과 함께 폐기될 경로라 건드리지 않는다.
-  launch_gemv_worklist<false, 1, false>(
+  launch_gemv_worklist<false, 1, false, kNCol, 1, false>(
       grid, device, topk,
       static_cast<const __nv_bfloat16*>(x.data_ptr()),
       static_cast<const __nv_bfloat16*>(w.data_ptr()),
@@ -483,17 +512,24 @@ inline void gemv_worklist_indexed_impl(
     auto E = SymbolicSize{"num_experts"};
     // a/c는 weight와 **같은 오프셋 테이블**을 쓴다 — R을 공유시켜 길이 불일치를
     // 여기서 잡는다 (어긋나면 조용히 남의 페어 점수로 마스킹한다).
-    TensorMatcher({R}).with_dtype<float>().with_device(cuda_device).verify(sin->a);
-    // SymbolicSize에 산술이 없으므로 페어 축은 별도 기호로 받고 R과의 관계를
-    // RuntimeCheck로 묶는다.
-    auto Rp = SymbolicSize{"total_pairs"};
-    TensorMatcher({Rp}).with_dtype<float>().with_device(cuda_device).verify(sin->c);
+    // score k1(per-k)은 가중치 통계를 아예 읽지 않으므로 검증도 건너뛴다 — 호출자는
+    // a/c 자리에 thr을 넣는다 (SparseIn 주석). k1w1은 a까지 읽으므로 a만 검증한다.
+    if (sin->per_k && sin->use_wn) {
+      TensorMatcher({R}).with_dtype<float>().with_device(cuda_device).verify(sin->a);
+    }
+    if (!sin->per_k) {
+      TensorMatcher({R}).with_dtype<float>().with_device(cuda_device).verify(sin->a);
+      // SymbolicSize에 산술이 없으므로 페어 축은 별도 기호로 받고 R과의 관계를
+      // RuntimeCheck로 묶는다.
+      auto Rp = SymbolicSize{"total_pairs"};
+      TensorMatcher({Rp}).with_dtype<float>().with_device(cuda_device).verify(sin->c);
+      RuntimeCheck(Rp.unwrap() * 2 == R.unwrap(),
+                   "gemv_worklist_indexed_sparse: pair_dot has ", Rp.unwrap(),
+                   " entries but the store has ", R.unwrap(),
+                   " rows (must be exactly half)");
+    }
     TensorMatcher({E, Ng}).with_dtype<float>().with_device(cuda_device).verify(sin->thr);
     TensorMatcher({M, K}).with_dtype<float>().with_device(cuda_device).verify(sin->topk_w);
-    RuntimeCheck(Rp.unwrap() * 2 == R.unwrap(),
-                 "gemv_worklist_indexed_sparse: pair_dot has ", Rp.unwrap(),
-                 " entries but the store has ", R.unwrap(),
-                 " rows (must be exactly half)");
     RuntimeCheck(E1.unwrap() == E.unwrap() + 1,
                  "gemv_worklist_indexed_sparse: thr has ", E.unwrap(),
                  " experts but row_off implies ", E1.unwrap() - 1);
@@ -506,8 +542,10 @@ inline void gemv_worklist_indexed_impl(
     RuntimeCheck(sin->grid > 0.0,
                  "gemv_worklist_indexed_sparse: grid must be positive, got ",
                  sin->grid);
-    sp.a = static_cast<const float*>(sin->a.data_ptr());
-    sp.c = static_cast<const float*>(sin->c.data_ptr());
+    // a가 nullptr인지가 곧 "k1인가 k1w1인가"다 (커널이 그것으로 가른다).
+    sp.a = (sin->per_k && !sin->use_wn) ? nullptr
+                                        : static_cast<const float*>(sin->a.data_ptr());
+    sp.c = sin->per_k ? nullptr : static_cast<const float*>(sin->c.data_ptr());
     sp.thr_tab = static_cast<const float*>(sin->thr.data_ptr());
     sp.topk_w = static_cast<const float*>(sin->topk_w.data_ptr());
     sp.p = static_cast<float>(sin->p);
@@ -522,15 +560,25 @@ inline void gemv_worklist_indexed_impl(
       // topk_w(라우터 가중)와 예산 스칼라(pmax/grid/ng/renorm_it)는 공유한다 —
       // 슬롯 0에서 복사한 뒤 그 다섯만 덮어 공유를 코드로 강제한다.
       sp_up = sp;
-      TensorMatcher({R2}).with_dtype<float>().with_device(cuda_device).verify(sin_up->a);
-      auto Rp2 = SymbolicSize{"total_pairs_up"};
-      TensorMatcher({Rp2}).with_dtype<float>().with_device(cuda_device).verify(sin_up->c);
+      RuntimeCheck(sin_up->per_k == sin->per_k,
+                   "gemv_worklist_indexed_gateup: gate/up sparse modes differ");
+      if (!sin_up->per_k) {
+        TensorMatcher({R2}).with_dtype<float>().with_device(cuda_device).verify(sin_up->a);
+        auto Rp2 = SymbolicSize{"total_pairs_up"};
+        TensorMatcher({Rp2}).with_dtype<float>().with_device(cuda_device).verify(sin_up->c);
+        RuntimeCheck(Rp2.unwrap() * 2 == R2.unwrap(),
+                     "gemv_worklist_indexed_gateup: up pair_dot has ", Rp2.unwrap(),
+                     " entries but the up store has ", R2.unwrap(), " rows");
+      }
       TensorMatcher({E, Ng}).with_dtype<float>().with_device(cuda_device).verify(sin_up->thr);
-      RuntimeCheck(Rp2.unwrap() * 2 == R2.unwrap(),
-                   "gemv_worklist_indexed_gateup: up pair_dot has ", Rp2.unwrap(),
-                   " entries but the up store has ", R2.unwrap(), " rows");
-      sp_up.a = static_cast<const float*>(sin_up->a.data_ptr());
-      sp_up.c = static_cast<const float*>(sin_up->c.data_ptr());
+      RuntimeCheck(sin_up->use_wn == sin->use_wn,
+                   "gemv_worklist_indexed_gateup: gate/up 이 다른 score를 쓴다");
+      if (sin_up->per_k && sin_up->use_wn) {
+        TensorMatcher({R2}).with_dtype<float>().with_device(cuda_device).verify(sin_up->a);
+      }
+      sp_up.a = (sin_up->per_k && !sin_up->use_wn)
+                    ? nullptr : static_cast<const float*>(sin_up->a.data_ptr());
+      sp_up.c = sin_up->per_k ? nullptr : static_cast<const float*>(sin_up->c.data_ptr());
       sp_up.thr_tab = static_cast<const float*>(sin_up->thr.data_ptr());
       sp_up.p = static_cast<float>(sin_up->p);
       sp_up.lam = static_cast<float>(sin_up->lam);
@@ -596,8 +644,8 @@ inline void gemv_worklist_indexed_impl(
   const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(kNCol))),
                   static_cast<unsigned int>(pairs), static_cast<unsigned int>(slots));
 
-#define PRISM_LAUNCH_INDEXED_NY(V, SP, NYM)                                  \
-  launch_gemv_worklist<true, V, SP, kNCol, NYM>(                             \
+#define PRISM_LAUNCH_INDEXED_NY(V, SP, NYM, PK)                              \
+  launch_gemv_worklist<true, V, SP, kNCol, NYM, PK>(                             \
       grid, device, topk,                                                    \
       static_cast<const __nv_bfloat16*>(x.data_ptr()),                       \
       static_cast<const __nv_bfloat16*>(w.data_ptr()),                       \
@@ -608,15 +656,16 @@ inline void gemv_worklist_indexed_impl(
       static_cast<int>(x_row_is_pair), sp,                                   \
       w1p, row_off1p, kidx1p, out_col_offset_up,                          \
       (sin_up != nullptr) ? &sp_up : nullptr)
-#define PRISM_LAUNCH_INDEXED(V, SP)                                          \
+#define PRISM_LAUNCH_INDEXED(V, SP, PK)                                      \
   do {                                                                       \
-    if (wide_ny) PRISM_LAUNCH_INDEXED_NY(V, SP, 4);                          \
-    else PRISM_LAUNCH_INDEXED_NY(V, SP, 1);                                   \
+    if (wide_ny) PRISM_LAUNCH_INDEXED_NY(V, SP, 4, PK);                      \
+    else PRISM_LAUNCH_INDEXED_NY(V, SP, 1, PK);                              \
   } while (0)
 #define PRISM_LAUNCH_INDEXED_V(V)                                            \
   do {                                                                       \
-    if (sin != nullptr) PRISM_LAUNCH_INDEXED(V, true);                        \
-    else PRISM_LAUNCH_INDEXED(V, false);                                      \
+    if (sin != nullptr && sin->per_k) PRISM_LAUNCH_INDEXED(V, true, true);   \
+    else if (sin != nullptr) PRISM_LAUNCH_INDEXED(V, true, false);           \
+    else PRISM_LAUNCH_INDEXED(V, false, false);                              \
   } while (0)
 
   switch (choose_vec(vec, n_cols, w.data_ptr())) {
@@ -777,6 +826,157 @@ void gemv_worklist_indexed_pinned_sparse(
   const SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
   gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
                              x_row_is_pair, vec, false, &sin);
+}
+
+// ── score k1 (per-k) 쌍둥이 ────────────────────────────────────────────────
+// 인자에서 **a/c가 빠진다** — 마스크가 `|x_k| >= thr` 하나라 가중치 통계를 읽지
+// 않는다 (`SparseIn::per_k`; fp8 형제 `gemv_fp8_indexed_sparsek1`과 같은 규약으로
+// 내부에서는 a/c 자리에 thr을 넣는다). 진입점을 따로 둔 이유는 페어/per-k가
+// 호출부에서 보여야 하기 때문이다: 같은 진입점에 플래그로 넣으면 어느 마스크로
+// 쟀는지가 로그와 코드에서 사라진다.
+void gemv_worklist_indexed_sparsek1(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
+    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+    tvm::ffi::TensorView out, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,
+    int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
+    double p, double lam, double pmax, double grid,
+    int64_t ng, int64_t renorm_it) {
+  const SparseIn sin{thr, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true};
+  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
+                             x_row_is_pair, vec, true, &sin);
+}
+
+void gemv_worklist_indexed_pinned_sparsek1(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
+    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+    tvm::ffi::TensorView out, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,
+    int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
+    double p, double lam, double pmax, double grid,
+    int64_t ng, int64_t renorm_it) {
+  const SparseIn sin{thr, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true};
+  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
+                             x_row_is_pair, vec, false, &sin);
+}
+
+void gemv_worklist_indexed_sparsek1_gateup(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
+    tvm::ffi::TensorView kidx_gate,
+    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
+    tvm::ffi::TensorView kidx_up,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView thr_gate, tvm::ffi::TensorView thr_up,
+    tvm::ffi::TensorView topk_w,
+    int64_t out_col_offset_gate, int64_t out_col_offset_up,
+    int64_t x_row_is_pair, int64_t vec,
+    double p_gate, double lam_gate, double p_up, double lam_up,
+    double pmax, double grid, int64_t ng, int64_t renorm_it) {
+  const SparseIn sin{thr_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate,
+                     pmax, grid, ng, renorm_it, true};
+  const SparseIn sin_up{thr_up, thr_up, thr_up, topk_w, p_up, lam_up,
+                        pmax, grid, ng, renorm_it, true};
+  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                             out_col_offset_gate, x_row_is_pair, vec, true,
+                             &sin, &w_up, &row_off_up, &kidx_up,
+                             out_col_offset_up, &sin_up);
+}
+
+void gemv_worklist_indexed_pinned_sparsek1_gateup(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
+    tvm::ffi::TensorView kidx_gate,
+    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
+    tvm::ffi::TensorView kidx_up,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView thr_gate, tvm::ffi::TensorView thr_up,
+    tvm::ffi::TensorView topk_w,
+    int64_t out_col_offset_gate, int64_t out_col_offset_up,
+    int64_t x_row_is_pair, int64_t vec,
+    double p_gate, double lam_gate, double p_up, double lam_up,
+    double pmax, double grid, int64_t ng, int64_t renorm_it) {
+  const SparseIn sin{thr_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate,
+                     pmax, grid, ng, renorm_it, true};
+  const SparseIn sin_up{thr_up, thr_up, thr_up, topk_w, p_up, lam_up,
+                        pmax, grid, ng, renorm_it, true};
+  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                             out_col_offset_gate, x_row_is_pair, vec, false,
+                             &sin, &w_up, &row_off_up, &kidx_up,
+                             out_col_offset_up, &sin_up);
+}
+
+// ── score k1w1 진입점 4개: per-k × 열 노름 (a = wn², c 없음) ────────────────
+void gemv_worklist_indexed_sparsek1w(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
+    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+    tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView thr,
+    tvm::ffi::TensorView topk_w,
+    int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
+    double p, double lam, double pmax, double grid,
+    int64_t ng, int64_t renorm_it) {
+  const SparseIn sin{a, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true, true};
+  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
+                             x_row_is_pair, vec, true, &sin);
+}
+
+void gemv_worklist_indexed_pinned_sparsek1w(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
+    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+    tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView thr,
+    tvm::ffi::TensorView topk_w,
+    int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
+    double p, double lam, double pmax, double grid,
+    int64_t ng, int64_t renorm_it) {
+  const SparseIn sin{a, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true, true};
+  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
+                             x_row_is_pair, vec, false, &sin);
+}
+
+void gemv_worklist_indexed_sparsek1w_gateup(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
+    tvm::ffi::TensorView kidx_gate,
+    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
+    tvm::ffi::TensorView kidx_up,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView a_gate, tvm::ffi::TensorView thr_gate,
+    tvm::ffi::TensorView a_up, tvm::ffi::TensorView thr_up,
+    tvm::ffi::TensorView topk_w,
+    int64_t out_col_offset_gate, int64_t out_col_offset_up,
+    int64_t x_row_is_pair, int64_t vec,
+    double p_gate, double lam_gate, double p_up, double lam_up,
+    double pmax, double grid, int64_t ng, int64_t renorm_it) {
+  const SparseIn sin{a_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate,
+                     pmax, grid, ng, renorm_it, true, true};
+  const SparseIn sin_up{a_up, thr_up, thr_up, topk_w, p_up, lam_up,
+                        pmax, grid, ng, renorm_it, true, true};
+  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                             out_col_offset_gate, x_row_is_pair, vec, true,
+                             &sin, &w_up, &row_off_up, &kidx_up,
+                             out_col_offset_up, &sin_up);
+}
+
+void gemv_worklist_indexed_pinned_sparsek1w_gateup(
+    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
+    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
+    tvm::ffi::TensorView kidx_gate,
+    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
+    tvm::ffi::TensorView kidx_up,
+    tvm::ffi::TensorView out,
+    tvm::ffi::TensorView a_gate, tvm::ffi::TensorView thr_gate,
+    tvm::ffi::TensorView a_up, tvm::ffi::TensorView thr_up,
+    tvm::ffi::TensorView topk_w,
+    int64_t out_col_offset_gate, int64_t out_col_offset_up,
+    int64_t x_row_is_pair, int64_t vec,
+    double p_gate, double lam_gate, double p_up, double lam_up,
+    double pmax, double grid, int64_t ng, int64_t renorm_it) {
+  const SparseIn sin{a_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate,
+                     pmax, grid, ng, renorm_it, true, true};
+  const SparseIn sin_up{a_up, thr_up, thr_up, topk_w, p_up, lam_up,
+                        pmax, grid, ng, renorm_it, true, true};
+  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                             out_col_offset_gate, x_row_is_pair, vec, false,
+                             &sin, &w_up, &row_off_up, &kidx_up,
+                             out_col_offset_up, &sin_up);
 }
 
 }  // namespace

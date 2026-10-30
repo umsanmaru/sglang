@@ -63,7 +63,8 @@ using prism_sparse::SparseIn;
 // 코드 스토어는 블록판과 같은 `[Σk, N]` u8이고 k 행 수는 128이 아닌 **32 배수**면 된다(청크 단위).
 // 블록판과 pt판은 배율이 2^n이면 비트동일하고, 임의 fp32면 마지막 라운딩 하나가 다르다 —
 // 비트일치 계약은 exact 픽스처(2^n 배율)로만 건다.
-// MODE = kPerK (score k1, 2026-09-05): 마스크가 k 행 단위(|x_k| >= thr, a/c 없음)다. 행우선
+// MODE = kPerK (score k1 2026-09-05 / k1w1 2026-09-07): 마스크가 k 행 단위다 —
+// a가 없으면 |x_k| >= thr, 있으면 |x_k|·wn_k >= thr (제곱 비교). 행우선
 // 스토어라 k 행 하나가 연속 N 바이트이므로 per-k skip이 자연스럽다 — 페어 루프 구조는 그대로
 // 두고 죽은 행만 로드를 빼고 (x, w)를 0으로 둔다. 그래서 dense에 x_k=0을 넣은 계산과 항·순서가
 // 같아 **비트 동일**하다 (thr=0이면 dense와 비트 동일).
@@ -154,8 +155,15 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
       }
       __syncthreads();
     } else if constexpr (MODE == kPerK) {
-      for (int i = tid; i < cnt; i += nthreads)
-        keep[i] = prism_sparse::keep_k(__bfloat162float(xs[i]), thr) ? uint8_t{1} : uint8_t{0};
+      // score k1 vs k1w1은 **주입된 표**가 정한다: a(=wn²)가 오면 x²·a >= thr², 아니면
+      // |x| >= thr (kt moe_base `build_mask`와 같은 규약).
+      const bool w = (sp.a != nullptr);
+      for (int i = tid; i < cnt; i += nthreads) {
+        const float xv = __bfloat162float(xs[i]);
+        keep[i] = (w ? prism_sparse::keep_k_w(xv, sp.a[o0 + base + i], thr * thr)
+                     : prism_sparse::keep_k(xv, thr))
+                      ? uint8_t{1} : uint8_t{0};
+      }
       __syncthreads();
     }
     if (!active) continue;
@@ -356,6 +364,10 @@ inline SparseArgs fill_sparse(const SparseIn& sin, host::SymbolicSize& E, host::
   using namespace host;
   auto Ra = SymbolicSize{"a_rows"};
   auto Rc = SymbolicSize{"c_pairs"};
+  if (sin.per_k && sin.use_wn) {  // score k1w1: a(wn²)만 읽는다 (c는 안 읽는다)
+    TensorMatcher({Ra}).with_dtype<float>().with_device(cuda_device).verify(sin.a);
+    RuntimeCheck(Ra.unwrap() == rows, what, ": wn² has ", Ra.unwrap(), " rows but the store has ", rows);
+  }
   if (!sin.per_k) {  // score k1은 가중치 통계(a/c)를 쓰지 않는다
     TensorMatcher({Ra}).with_dtype<float>().with_device(cuda_device).verify(sin.a);
     TensorMatcher({Rc}).with_dtype<float>().with_device(cuda_device).verify(sin.c);
@@ -368,7 +380,8 @@ inline SparseArgs fill_sparse(const SparseIn& sin, host::SymbolicSize& E, host::
   RuntimeCheck(Ng.unwrap() == sin.ng, what, ": thr grid ", Ng.unwrap(), " != ng ", sin.ng);
   RuntimeCheck(sin.grid > 0.0, what, ": grid must be positive, got ", sin.grid);
   SparseArgs sp{};
-  sp.a = sin.per_k ? nullptr : static_cast<const float*>(sin.a.data_ptr());
+  // a가 nullptr인지가 곧 "k1인가 k1w1인가"다 (커널이 그것으로 가른다).
+  sp.a = (sin.per_k && !sin.use_wn) ? nullptr : static_cast<const float*>(sin.a.data_ptr());
   sp.c = sin.per_k ? nullptr : static_cast<const float*>(sin.c.data_ptr());
   sp.thr_tab = static_cast<const float*>(sin.thr.data_ptr());
   sp.topk_w = static_cast<const float*>(sin.topk_w.data_ptr());
@@ -456,7 +469,8 @@ inline void gemv_fp8_impl(
                 static_cast<const uint16_t*>(kidx_up->data_ptr()), out_col_offset_up};
     if (sin != nullptr) {
       RuntimeCheck(sin_up != nullptr, "gemv_fp8_gateup: sparse fusion needs the up sparse spec");
-      RuntimeCheck(sin_up->per_k == sin->per_k, "gemv_fp8_gateup: gate/up sparse modes differ");
+      RuntimeCheck(sin_up->per_k == sin->per_k && sin_up->use_wn == sin->use_wn,
+                   "gemv_fp8_gateup: gate/up sparse modes differ");
       // proj별로 갈리는 것은 a/c/thr/p/lam 다섯 — 예산 스칼라와 topk_w는 슬롯 0과 공유.
       SparseArgs u = fill_sparse(*sin_up, E, Ng, M, K, cuda_device, rows1,
                                  "gemv_fp8_sparse_gateup(up)");
@@ -480,10 +494,10 @@ inline void gemv_fp8_impl(
   using MDense = std::integral_constant<int, kDense>;
   using MPair = std::integral_constant<int, kPair>;
   using MPerK = std::integral_constant<int, kPerK>;
-  // score k1(per-k)은 kt 쪽에 블록 배율 커널(tile_k1_fp8b128)만 있다 — PT × per-k 조합은 없다.
+  // score k1(per-k)의 CPU 짝은 블록 배율(tile_k1_fp8b128)과 per-tensor(tile_k1_fp8pt)
+  // 둘 다 있다 (2026-09-07) — 네 조합이 전부 유효하다.
   if (sin != nullptr && sin->per_k) {
-    RuntimeCheck(!pt, "gemv_fp8: per-k (score k1) sparse mode is not available for per-tensor scales");
-    go(MPerK{}, F{});
+    if (pt) go(MPerK{}, T{}); else go(MPerK{}, F{});
   } else if (sin != nullptr) {
     if (pt) go(MPair{}, T{}); else go(MPair{}, F{});
   } else {
@@ -566,7 +580,7 @@ PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8pt_indexed_pinned_sparse_gateup, false, tru
 
 // ── score k1 진입점 4개: {device, pinned} × {single, gateup}, a/c 없음 (|x_k| >= thr) ─────
 // SparseIn.per_k = true; thr 텐서를 a/c 자리에도 넣지만 host 검증·커널 모두 읽지 않는다.
-#define PRISM_F8_ENTRY_SPARSEK1(NAME, ON_DEVICE)                                               \
+#define PRISM_F8_ENTRY_SPARSEK1(NAME, ON_DEVICE, PT)                                             \
   void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes,     \
             tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, \
             tvm::ffi::TensorView out, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,   \
@@ -574,9 +588,9 @@ PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8pt_indexed_pinned_sparse_gateup, false, tru
             double grid, int64_t ng, int64_t renorm_it) {                                      \
     const SparseIn sin{thr, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true};        \
     gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,   \
-                  ON_DEVICE, false, &sin);                                                     \
+                  ON_DEVICE, PT, &sin);                                                        \
   }
-#define PRISM_F8_ENTRY_SPARSEK1_GATEUP(NAME, ON_DEVICE)                                        \
+#define PRISM_F8_ENTRY_SPARSEK1_GATEUP(NAME, ON_DEVICE, PT)                                       \
   void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g,   \
             tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g,                     \
             tvm::ffi::TensorView kidx_g, tvm::ffi::TensorView codes_u,                         \
@@ -588,14 +602,36 @@ PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8pt_indexed_pinned_sparse_gateup, false, tru
     const SparseIn sin{thr_g, thr_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it, true}; \
     const SparseIn sin_up{thr_u, thr_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it, true}; \
     gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,        \
-                  x_row_is_pair, ON_DEVICE, false, &sin, &codes_u, &scales_u, &row_off_u,      \
+                  x_row_is_pair, ON_DEVICE, PT, &sin, &codes_u, &scales_u, &row_off_u,          \
                   &kidx_u, out_col_offset_u, &sin_up);                                         \
   }
-PRISM_F8_ENTRY_SPARSEK1(gemv_fp8_indexed_sparsek1, true)
-PRISM_F8_ENTRY_SPARSEK1(gemv_fp8_indexed_pinned_sparsek1, false)
-PRISM_F8_ENTRY_SPARSEK1_GATEUP(gemv_fp8_indexed_sparsek1_gateup, true)
-PRISM_F8_ENTRY_SPARSEK1_GATEUP(gemv_fp8_indexed_pinned_sparsek1_gateup, false)
+#define PRISM_F8_ENTRY_SPARSEK1W(NAME, ON_DEVICE, PT)                                          \
+  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes,     \
+            tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, \
+            tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView thr,        \
+            tvm::ffi::TensorView topk_w, int64_t out_col_offset, int64_t x_row_is_pair,        \
+            double p, double lam, double pmax, double grid, int64_t ng, int64_t renorm_it) {   \
+    const SparseIn sin{a, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true, true};    \
+    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,   \
+                  ON_DEVICE, PT, &sin);                                                        \
+  }
+PRISM_F8_ENTRY_SPARSEK1(gemv_fp8_indexed_sparsek1, true, false)
+PRISM_F8_ENTRY_SPARSEK1(gemv_fp8_indexed_pinned_sparsek1, false, false)
+PRISM_F8_ENTRY_SPARSEK1_GATEUP(gemv_fp8_indexed_sparsek1_gateup, true, false)
+PRISM_F8_ENTRY_SPARSEK1_GATEUP(gemv_fp8_indexed_pinned_sparsek1_gateup, false, false)
+// per-tensor 배율 판 (kt 짝: tile_k1_fp8pt, 2026-09-07)
+PRISM_F8_ENTRY_SPARSEK1(gemv_fp8pt_indexed_sparsek1, true, true)
+PRISM_F8_ENTRY_SPARSEK1(gemv_fp8pt_indexed_pinned_sparsek1, false, true)
+PRISM_F8_ENTRY_SPARSEK1_GATEUP(gemv_fp8pt_indexed_sparsek1_gateup, true, true)
+PRISM_F8_ENTRY_SPARSEK1_GATEUP(gemv_fp8pt_indexed_pinned_sparsek1_gateup, false, true)
+// score k1w1 (per-k × 열 노름) — 블록 배율·per-tensor 둘 다. gateup 융합은 dense 레인이
+// 아직 안 쓰므로 single만 채운다 (필요해지면 SPARSEK1_GATEUP과 같은 모양으로 더한다).
+PRISM_F8_ENTRY_SPARSEK1W(gemv_fp8_indexed_sparsek1w, true, false)
+PRISM_F8_ENTRY_SPARSEK1W(gemv_fp8_indexed_pinned_sparsek1w, false, false)
+PRISM_F8_ENTRY_SPARSEK1W(gemv_fp8pt_indexed_sparsek1w, true, true)
+PRISM_F8_ENTRY_SPARSEK1W(gemv_fp8pt_indexed_pinned_sparsek1w, false, true)
 #undef PRISM_F8_ENTRY_SPARSEK1
+#undef PRISM_F8_ENTRY_SPARSEK1W
 #undef PRISM_F8_ENTRY_SPARSEK1_GATEUP
 
 }  // namespace

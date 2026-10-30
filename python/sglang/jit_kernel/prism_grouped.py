@@ -127,6 +127,10 @@ def grouped_gemm_cold(x2d, grouping, cold, out3d, out_col_offset, x_row_is_pair,
     grouped GEMM. `cold`는 `ColdSlab`(weights.py) — slab 텐서 뷰, blk_off, 타일
     올림된 row_off/kidx, 노드 N shard 시작, n_block/k_block을 든다.
     출력 열은 `out_col_offset + cold.n_start`부터 이 노드의 n열이다."""
+    if out3d.shape[0] >= 1536 and cold.expert_offsets:
+        from sglang.jit_kernel.prism_buffered import grouped_packed_buffered
+        return grouped_packed_buffered(x2d, grouping, [(cold, out_col_offset)],
+                                       out3d, x_row_is_pair, stream)
     module = _jit_prism_grouped_module()
     with torch.cuda.stream(stream):
         module.grouped_gemm_cold(
@@ -141,6 +145,11 @@ def grouped_gemm_cold_gateup(x2d, grouping, gate, up, out3d, out_col_gate,
                              out_col_up, x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
     """cold gate+up 한 launch (같은 노드의 두 slab). 두 slab의 n/n_start/블록
     상수는 같아야 한다 — 같은 kt 인스턴스가 만든 것이므로 그렇다."""
+    if out3d.shape[0] >= 1536 and gate.expert_offsets and up.expert_offsets:
+        from sglang.jit_kernel.prism_buffered import grouped_packed_buffered
+        return grouped_packed_buffered(x2d, grouping,
+                                       [(gate, out_col_gate), (up, out_col_up)],
+                                       out3d, x_row_is_pair, stream)
     if (gate.n_start, gate.n_block, gate.k_block) != (up.n_start, up.n_block, up.k_block):
         raise ValueError("cold gateup fusion requires gate/up slabs of the same node instance")
     module = _jit_prism_grouped_module()
