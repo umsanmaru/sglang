@@ -152,6 +152,16 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         yield module
         return
 
+    # 파라미터의 거처가 method의 계약인 경우는 왕복을 건너뛴다. 이 컨텍스트는 CPU
+    # offload(= 임시로 CPU에 내려둔 파라미터)를 위한 것이고 판정 기준이 device.type
+    # 하나뿐이라, 의도적으로 host에 파라미터를 만드는 method는 오해를 받는다:
+    # Prism의 full expert weight는 host 상주가 설계이며(hot 밴드만 VRAM) 훅이 그 CPU
+    # 텐서를 그대로 읽으므로, 왕복은 층당 full weight를 올렸다 내린 뒤 그 GPU 사본을
+    # 버리는 순수 낭비다.
+    if getattr(getattr(module, "quant_method", None), "keeps_params_on_host", False):
+        yield module
+        return
+
     with stage_module_for_post_load(
         module,
         target_device,

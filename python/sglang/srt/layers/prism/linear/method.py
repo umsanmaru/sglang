@@ -1,0 +1,486 @@
+"""Prism dense의 sglang 접점 — linear quant-method wrapper.
+
+차단선: `LinearBase` 위로는 Prism을 모른다. 이 모듈이 유일한 등록 지점이며,
+활성화는 env `SGLANG_PRISM_LINEAR_PLAN=<plan.json>` 로만 된다 (MoE의
+`SGLANG_PRISM_PLAN`과 **독립**이다 — 둘을 따로 켜고 끌 수 있어야 벤치가 성립한다).
+
+MoE `moe/prism/method.py`와 같은 자리, 같은 세 훅:
+
+    create_weights                 full weight를 **CPU 파라미터**로 할당
+                                   (sglang weight_loader가 그대로 채운다)
+    process_weights_after_loading  절단 → executor 등록 → CPU 파라미터 해제
+                                   (full 텐서 소멸 — 계약 ③)
+    apply                          executor.run 위임 한 줄
+
+MoE와 갈리는 것:
+
+  * **좌표가 prefix에서 온다.** `LinearBase`에는 `layer_id`가 없다 — registry의
+    predicate가 `split_prefix`로 `(layer, name)`을 뽑아 ctx로 넘긴다.
+  * **`apply`가 텐서를 그대로 돌려준다.** `dispatch_output`/`CombineInput` 래핑이
+    없고, bias는 여기서 더한다.
+  * **TP 방어가 `create_weights`에 있다.** predicate 시점에는 `tp_size`가 아직
+    없다 (서브클래스가 `super().__init__()` 반환 후 대입한다 —
+    `layers/linear_method_registry.py` 참조).
+
+P0 제약: TP=1, bf16 스토어, cold 미배선. 셋 다 조용히 넘어가지 않고 즉사한다.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import List, Optional
+
+import torch
+
+from sglang.srt.layers.prism.geometry import PlanError, Tier
+from sglang.srt.layers.prism.kernels import (
+    gpu_store_format_tag,
+    gpu_warm_supports_score,
+)
+
+logger = logging.getLogger(__name__)
+
+_ENV_PLAN = "SGLANG_PRISM_LINEAR_PLAN"
+_ENV_MAX_TOKENS = "SGLANG_PRISM_LINEAR_MAX_TOKENS"
+# cold CPU 스레드 수. 벤치는 28이 최적이었지만(물리 16코어 = 8×2소켓; 14→28은 7%
+# 개선, 56은 9배 악화) 실서버는 GPU 스트림·스케줄러와 경합하므로 재측정 대상이다.
+_ENV_COLD_THREADS = "SGLANG_PRISM_LINEAR_COLD_THREADS"
+# MoE와 공유하는 이름. dense 전용 값이 없으면 이쪽을 본다 — 실행
+# 스크립트가 이미 이 이름을 내보내고 있어서, 안 맞추면 지정한 스레드
+# 수가 조용히 무시되고 기본값 28로 돈다.
+_ENV_CPUINFER = "SGLANG_PRISM_CPUINFER_THREADS"
+
+# 래핑이 **로더 선택을 바꾸는** 메서드들. `ColumnParallelLinear.__init__`이
+# `self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED`로 v1/v2
+# weight_loader를 고르는데(`linear.py:367`), 우리가 감싸면 그 이름이 바뀐다 —
+# v2를 쓰던 메서드는 조용히 v1으로 떨어져 shard 로딩이 어긋난다. 이름으로 하는
+# 판정이라 래퍼가 흉내낼 수 없으므로, 해당 메서드는 지금 감싸지 않는다.
+# (bf16 `UnquantizedLinearMethod`는 애초에 v1이라 영향이 없다.)
+_V2_LOADER_UNSUPPORTED = frozenset({
+    "CompressedTensorsLinearMethod", "AWQMarlinLinearMethod", "AWQLinearMethod",
+    "AWQLinearAscendMethod", "GPTQMarlinLinearMethod",
+    "BlockInt8LinearMethod", "MarlinLinearMethod", "QQQLinearMethod",
+    "GPTQMarlin24LinearMethod", "TPUInt8LinearMethod", "GPTQLinearMethod",
+})
+
+# 감쌀 수 있는 양자화 메서드 — 그 파라미터·후처리를 이 모듈이 아는 것들.
+# `Fp8LinearMethod`는 per-tensor(static-tensor) 체크포인트에서만 지원한다
+# (blockwise는 dense cold 배관이 아직 없다 — `formats.Fp8LinearFormat` 참조).
+_QUANT_SUPPORTED = frozenset({"Fp8LinearMethod"})
+
+# 이름을 물려받은 래퍼 클래스 캐시. `ColumnParallelLinear.__init__`이
+# `self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED`로 v1/v2
+# weight_loader를 고르므로(`linear.py:367`), 래퍼 클래스의 **이름을 inner와 같게**
+# 만들면 로더 선택이 감싸기 전과 동일해진다. 대안 둘은 모두 나쁘다: 이름 검사 집합에
+# "PrismLinearMethod"를 넣으면 v1이던 bf16까지 v2로 끌려가고, 감싸기를 거부하면
+# 양자화 모델을 아예 못 돈다.
+_WRAPPER_CLASSES: dict = {}
+
+
+def _wrapper_class(inner_cls_name: str):
+    cls = _WRAPPER_CLASSES.get(inner_cls_name)
+    if cls is None:
+        cls = type(inner_cls_name, (PrismLinearMethod,), {"_prism_inner_name": inner_cls_name})
+        _WRAPPER_CLASSES[inner_cls_name] = cls
+    return cls
+
+
+class _LinearRuntime:
+    """프로세스 전역 1벌: plan + executor.
+
+    `apply`가 per-layer 호출이라 cross-layer 상태를 전역이 들어야 한다 (MoE의
+    `_PrismRuntime`과 같은 배치).
+    """
+
+    def __init__(self, plan):
+        self.plan = plan
+        self.max_tokens = int(os.environ.get(_ENV_MAX_TOKENS, "4096"))
+        self._executor = None
+        self._stock_registered = set()
+        self._checked = False
+        # sparse plan이면 calib 자산을 **로드 타임에 한 번** 연다. 전수 대조는
+        # 경고까지이고(존재하지 않을 좌표를 죽이지 않으려고), 전부-0 게이트의 실제
+        # 자리는 `weights._prepare_part`다.
+        self.calib = None
+        if plan.sparsity is not None:
+            from sglang.srt.layers.prism.linear.calib import LinearCalibTables
+
+            self.calib = LinearCalibTables.load(plan.sparsity)
+            # 죽이지 않는 프리스캔 — plan은 어느 층에 어느 모듈이 실재하는지 모른다
+            # (`calib.check_plan` docstring). 실재하는 좌표의 게이트는 prepare에 있다.
+            uncal = self.calib.check_plan(plan, strict=False)
+            if uncal:
+                logger.warning(
+                    "[prism-linear] calib이 안 덮는 plan 좌표 %d개 — 그 모듈이 실재하면 "
+                    "prepare에서 즉사한다. 예: %s", len(uncal), "; ".join(uncal[:3]))
+            logger.info(
+                "[prism-linear] calib loaded: %s (score=%s, weight_stats=%s)",
+                plan.sparsity.calib.path, plan.sparsity.score,
+                self.calib.uses_weight_stats)
+
+    def executor(self, device: torch.device):
+        if self._executor is None:
+            from sglang.srt.layers.prism.linear.executor import LinearExecutor
+            from sglang.srt.layers.prism.linear.formats import FORMATS
+            from sglang.srt.layers.prism.linear.rejoin import warmup as warmup_rejoin
+
+            # **캡처 안에서 처음 일어나면 안 되는 일**을 전부 startup으로 앞당긴다:
+            # JIT 컴파일과 지연 할당. 지금 쓰는 `breakable` prefill 백엔드는 캡처 전에
+            # forward를 2회 돌려주지만(`breakable_cuda_graph_backend.py:117`) 그건 그
+            # 백엔드의 성질이지 계약이 아니다 — `tc_piecewise`로 바꾸거나 decode graph만
+            # 켜면 컴파일이 캡처 순서에 얽힌다. MoE `method.py:180`과 같은 이유·같은 자리.
+            warmup_rejoin(device)
+            for tag in {pp.kernels.gpu_warm for pp in self.plan.projs.values()}:
+                FORMATS[gpu_store_format_tag(tag)].warmup()
+            cold, resources = self._cold_backend()
+            self._executor = LinearExecutor(max_tokens=self.max_tokens, device=device,
+                                            cold=cold, resources=resources,
+                                            cold_split=os.getenv("SGLANG_PRISM_LINEAR_COLD_SPLIT", "0") == "1",
+                                            prefill_gpu_bytes=(int(os.getenv("SGLANG_PRISM_LINEAR_PREFILL_BUFFER_MIB", "32")) * 1024**2
+                                                if os.getenv("SGLANG_PRISM_LINEAR_PREFILL_GPU", "0") == "1" else 0))
+            self._executor.warmup(device)
+            if resources is not None:
+                resources.warmup()
+        return self._executor
+
+    def _cold_backend(self):
+        """plan에 COLD 행이 있을 때만 만든다. 없으면 kt를 import조차 하지 않는다."""
+        if not any(pp.has_tier(Tier.COLD) for pp in self.plan.projs.values()):
+            return None, None
+        from sglang.srt.layers.prism.linear.cold_backend import KtLinearColdBackend
+        from sglang.srt.layers.prism.linear.resources import LinearColdResources
+        from sglang.srt.layers.prism.numa import numa_node_count
+
+        threads = int(os.environ.get(_ENV_COLD_THREADS,
+                             os.environ.get(_ENV_CPUINFER, "28")))
+        physical_nodes = numa_node_count()
+        mapping = os.environ.get("SGLANG_PRISM_NUMA_MAP", "")
+        cpuinfer = None
+        nodes = physical_nodes
+        if mapping:
+            from kt_kernel import kt_kernel_ext
+
+            numa_map = [int(x.strip()) for x in mapping.split(",")]
+            if (len(set(numa_map)) != len(numa_map)
+                    or any(n < 0 or n >= physical_nodes for n in numa_map)
+                    or threads < len(numa_map)):
+                raise ValueError(f"Invalid NUMA map {numa_map} for {threads} threads")
+            nodes = len(numa_map)
+            cfg = kt_kernel_ext.WorkerPoolConfig()
+            cfg.subpool_count = nodes
+            cfg.subpool_numa_map = numa_map
+            cfg.subpool_thread_count = [
+                threads // nodes + (i < threads % nodes) for i in range(nodes)
+            ]
+            cpuinfer = kt_kernel_ext.CPUInfer(cfg)
+            logger.info("[prism-linear] physical NUMA map: %s", numa_map)
+        logger.info("[prism-linear] cold backend: %d NUMA nodes, %d CPUInfer threads",
+                    nodes, threads)
+        return (
+            KtLinearColdBackend(self.plan, max_tokens=self.max_tokens,
+                                num_numa_nodes=nodes, cpuinfer_threads=threads,
+                                cpuinfer=cpuinfer),
+            LinearColdResources(max_tokens=self.max_tokens),
+        )
+
+    def finalize(self) -> None:
+        """cold 그룹을 굳히고 pack한다 (첫 step 1회).
+
+        로딩 중에 못 하는 이유는 그룹의 expert 수다 — `check_coverage`가 좌표가
+        아니라 이름으로 세는 것과 같은 이유로, 어느 layer가 어떤 projection을
+        갖는지는 plan만으로 알 수 없다.
+        """
+        if self._executor is not None:
+            self._executor.finalize()
+
+    def check_coverage(self) -> None:
+        """plan의 proj 이름이 **하나라도** 걸렸는가 (첫 step에서 1회).
+
+        아무 layer에도 안 걸린 이름은 오타다 — 조용히 stock 경로로 돌아 "켰는데
+        안 켜진" 상태가 되는데, 성능만 달라져 어떤 테스트도 안 잡는다.
+
+        **좌표 단위가 아니라 이름 단위**로 보는 이유: plan의 `projs`는 전 layer로
+        전개되지만 모델은 layer마다 projection 집합이 다를 수 있다 (Qwen3.8-27B는
+        `self_attn.qkv_proj`가 64층 중 full_attention 16층에만 있고 나머지는
+        `linear_attn.*`이다). 좌표를 전부 요구하면 정상 모델에서 오탐이 난다.
+        대신 이름별 매칭 수를 로그로 남겨 배분이 의도대로인지 볼 수 있게 한다.
+        """
+        if self._checked or (self._executor is None and not self._stock_registered):
+            return
+        self._checked = True
+        got = (self._executor.registered() if self._executor is not None else frozenset())
+        got = got | self._stock_registered
+        counts = {name: 0 for name in self.plan.names()}
+        for _, name in got:
+            counts[name] = counts.get(name, 0) + 1
+        never = sorted(n for n, c in counts.items() if c == 0)
+        if never:
+            raise PlanError(
+                f"prism dense: these planned projections never matched any linear "
+                f"layer: {never}. plan의 proj 이름이 이 모델의 prefix와 다르다 "
+                f"(예: 'mlp.gate_up_proj' vs 'mlp.gate_proj')"
+            )
+        logger.info("[prism-linear] stock hot-only projections: %d", len(self._stock_registered))
+        logger.info(
+            "[prism-linear] coverage: %s (총 %d개 projection 등록)",
+            ", ".join(f"{n}×{c}" for n, c in sorted(counts.items())), len(got),
+        )
+
+
+_RUNTIME: Optional[_LinearRuntime] = None
+
+
+def _runtime() -> _LinearRuntime:
+    global _RUNTIME
+    if _RUNTIME is None:
+        from sglang.srt.layers.prism.linear.plan import parse_plan, validate_static
+
+        path = os.environ[_ENV_PLAN]
+        plan = parse_plan(path)
+        validate_static(plan)
+        logger.info(
+            "[prism-linear] plan loaded: %s (model_id=%s, projs=%s, sparsity=%s)",
+            path, plan.model_id, sorted(plan.names()),
+            "none" if plan.sparsity is None else plan.sparsity.score,
+        )
+        _RUNTIME = _LinearRuntime(plan)
+    return _RUNTIME
+
+
+class PrismLinearMethod:
+    """`LinearBase.quant_method` 자리에 들어가는 Prism 실행기."""
+
+    # loader.py의 `device_loading_context` 왕복 opt-out (MoE `PrismMoEMethod`와 같은 계약).
+    # 그 컨텍스트는 CPU offload용이고 판정 기준이 `device.type == "cpu"` 하나뿐이라,
+    # **의도적으로** host에 파라미터를 만드는 우리를 offload로 오해한다. 그대로 두면
+    # layer마다 full weight를 GPU로 올렸다 내린 뒤 그 사본을 버린다 — 순수 낭비인데
+    # **에러 없이 느려지기만** 해서 어떤 테스트도 안 잡는다.
+    keeps_params_on_host = True
+
+    def __init__(self, inner, layer_idx: int, name: str):
+        self.inner = inner          # 미지 속성의 위임처
+        self.layer_idx = layer_idx
+        self.name = name
+
+    def __getattr__(self, attr):
+        # __init__ 이전/자기 속성 미존재 시 재귀 방지 (kt·MoE prism의 알려진 함정)
+        if attr in ("inner", "layer_idx", "name"):
+            raise AttributeError(attr)
+        return getattr(self.inner, attr)
+
+    # ── Stage 1: 파라미터 ────────────────────────────────────────────────
+    def create_weights(self, layer, input_size_per_partition: int,
+                       output_partition_sizes: List[int], input_size: int,
+                       output_size: int, params_dtype, **extra_weight_attrs):
+        from sglang.srt.layers.prism.linear.plan import check_dims, check_partition
+        from sglang.srt.utils import set_weight_attrs
+
+        rt = _runtime()
+        where = f"layer {self.layer_idx} proj '{self.name}'"
+        if input_size_per_partition != input_size:
+            raise NotImplementedError(
+                f"{where}: Prism dense supports TP=1 only (K is sharded: "
+                f"{input_size_per_partition} of {input_size}) — RowParallelLinear의 "
+                f"TP는 prism과 같은 K축을 쪼갠다"
+            )
+        n = sum(output_partition_sizes)
+        if n != output_size:
+            raise NotImplementedError(
+                f"{where}: Prism dense supports TP=1 only (N is sharded: {n} of {output_size})"
+            )
+        pp = rt.plan.get(self.layer_idx, self.name)
+        if pp is None:                       # predicate가 걸렀어야 한다
+            raise PlanError(f"{where}: wrapped but not in the plan")
+        check_dims(pp, input_size, n, where)
+        check_partition(pp, output_partition_sizes, where)
+        if self.inner.__class__.__name__ in _QUANT_SUPPORTED:
+            # 양자화 파라미터(코드 + 배율)의 **모양과 로더 훅은 inner가 소유한다** —
+            # 우리가 흉내내면 체크포인트 키 이름·shard 로더가 어긋난다. 그래서 생성은
+            # 위임하고, 로딩이 끝난 뒤(Stage 2) 그 텐서를 읽어 절단만 한다.
+            #
+            # 단, **어느 device에 만드는지는 위임하지 않는다** (계약 ③: full weight는
+            # 호스트, GPU에는 hot 스토어만). inner(Fp8LinearMethod.create_weights →
+            # create_fp8_weight_)는 모델 생성 컨텍스트의 device, 즉 CUDA에 통째로
+            # 할당해서 fp8pt 모델은 shard를 읽기도 전에 OOM으로 죽었다
+            # (2026-09-08 Mistral-Med-128B 15 GiB plan: "Tried to allocate 144 MiB,
+            # 17.69 MiB free, this process has 31.33 GiB" — 113 GiB의 projection을
+            # 31 GiB 카드에). 아래 bf16 경로가 device="cpu"로 하는 것과 같은 일을
+            # 컨텍스트로 강제한다. Stage 2(process_weights_after_loading)는 이미
+            # `w.cpu() if w.is_cuda else w`로 CPU 텐서를 전제하고 inner의 후처리를
+            # 부르지 않으므로, 이 변경으로 달라지는 것은 할당 위치뿐이다.
+            with torch.device("cpu"):
+                self.inner.create_weights(
+                    layer, input_size_per_partition, output_partition_sizes, input_size,
+                    output_size, params_dtype, **extra_weight_attrs)
+            return
+        if params_dtype != torch.bfloat16:
+            raise NotImplementedError(
+                f"{where}: Prism dense v1 supports bf16 params only, got {params_dtype}"
+            )
+
+        # full weight를 **CPU**에 — GPU에는 hot 스토어만 간다 (계약 ③). cold 주입은
+        # C++가 host memcpy로 읽으므로 device 텐서를 넘기면 segfault다.
+        weight = torch.nn.Parameter(
+            torch.empty(n, input_size, dtype=params_dtype, device="cpu"),
+            requires_grad=False,
+        )
+        set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
+        layer.register_parameter("weight", weight)
+        set_weight_attrs(weight, extra_weight_attrs)
+
+    # ── Stage 2: 절단·등록 ───────────────────────────────────────────────
+    def process_weights_after_loading(self, layer) -> None:
+        # SGLang sets torch threads to one for GPU weight loading. These weights
+        # live on CPU; allow the preparation hook to use an explicit thread count
+        # and restore the inference setting, including when preparation fails.
+        threads = int(os.environ.get("SGLANG_PRISM_LINEAR_LOAD_THREADS", "0"))
+        if threads < 0:
+            raise ValueError("SGLANG_PRISM_LINEAR_LOAD_THREADS must be nonnegative")
+        saved = torch.get_num_threads()
+        changed = threads > 0 and threads != saved
+        try:
+            if changed:
+                torch.set_num_threads(threads)
+            return self._prepare_weights_after_loading(layer)
+        finally:
+            if changed:
+                torch.set_num_threads(saved)
+
+    def _prepare_weights_after_loading(self, layer) -> None:
+        import time
+
+        from sglang.srt.layers.prism.linear.weights import prepare_linear_weights
+        from sglang.srt.layers.prism.numa import gpu_numa_node
+
+        rt = _runtime()
+        where = f"layer {self.layer_idx} proj '{self.name}'"
+        t0 = time.perf_counter()
+        # 로더의 device_loading_context가 파라미터를 CUDA로 옮겨뒀을 수 있다
+        # (훅 종료 후 원복). cold 슬라이스는 host 메모리에서 해야 한다.
+        w = layer.weight.data
+        w = w.cpu() if w.is_cuda else w
+        # 양자화 포맷의 배율. **inner의 `process_weights_after_loading`은 부르지
+        # 않는다** — 그것은 cutlass/marlin 경로용으로 weight를 전치하거나 배율을
+        # per-channel로 바꿔 놓아서(`quantization/fp8.py:600` 근처) 체크포인트의
+        # `[N, K]` + 스칼라 계약이 깨진다. prism은 원본 배치를 그대로 잘라야 한다.
+        scale = None
+        if self.inner.__class__.__name__ in _QUANT_SUPPORTED:
+            raw = getattr(layer, "weight_scale", None)
+            if raw is None:
+                raw = getattr(layer, "weight_scale_inv", None)
+            if raw is None:
+                raise PlanError(
+                    f"{where}: {self.inner.__class__.__name__}를 감쌌는데 배율 파라미터가 "
+                    f"없다 (weight_scale / weight_scale_inv 둘 다 없음)")
+            scale = raw.data
+            scale = (scale.cpu() if scale.is_cuda else scale).to(torch.float32)
+
+        device = torch.device(torch.cuda.current_device())
+        prepared = prepare_linear_weights(
+            self.layer_idx, self.name, w, rt.plan,
+            scale=scale,
+            device=device, warm_node=gpu_numa_node(device), pin_memory=True,
+            calib=rt.calib,
+        )
+        # warm 마스킹은 그 GPU 커널에 이 score의 진입점이 있을 때만이다 — 없으면 warm을
+        # dense로 돌린다 (k1은 현재 fp8 worklist에만 `*_sparsek1`이 있다). cold는 kt가
+        # 자기 마스크를 만드는 별개 경로라 여기 영향받지 않는다.
+        warm_masking = True
+        if rt.plan.sparsity is not None:
+            pp = rt.plan.proj(self.layer_idx, self.name)
+            warm_masking = gpu_warm_supports_score(pp.kernels.gpu_warm,
+                                                   rt.plan.sparsity.score)
+            if not warm_masking and prepared.rows(Tier.WARM):
+                logger.warning(
+                    "[prism-linear] %s: gpu_warm '%s' has no '%s' entry point — "
+                    "warm %d rows run dense (cold still masks)",
+                    where, pp.kernels.gpu_warm, rt.plan.sparsity.score,
+                    prepared.rows(Tier.WARM))
+        rt.executor(device).register(self.layer_idx, self.name, prepared,
+                                     sparsity=rt.plan.sparsity,
+                                     warm_masking=warm_masking, prefill_weight=w)
+        del w
+
+        # full 텐서 소멸 (계약 ③) — host RAM 회수
+        layer.weight.data = torch.empty(0, dtype=layer.weight.dtype)
+        logger.debug(
+            "[prism-linear] %s registered (hot=%d warm=%d cold=%d) %.2fs",
+            where, prepared.rows(Tier.HOT), prepared.rows(Tier.WARM),
+            prepared.rows(Tier.COLD), time.perf_counter() - t0,
+        )
+
+    # ── step-time ────────────────────────────────────────────────────────
+    def apply(self, layer, x: torch.Tensor, bias: Optional[torch.Tensor] = None
+              ) -> torch.Tensor:
+        rt = _runtime()
+        if not isinstance(x, torch.Tensor):
+            # DeepseekV2MLP의 gemm_output_zero_allocator 경로 (uint8 weight 전용).
+            # 조용히 무시하면 사전할당 버퍼가 버려지고 모양이 어긋난다.
+            raise NotImplementedError(
+                f"layer {self.layer_idx} proj '{self.name}': prism dense does not "
+                f"support the pre-allocated-output call form"
+            )
+        rt.finalize()
+        rt.check_coverage()
+        shape = x.shape
+        x2d = x if x.dim() == 2 else x.view(-1, shape[-1])
+        # sparsity는 decode에만 (계약 ①: prefill은 dense).
+        masking = rt.plan.sparsity is not None and x2d.shape[0] == 1
+        out = rt.executor(x.device).run(self.layer_idx, self.name, x2d, masking=masking)
+        if bias is not None:
+            out = out + bias
+        return out if x.dim() == 2 else out.view(*shape[:-1], out.shape[-1])
+
+
+# ---------------------------------------------------------------------------
+# registry 등록 — env가 켜졌을 때만 predicate가 매치된다.
+# ---------------------------------------------------------------------------
+
+
+def _predicate(layer, prefix: str, server_args):
+    from sglang.srt.layers.prism.linear.plan import split_prefix
+
+    if not os.environ.get(_ENV_PLAN):
+        return None
+    coord = split_prefix(prefix)
+    if coord is None:                    # lm_head, embedding 이웃, vision tower …
+        return None
+    layer_idx, name = coord
+    plan = _runtime().plan
+    if plan.get(layer_idx, name) is None:
+        return None
+    return {"layer_idx": layer_idx, "name": name}
+
+
+def _factory(layer, inner, ctx):
+    cls = inner.__class__.__name__
+    if (os.getenv("SGLANG_PRISM_LINEAR_HOT_STOCK", "0") == "1"
+            and cls == "UnquantizedLinearMethod"
+            and layer.params_dtype == torch.bfloat16):
+        rt = _runtime()
+        pp = rt.plan.proj(ctx["layer_idx"], ctx["name"])
+        if (pp.has_tier(Tier.HOT) and not pp.has_tier(Tier.WARM)
+                and not pp.has_tier(Tier.COLD)):
+            from sglang.srt.layers.prism.linear.plan import check_dims
+
+            check_dims(pp, layer.input_size, layer.output_size,
+                       f"layer {ctx['layer_idx']} proj '{ctx['name']}' stock hot-only")
+            # Preserve the native fused weight layout, loader, and apply method.
+            # No Prism preparation, per-part adapters, or step-time wrapper.
+            rt._stock_registered.add((ctx["layer_idx"], ctx["name"]))
+            return inner
+    if cls in _V2_LOADER_UNSUPPORTED:
+        raise NotImplementedError(
+            f"layer {ctx['layer_idx']} proj '{ctx['name']}': cannot wrap {cls} — "
+            f"그 메서드의 파라미터·후처리를 prism이 모른다. 지금 지원하는 것은 bf16 "
+            f"(UnquantizedLinearMethod)과 {sorted(_QUANT_SUPPORTED)}뿐이다"
+        )
+    # 래퍼 클래스의 이름을 inner와 같게 만든다 — v1/v2 weight_loader 선택이
+    # 이름으로 이뤄지므로 (위 `_wrapper_class` 주석).
+    return _wrapper_class(cls)(inner, ctx["layer_idx"], ctx["name"])
+
+
+from sglang.srt.layers.linear_method_registry import register_linear_quant_wrapper
+
+register_linear_quant_wrapper("prism_linear", _predicate, _factory, priority=30)
