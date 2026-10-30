@@ -1,0 +1,210 @@
+"""Prism GPU 커널 이름 registry (계약 ①).
+
+커널 이름은 startup에 검증되고, 이후 런타임에 문자열/enum 분기는 존재하지
+않는다. 2026-08-25 이후 GPU 티어의 구현은 **하나**다 — `tiers.py`의 인덱스
+worklist GEMV이고, hot/warm은 스토어의 거처로만 갈린다(계약 ①). 그래서 이
+모듈에 남은 책임은 "Plan이 아는 이름인가"의 검증뿐이고, 구현 선택은 여기서
+일어나지 않는다.
+
+`torch_bmm`은 밴드 시절의 이름이다. 기존 plan 40개가 이 키를 쓰므로 유효한
+이름으로 남기되, 가리키는 구현은 `gemv_worklist`와 같다 — bmm 경로는 가변
+per-expert K를 표현할 수 없어(연속 배치 축 요구) 폐기됐다.
+
+cpu_cold의 실체는 kt-kernel의 CRTP 클래스다. 여기서는 유효한 키 목록만 안다.
+
+이 모듈은 `layers/prism/`의 공유 코어다 (2026-08-31 승격) — 커널 이름과 그 이름이
+함의하는 정렬·타일·slab 레이아웃·스토어 태그는 expert 축과 무관하므로 MoE와 dense가
+같은 표를 본다. 유일하게 갈리던 `gpu_store_format`(태그 → StoreFormat 객체)만
+`gpu_store_format_tag`로 낮추고 객체 해석은 각 오프로드에 남겼다.
+"""
+
+from __future__ import annotations
+
+from typing import Tuple
+
+_GPU_WARM_KERNELS: Tuple[str, ...] = ("gemv_worklist", "torch_bmm", "gemv_worklist_mxfp4",
+                                      "gemv_worklist_fp8", "gemv_worklist_fp8pt")
+# `kt_tile_k2_bf16_nopf`는 `kt_tile_k2_bf16`의 **no-SW-pf 형제**다 (kt-kernel
+# `GemmKernelTileK2BF16NoPF`): 소비 커서·prefill B-panel·prep/export 보조 프리페치가
+# 컴파일 타임에 빠진 같은 커널. 레이아웃·정렬·score·자산이 전부 같으므로 아래 모든 표에서
+# 원본과 같은 값을 갖고, "SW 프리페처 없음" ablation은 plan의 커널 키만 바꿔 돌린다.
+_CPU_COLD_KERNELS: Tuple[str, ...] = ("kt_amx_bf16", "kt_tile_k2_bf16", "kt_tile_k2_bf16_nopf",
+                                      "kt_tile_k1_bf16",
+                                      "kt_amx_fp4", "kt_tile_k2_mxfp4", "kt_tile_k2_fp8b128",
+                                      "kt_tile_k1_fp8b128", "kt_tile_k2_fp8pt", "kt_tile_k1_fp8pt")
+
+# cold 커널 키가 함의하는 **slab 레이아웃**(GPU 제자리 읽기 로더가 해석) 과 노드 N shard 정렬.
+#   kt_bf16  — kt BufferBBF16Impl packed 6D (prism_grouped.cuh COLD)
+#   kt_fp4   — kt BufferBInt4KGroupImpl: 행우선 nibble + fp32 d (prism_grouped_mxfp4.cuh KT_FP4)
+#   kt_tile4 — GemmKernelTileK2MXFP4::BufferB: fp4 32k×256n 타일 + 전치 E8M0 (KT_TILE4); N shard 256 배수
+#   kt_tile8 — GemmKernelTileK2FP8B128::BufferB: e4m3 32k×256n 타일 + 전치 fp32 128×128 배율
+#              (KT_TILE8); N shard 256 배수, K 128 배수
+#   kt_bf16k1 — GemmKernelTileK1BF16::BufferB: bf16 k1 타일 (64 B 라인 = k 한 행 × 32 n).
+#              타일 컬럼(8192 원소)·super(256 n)·크기는 kt_bf16(k2)와 같고 그룹 안 순열만 다르다.
+#              **CPU prefill이 없다** (m>1 토큰 루프) — decode 전용 (tile-bf16-moe.hpp).
+#   kt_tile8k1 — GemmKernelTileK1FP8B128::BufferB: 같은 타일 기하, 64 B 라인 = k 한 행 × 64 n
+#              (KT_TILE8_K1); per-k 마스크 커널(score k1) — 정렬 요구는 kt_tile8과 동일
+#   kt_tile8pt — GemmKernelTileK2FP8PT::BufferB: 코드 타일은 kt_tile8과 같고 배율은 expert 블록 끝
+#              64 B 슬롯의 fp32 1개(per-tensor). N shard 256 배수, K 32 배수 (128 제약 없음).
+#              GPU 로더는 Layout::KT_TILE8_PT.
+#   kt_tile8ptk1 — GemmKernelTileK1FP8PT::BufferB: 코드 타일은 kt_tile8k1(k1), 배율은 kt_tile8pt와
+#              같은 64 B 슬롯 fp32 1개. 두 축의 교차 — per-k 마스크(score k1) + per-tensor 배율.
+_CPU_COLD_SLAB_LAYOUT: dict = {"kt_amx_bf16": "kt_bf16", "kt_tile_k2_bf16": "kt_bf16",
+                               "kt_tile_k2_bf16_nopf": "kt_bf16",
+                               "kt_tile_k1_bf16": "kt_bf16k1",
+                               "kt_amx_fp4": "kt_fp4", "kt_tile_k2_mxfp4": "kt_tile4",
+                               "kt_tile_k2_fp8b128": "kt_tile8", "kt_tile_k1_fp8b128": "kt_tile8k1",
+                               "kt_tile_k2_fp8pt": "kt_tile8pt",
+                               "kt_tile_k1_fp8pt": "kt_tile8ptk1"}
+# kt_tile_k1_bf16의 256은 타일 super다 (k2는 부분 super를 꼬리 표로 처리하지만 k1은 안 한다 —
+# 실제 dense plan의 cold 조각이 전부 256 배수라 값어치가 없었다).
+_CPU_COLD_N_ALIGN: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32,
+                           "kt_tile_k2_bf16_nopf": 32, "kt_tile_k1_bf16": 256,
+                           "kt_amx_fp4": 32,
+                           "kt_tile_k2_mxfp4": 256, "kt_tile_k2_fp8b128": 256, "kt_tile_k1_fp8b128": 256,
+                           "kt_tile_k2_fp8pt": 256, "kt_tile_k1_fp8pt": 256}
+
+# GPU 커널 키가 함의하는 **스토어 포맷** (formats.py). 키 하나가 스토어 형식·K 정렬·커널
+# 진입점·로더 파라미터 형태를 전부 정한다 (계약 ①) — 이 dict가 그 유일한 대응표다.
+#   gemv_worklist / torch_bmm → bf16 [Σₖ, N]  (정렬 2)
+#   gemv_worklist_mxfp4       → mxfp4 pair-row codes u8 [Σₖ/2, N] + E8M0 scales u8 [Σₖ/32, N] (정렬 32)
+#   gemv_worklist_fp8         → fp8 e4m3 codes u8 [Σₖ, N] + fp32 scale_inv [Σₖ/128, N/128] (정렬 128)
+#   gemv_worklist_fp8pt       → 같은 codes + fp32 배율 [E] (행렬당 스칼라 1개; 정렬 32).
+#                               Mistral-Medium-3.5 류 static-tensor FP8 (`weight_block_size: null`)
+_GPU_STORE_FORMAT: dict = {
+    "gemv_worklist": "bf16",
+    "torch_bmm": "bf16",
+    "gemv_worklist_mxfp4": "mxfp4",
+    "gemv_worklist_fp8": "fp8",
+    "gemv_worklist_fp8pt": "fp8pt",
+}
+
+# cold packed 저장의 K축 타일 행 수 — **커널 키가 함의하는 값**이다 (계약 ①:
+# "cold의 저장 형식(pack)은 커널 키가 함의한다 — 별도 codec 필드 없음").
+# plan/자산이 지키는 정렬은 페어(%2)뿐이므로, 로더가 여기까지 올리고 0 행을
+# 채운다. 새 cold 커널은 자기 타일 크기를 여기 등록한다.
+# fp8 타일은 배율 블록이 128 k라 타일 올림도 128이다 (32로 올리면 마지막 블록의 배율이 없다).
+_CPU_COLD_TILE_ROWS: dict = {"kt_amx_bf16": 32, "kt_tile_k2_bf16": 32,
+                             "kt_tile_k2_bf16_nopf": 32, "kt_tile_k1_bf16": 32,
+                             "kt_amx_fp4": 32,
+                             "kt_tile_k2_mxfp4": 32, "kt_tile_k2_fp8b128": 128, "kt_tile_k1_fp8b128": 128,
+                             "kt_tile_k2_fp8pt": 32, "kt_tile_k1_fp8pt": 32}
+
+# cold 커널 키가 함의하는 **Seam B 마스크 종류** = 요구하는 sparsity score.
+#   k2wl2 — 페어 마스크(VNNI 페어 단위 skip), wn²/pair_dot 테이블 + 페어 에너지 thr 곡선
+#   k1    — per-k 마스크(k 한 행 단위 skip), |x_k| >= thr, thr 곡선만
+#   k1w1  — 같은 per-k 마스크에 열 노름을 곱한다 (|x_k|·wn_k >= thr). **커널은 k1과 같은 것**이고
+#           갈리는 것은 주입하는 표뿐이라(wn 유무) per-k 커널은 둘 다 받는다.
+# plan.sparsity.score가 이 목록 밖이면 startup 즉사 (cold_backend) — 페어 커널에 per-k thr을
+# 꽂거나 그 반대면 마스크 규칙과 thr 분위수가 어긋난다.
+_CPU_COLD_SCORES: dict = {"kt_amx_bf16": ("k2wl2",), "kt_tile_k2_bf16": ("k2wl2",),
+                          "kt_tile_k2_bf16_nopf": ("k2wl2",),
+                          "kt_tile_k1_bf16": ("k1", "k1w1"), "kt_amx_fp4": ("k2wl2",),
+                          "kt_tile_k2_mxfp4": ("k2wl2",), "kt_tile_k2_fp8b128": ("k2wl2",),
+                          "kt_tile_k1_fp8b128": ("k1", "k1w1"), "kt_tile_k2_fp8pt": ("k2wl2",),
+                          "kt_tile_k1_fp8pt": ("k1", "k1w1")}
+
+
+# GPU warm 커널이 **마스킹할 수 있는** score. cold 커널은 자기 score가 하나로 정해져
+# 있지만(위 `_CPU_COLD_SCORE`) warm은 진입점이 있는 것만 마스킹할 수 있고, 없으면 그 티어를
+# dense로 돌려야 한다 (계약 ①: 마스킹 여부는 티어별 선택).
+#   k1 진입점(`*_sparsek1`)은 bf16·fp8(블록)·fp8pt 셋에 있다 (2026-09-07). mxfp4에는 없다 —
+#   k1 plan을 주고 warm에 spec을 달면 커널이 a/c를 읽어 **다른 마스크**를 만들므로, 조용히
+#   통과시키지 않고 여기서 능력을 선언한다. `torch_bmm`은 옛 이름이라 페어만 남긴다.
+_GPU_WARM_SCORES: dict = {"gemv_worklist": ("k2wl2", "k1", "k1w1"), "torch_bmm": ("k2wl2",),
+                          "gemv_worklist_mxfp4": ("k2wl2",),
+                          "gemv_worklist_fp8": ("k2wl2", "k1", "k1w1"),
+                          "gemv_worklist_fp8pt": ("k2wl2", "k1", "k1w1")}
+
+
+class KernelError(ValueError):
+    """커널 resolve 실패 또는 커널 입력 계약 위반."""
+
+
+def known_gpu_kernels() -> Tuple[str, ...]:
+    return _GPU_WARM_KERNELS
+
+
+def known_cpu_kernels() -> Tuple[str, ...]:
+    return _CPU_COLD_KERNELS
+
+
+def resolve_gpu_kernel(name: str) -> str:
+    """이름을 검증하고 그대로 돌려준다 (startup 1회)."""
+    if name not in _GPU_WARM_KERNELS:
+        raise KernelError(
+            f"unknown gpu_warm kernel '{name}' (known: {sorted(_GPU_WARM_KERNELS)})"
+        )
+    return name
+
+
+def gpu_store_format_tag(name: str) -> str:
+    """GPU 커널 키 → 스토어 포맷 **태그** ("bf16"/"mxfp4"/"fp8"). 이름 검증 겸.
+
+    태그를 실제 `StoreFormat` 객체로 바꾸는 것은 각 오프로드의 몫이다 — 파라미터
+    이름과 full 텐서 인출이 포맷 객체에 딸려 있고 그것이 MoE(w13/w2)와
+    dense(weight)에서 갈리기 때문이다. 커널 키가 함의하는 *형식*은 같고
+    *컨테이너*만 다르므로, 공유되는 것은 정확히 이 대응표까지다.
+    """
+    try:
+        return _GPU_STORE_FORMAT[name]
+    except KeyError:
+        raise KernelError(
+            f"unknown gpu_warm kernel '{name}' (known: {sorted(_GPU_WARM_KERNELS)})"
+        ) from None
+
+
+def cold_pack_tile_rows(name: str) -> int:
+    """cold 스토어를 올림해야 하는 타일 행 수. 이름 검증도 겸한다."""
+    try:
+        return _CPU_COLD_TILE_ROWS[name]
+    except KeyError:
+        raise KernelError(
+            f"unknown cpu_cold kernel '{name}' (known: {sorted(_CPU_COLD_KERNELS)})"
+        ) from None
+
+
+def cold_slab_layout(name: str) -> str:
+    """cold 커널 키 → slab 레이아웃 태그 (cold_gpu.ColdSlab.layout). 이름 검증 겸."""
+    try:
+        return _CPU_COLD_SLAB_LAYOUT[name]
+    except KeyError:
+        raise KernelError(f"unknown cpu_cold kernel '{name}' (known: {sorted(_CPU_COLD_KERNELS)})") from None
+
+
+def cold_sparsity_scores(name: str) -> tuple:
+    """cold 커널 키가 **받을 수 있는** score들. 이름 검증 겸.
+
+    per-k 커널이 둘(k1, k1w1)을 받는 이유: 마스크 단위(k 한 행)는 커널의 성질이지만
+    점수식(가중치 노름을 곱하는가)은 주입한 표의 성질이다. 페어 커널은 하나다.
+    """
+    return _CPU_COLD_SCORES[resolve_cpu_kernel(name)]
+
+
+def cold_sparsity_score(name: str) -> str:
+    """(하위 호환) 그 커널의 **대표** score 하나."""
+    return cold_sparsity_scores(name)[0]
+
+
+def gpu_warm_supports_score(name: str, score: str) -> bool:
+    """이 GPU warm 커널이 그 score로 마스킹할 수 있는가. 이름 검증 겸.
+
+    거짓이면 호출자는 그 티어를 **dense로 돌려야** 한다 — spec을 달면 커널이 자기가
+    아는 식(k2wl2 페어 에너지)으로 계산해 plan이 말한 것과 다른 마스크가 된다.
+    """
+    return score in _GPU_WARM_SCORES[resolve_gpu_kernel(name)]
+
+
+def cold_n_align(name: str) -> int:
+    """cold 커널 키가 요구하는 노드 N shard 정렬 (행 수)."""
+    return _CPU_COLD_N_ALIGN[resolve_cpu_kernel(name)]
+
+
+def resolve_cpu_kernel(name: str) -> str:
+    """이름을 검증하고 kt-kernel 클래스 키를 반환한다. 인스턴스화는 cold
+    backend의 몫 (kt-kernel이 Plan 어휘를 모르게 하는 번역 경계)."""
+    if name not in _CPU_COLD_KERNELS:
+        raise KernelError(
+            f"unknown cpu_cold kernel '{name}' (known: {sorted(_CPU_COLD_KERNELS)})"
+        )
+    return name
