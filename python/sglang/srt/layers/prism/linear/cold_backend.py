@@ -516,12 +516,14 @@ class KtLinearColdBackend:
         # 먼저 본다). 실물 슬롯만 plan의 p를 받고 더미는 0 — 더미를 마스킹하면
         # `no weight source` 기하가 깨진다 (모듈 docstring).
         spec = self._plan.sparsity
-        if spec is not None:
+        if spec is not None and any(self._masked(group, i) for i in range(len(real))):
             sp = cfg.partial.sparsity
             sp.pmax, sp.grid = spec.pmax, spec.grid
             sp.ng, sp.renorm_it = spec.ng, spec.renorm_it
             for slot in ("gate", "up", "down"):
-                if slot in real:
+                # 더미와 "실물이지만 마스킹 안 하는" 슬롯은 둘 다 p=0이다 — kt에서
+                # s = clip(0) = 0이고 thr[0]=0이라 전부 살아남는다(= dense).
+                if slot in real and self._masked(group, real.index(slot)):
                     pv, lv = self._budget(group, real.index(slot), slot)
                 else:
                     pv, lv = 0.0, 0.0
@@ -529,6 +531,25 @@ class KtLinearColdBackend:
                 setattr(sp, f"lam_{slot}", lv)
         cfg.pool = self.cpuinfer.backend_
         return cfg
+
+    def _masked(self, group: "ColdGroup", i: int) -> bool:
+        """이 슬롯을 마스킹하는가. 그룹 안에서 **일치**해야 한다.
+
+        plan에 sparsity가 있어도 조각이 `sparse: false`로 빠질 수 있다 —
+        Qwen3.8의 `linear_attn` 3종처럼 calib이 안 덮는 projection이 실재하기
+        때문이다. 그 조각들도 cold 행이 있으면 그룹에 들어온다. kt는 슬롯별로
+        `p_gate/p_up/p_down`을 따로 받으므로 **슬롯 단위**로는 표현되지만, 한
+        슬롯 안에서 unit마다 갈리면 표현할 수 없다.
+        """
+        flags = {u.sparsity_p[i] is not None for u in group.units}
+        if len(flags) != 1:
+            names = sorted({u.proj for u in group.units})
+            raise PlanError(
+                f"{group.key.label} slot{i}: 한 형상 그룹 안에서 마스킹 여부가 "
+                f"갈린다 (proj: {names}) — kt는 슬롯당 스칼라 하나만 받는다. "
+                f'plan에서 "sparse"를 통일하거나 밴딩으로 그룹을 쪼개야 한다'
+            )
+        return flags.pop()
 
     def _budget(self, group: "ColdGroup", i: int, slot: str) -> Tuple[float, float]:
         """이 슬롯의 (p, lam). 그룹 안에서 **하나**여야 한다.
@@ -539,18 +560,14 @@ class KtLinearColdBackend:
         """
         vals = {(u.sparsity_p[i], u.sparsity_lambda[i]) for u in group.units}
         if len(vals) != 1:
+            # 튜플에 None이 섞이면 sorted가 TypeError다 — 진단을 죽이지 않는다.
+            shown = sorted(f"p={a}/lam={b}" for a, b in vals)
             raise PlanError(
                 f"{group.key.label} {slot}: 한 형상 그룹 안에서 sparsity 예산이 "
-                f"갈린다 {sorted(vals)} — kt는 슬롯당 스칼라 하나만 받는다. "
+                f"갈린다 {shown} — kt는 슬롯당 스칼라 하나만 받는다. "
                 f"plan에서 예산을 통일하거나 밴딩으로 그룹을 쪼개야 한다"
             )
         pv, lv = vals.pop()
-        if pv is None or lv is None:
-            raise PlanError(
-                f"{group.key.label} {slot}: plan에 sparsity가 있는데 이 조각은 "
-                f"p/lambda를 나르지 않는다 (마스킹 대상이 아니면 cold 그룹에 "
-                f"들어오지 말아야 한다)"
-            )
         return float(pv), float(lv)
 
     def _sparsity_tables(self, group: ColdGroup, cfg, tile: int) -> Optional[dict]:
@@ -563,11 +580,13 @@ class KtLinearColdBackend:
         """
         if self._plan.sparsity is None:
             return None
-        E, ng = group.num_experts, int(self._plan.sparsity.ng)
         real = ("gate", "up") if group.key.entry == "gateup" else ("down",)
+        if not any(self._masked(group, i) for i in range(len(real))):
+            return None      # 이 인스턴스는 통째로 dense — 테이블을 주지 않는다
+        E, ng = group.num_experts, int(self._plan.sparsity.ng)
         tables: dict = {}
         for slot in ("gate", "up", "down"):
-            if slot in real:
+            if slot in real and self._masked(group, real.index(slot)):
                 i = real.index(slot)
                 colds = [u.colds[i] for u in group.units]
                 for c, u in zip(colds, group.units):
@@ -579,6 +598,13 @@ class KtLinearColdBackend:
                 wn_sq = torch.cat([c.calib.wn_sq.reshape(-1) for c in colds])
                 pair = torch.cat([c.calib.pair_dot.reshape(-1) for c in colds])
                 thr = torch.stack([u.thr[i].reshape(-1) for u in group.units])
+            elif slot in real:
+                # 실물이지만 마스킹하지 않는 슬롯: 크기는 실제 k_total, 값은 0.
+                # p=0과 짝을 이뤄 dense와 같은 결과를 낸다.
+                k_total = sum(u.colds[real.index(slot)].k_pad for u in group.units)
+                wn_sq = torch.zeros(k_total)
+                pair = torch.zeros(k_total // PAIR_GROUP)
+                thr = torch.zeros(E, ng)
             else:
                 # 더미: kindex가 expert당 tile행이라 k_total = E·tile.
                 wn_sq = torch.zeros(E * tile)

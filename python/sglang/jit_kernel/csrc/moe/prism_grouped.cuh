@@ -339,6 +339,23 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_wres(
     const long long o0 = s.row_off[e];
     const int kr = static_cast<int>(s.row_off[e + 1] - o0);
     const int ntiles = (npairs + kBM - 1) / kBM;
+    // 이 티어에 행이 **하나도 없는** expert (expert별로 예산이 갈리는 plan에서 나온다:
+    // 전량을 다른 티어가 가진 expert). partial은 0이지만 아래 K 조각 루프가 한 번도
+    // 돌지 않아 out 쓰기(조각 루프 **안**에 있다)가 통째로 건너뛰어진다 — rejoin은
+    // 그 자리에 남은 **이전 스텝의 값**을 그대로 더한다. 스트리밍 변형은 acc를 0으로
+    // 채우고 K 루프 밖에서 store하므로 이 구멍이 없다. 여기서 0을 명시적으로 쓴다.
+    if (kr == 0) {
+      constexpr int CH0 = BN / 8;
+      for (int idx = tid; idx < npairs * CH0; idx += kThreads) {
+        const int i = idx / CH0;
+        const long long c = static_cast<long long>(idx % CH0) * 8;
+        if (n0 + c < n_cols) {
+          *reinterpret_cast<uint4*>(out + static_cast<long long>(pair_sorted[pbeg + i]) * out_row +
+                                    s.out_off + n0 + c) = make_uint4(0u, 0u, 0u, 0u);
+        }
+      }
+      continue;
+    }
     for (int kc0 = 0; kc0 < kr; kc0 += k_chunk) {
     const int kcnt = min(k_chunk, kr - kc0);         // 이 조각의 K 행 수 (32의 배수)
     const bool first = (kc0 == 0), last = (kc0 + kcnt >= kr);
