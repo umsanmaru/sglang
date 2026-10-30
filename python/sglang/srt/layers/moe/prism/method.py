@@ -72,6 +72,11 @@ _ENV_COLD_SPLIT = "SGLANG_PRISM_COLD_SPLIT"
 # 미설정 = 물리 코어 수(HT 제외). cold_load 시점의 kt 워커들은 50 ms 뒤 condvar에서
 # 잠들므로(worker_pool.cpp) prepare 구간에 코어를 다 써도 경합하지 않는다.
 _ENV_LOAD_THREADS = "SGLANG_PRISM_LOAD_THREADS"
+# effective sparsity 실측 (mask_stats.py): 출력 json 경로. sparse plan + eager decode에서만 값이 쌓인다.
+_ENV_MASK_STATS = "SGLANG_PRISM_MASK_STATS"
+_ENV_MASK_STATS_EVERY = "SGLANG_PRISM_MASK_STATS_EVERY"
+# NaN 진단: 층 입력/act의 유한성을 prefill 포함해 검사 (층당 GPU 리덕션 + 동기).
+_ENV_MASK_STATS_NANPROBE = "SGLANG_PRISM_MASK_STATS_NANPROBE"
 
 
 def _load_threads() -> int:
@@ -189,6 +194,13 @@ class _PrismRuntime:
             # 조립 지점: env·runner 같은 외부 입력은 전부 여기서 읽어 명시
             # 인자로 주입한다 (executor는 hidden input 없음).
             gmin = os.environ.get(_ENV_GROUPED_MIN_M)
+            mask_stats = None
+            if os.environ.get(_ENV_MASK_STATS):
+                from sglang.srt.layers.moe.prism.mask_stats import MaskStats
+
+                mask_stats = MaskStats(self.plan, self.calib, os.environ[_ENV_MASK_STATS],
+                                       every=int(os.environ.get(_ENV_MASK_STATS_EVERY, "16")),
+                                       nan_probe=os.environ.get(_ENV_MASK_STATS_NANPROBE) == "1")
             self._executor = PrismExecutor(
                 self.plan, self._resources, self.cold() if self.has_cold else None,
                 cold_stream=os.environ.get(_ENV_COLD_STREAM) == "1",
@@ -205,6 +217,7 @@ class _PrismRuntime:
                                 if os.environ.get(_ENV_WARM_CPU_MIN_M) else None),
                 cold_async=os.environ.get(_ENV_COLD_ASYNC) == "1",
                 cold_split=os.environ.get(_ENV_COLD_SPLIT) == "1",
+                mask_stats=mask_stats,
             )
         return self._executor
 
