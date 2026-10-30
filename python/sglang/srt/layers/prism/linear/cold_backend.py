@@ -32,8 +32,14 @@ config의 `intermediate_size`는 곧 `node_gateup_n_rows[i]`다. 그래서 down 
 gateup 매핑에서는 더미가 down이고 그 N 총합이 `hidden_size`(= 실제 K)로 **고정**
 이라 깎을 수 없다 — 그룹당 `4·pool_count_·K/nodes` 한 벌을 지불한다.
 
-sparsity와 양자화 스토어(fp8/mxfp4)는 아직 배선하지 않는다 — 둘 다 즉사시킨다.
-조용히 dense/bf16으로 돌면 벤치 결론만 틀린다.
+**sparsity는 인스턴스 단위 예산이다.** `cfg.partial.sparsity`의 `p_*`/`lam_*`가
+인스턴스당 스칼라라, 예산이 다른 unit은 **다른 그룹**이 된다 (`GroupKey.budget`) —
+검사가 아니라 구성으로 집행한다. thr 곡선은 `[E, ng]`로 expert 축이 있어 unit마다
+다를 수 있으므로 키에 넣지 않는다. score k1은 thr 셋만, k2wl2는 점수 재료 9개까지
+주입한다 (`experts_partial.sparsity_keys()`가 커널에게서 그 사실을 읽는다).
+
+양자화 스토어 중 per-tensor fp8(fp8pt)만 배선한다; blockwise fp8/mxfp4는 즉사시킨다. 조용히 bf16으로
+돌면 벤치 결론만 틀린다.
 """
 
 from __future__ import annotations
@@ -45,7 +51,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 
 from sglang.srt.layers.prism.geometry import NumaShard, PlanError
-from sglang.srt.layers.prism.kernels import cold_n_align, cold_pack_tile_rows
+from sglang.srt.layers.prism.kernels import (
+    cold_n_align,
+    cold_pack_tile_rows,
+    cold_sparsity_scores,
+)
 from sglang.srt.layers.prism.linear.plan import LinearPlan
 from sglang.srt.layers.prism.linear.weights import LinearColdShard, PreparedLinear
 
@@ -54,11 +64,21 @@ from sglang.srt.layers.prism.linear.weights import LinearColdShard, PreparedLine
 # 복제가 prefill에서 M×K×2 B다. 묶음은 최적화이지 계약이 아니다.
 TOP_K = 1
 
+# 진입점 → kt 슬롯 이름 (실제 weight가 실리는 것). 나머지는 더미다.
+_SLOTS = {"gateup": ("gate", "up"), "down": ("down",)}
+
 logger = logging.getLogger(__name__)
 
-# 이 백엔드가 아는 cold 커널. 양자화 키는 배율 셋과 `cold_load_kwargs`가 필요한데
-# dense formats에 아직 그 훅이 없다 (TODO). 조용히 빠지면 pack이 쓰레기를 읽는다.
-_SUPPORTED_KERNELS = frozenset({"kt_amx_bf16", "kt_tile_k2_bf16", "kt_tile_k2_bf16_nopf"})
+# 이 백엔드가 아는 cold 커널. 배율 있는 키는 배율 셋을 kt에 넘겨야 하는데, per-tensor
+# fp8(fp8pt)의 계약 "proj당 fp32 [E]"는 `_scale_kwargs`가 `LinearColdShard.s_flat`
+# (formats.Fp8PtLinearFormat.cold_flat이 채운다)에서 만들어 준다 — 그래서 fp8pt 두 키를
+# 연다 (2026-09-08, Mistral-Med-128B 15 GiB plan이 이 게이트에서 NotImplementedError로
+# 죽었고, 위 배관은 이미 그 포맷을 위해 쓰여 있었다). blockwise fp8(fp8b128)은 slab 안
+# 스칼라가 아니라 [N/128, K/128] 배율 텐서를 따로 요구하므로 여전히 제외 — 조용히 빠지면
+# pack이 쓰레기를 읽는다.
+_SUPPORTED_KERNELS = frozenset({"kt_amx_bf16", "kt_tile_k2_bf16", "kt_tile_k2_bf16_nopf",
+                                "kt_tile_k1_bf16",
+                                "kt_tile_k2_fp8pt", "kt_tile_k1_fp8pt"})
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +100,14 @@ class Unit:
     n_start: int                             # out3d의 열 오프셋
     colds: Tuple[LinearColdShard, ...]
     shards: Tuple[Tuple[int, int, int], ...]  # (node, n_start, n_end)
+    # `colds`와 같은 순서의 마스킹 재료 (`weights.PartSparsity`). 마스킹하지 않는
+    # 조각은 None이다 — plan의 `"sparse": false`가 여기까지 그대로 온다.
+    sp: Tuple[Optional[object], ...] = ()
+
+    @property
+    def budget(self) -> Tuple[Optional[Tuple[float, float]], ...]:
+        """슬롯별 (p, lam) — 인스턴스 스칼라라 그룹 키의 일부다."""
+        return tuple(None if x is None else (x.p, x.lam) for x in self.sp)
 
     @property
     def entry(self) -> str:
@@ -109,10 +137,15 @@ class GroupKey:
     n: int                                     # part 하나의 출력 축
     kernel: str                                # cpu_cold 키
     shards: Tuple[Tuple[int, int, int], ...]
+    # 슬롯별 (p, lam) 또는 None. `cfg.partial.sparsity`의 예산이 인스턴스 스칼라라
+    # 예산이 다르면 **다른 인스턴스**여야 한다 — 한 그룹에 섞으면 어느 한쪽의 p가
+    # 조용히 다른 조각에도 적용된다.
+    budget: Tuple[Optional[Tuple[float, float]], ...] = ()
 
     @property
     def label(self) -> str:
-        return f"{self.entry}(K={self.k},N={self.n},{self.kernel})"
+        b = ",".join("dense" if x is None else f"p{x[0]:g}" for x in self.budget)
+        return f"{self.entry}(K={self.k},N={self.n},{self.kernel}{',' + b if b else ''})"
 
 
 @dataclass(frozen=True)
@@ -204,8 +237,9 @@ def split_units(layer: int, name: str, prepared: PreparedLinear,
             and shards_of_part[i] == shards_of_part[i + 1]
         )
         colds = (a.cold, b.cold) if pairable else (a.cold,)
+        sp = (a.sparsity, b.sparsity) if pairable else (a.sparsity,)
         units.append(Unit(layer=layer, proj=name, k=prepared.k, n_start=a.n_start,
-                          colds=colds, shards=shards_of_part[i]))
+                          colds=colds, shards=shards_of_part[i], sp=sp))
         i += 2 if pairable else 1
     return units
 
@@ -232,11 +266,18 @@ class KtLinearColdBackend:
 
     def __init__(self, plan: LinearPlan, *, max_tokens: int, num_numa_nodes: int,
                  cpuinfer=None, cpuinfer_threads: int = 28):
+        # 커널 키가 함의하는 마스크 규칙(score)과 plan의 score는 같아야 한다 — 페어
+        # 커널에 k1 thr(per-k 분위수)를 꽂거나 per-k 커널에 k2wl2를 꽂으면 마스크와
+        # nnz가 조용히 어긋난다 (MoE `moe/prism/cold_backend.py`와 같은 게이트).
         if plan.sparsity is not None:
-            raise NotImplementedError(
-                "dense cold: sparse plan은 아직 배선되지 않았다 (TODO §4). "
-                "조용히 dense로 돌면 마스킹이 안 걸린 채 sparse 벤치 결론이 나온다"
-            )
+            for (layer, name), pp in plan.projs.items():
+                want = cold_sparsity_scores(pp.kernels.cpu_cold)
+                if plan.sparsity.score not in want:
+                    raise PlanError(
+                        f"layer {layer} proj '{name}': cpu_cold "
+                        f"'{pp.kernels.cpu_cold}'가 받는 score는 {list(want)}인데 "
+                        f"plan.sparsity.score는 '{plan.sparsity.score}'다"
+                    )
         self._plan = plan
         self._max_tokens = int(max_tokens)
         self._nodes = int(num_numa_nodes)
@@ -291,7 +332,7 @@ class KtLinearColdBackend:
         self._final = True
         for unit, kernel in self._pending:
             key = GroupKey(entry=unit.entry, k=unit.k, n=unit.n, kernel=kernel,
-                           shards=unit.shards)
+                           shards=unit.shards, budget=unit.budget)
             self._groups.setdefault(key, ColdGroup(key)).units.append(unit)
         self._pending = []
         for group in self._groups.values():
@@ -500,8 +541,95 @@ class KtLinearColdBackend:
                 _set_kindex(dst, [u.colds[real.index(slot)] for u in group.units])
             else:
                 _set_dummy_kindex(dst, E, tile, key.n)
+        spec = self._plan.sparsity
+        if spec is not None and any(b is not None for b in key.budget):
+            # 예산·격자는 config에 굽는다 — step마다 넘기는 값이 아니다 (MoE와 동일).
+            sp = cfg.partial.sparsity
+            sp.pmax, sp.grid = spec.pmax, spec.grid
+            sp.ng, sp.renorm_it = spec.ng, spec.renorm_it
+            for slot, b in zip(_SLOTS[key.entry], key.budget):
+                # 마스킹하지 않는 슬롯은 p=0이다 — 곡선의 0번 칸이 thr=0이라 전량
+                # 통과하고, 그것이 dense와 비트일치하는 자리다 (TODO §4의 게이트).
+                p_, lam_ = (0.0, 0.0) if b is None else b
+                setattr(sp, f"p_{slot}", float(p_))
+                setattr(sp, f"lam_{slot}", float(lam_))
         cfg.pool = self.cpuinfer.backend_
         return cfg
+
+    def _scale_kwargs(self, group: ColdGroup, E: int) -> dict:
+        """`load_weights_from_tensors`의 배율 인자. 배율 없는 포맷이면 빈 dict.
+
+        지금 지원하는 배율 있는 cold 포맷은 per-tensor fp8 하나이고, 그 계약은
+        "proj당 fp32 `[E]`"다 (`experts_partial._WEIGHT_FORMAT`의 `s_div=None`).
+        blockwise(128×128)는 slab 안의 표가 아니라 별도 텐서를 요구하므로 여기서
+        만들 수 없다 — 그 포맷을 dense cold에 붙일 때 같이 설계한다.
+        """
+        first = group.units[0].colds[0]
+        if getattr(first, "s_flat", None) is None:
+            return {}
+        real = _SLOTS[group.key.entry]
+        out = {}
+        for slot in ("gate", "up", "down"):
+            if slot in real:
+                i = real.index(slot)
+                vals = [u.colds[i].s_flat.reshape(-1)[0] for u in group.units]
+                out[f"{slot}_scale"] = torch.stack(vals).to(torch.float32).contiguous()
+            else:
+                out[f"{slot}_scale"] = torch.ones(E, dtype=torch.float32)
+        return out
+
+    def _sparsity_tables(self, group: ColdGroup) -> dict:
+        """kt에 주입할 sparsity 테이블. 슬롯 순서 = expert 순서 = `group.units`.
+
+        thr 곡선은 `[E, ng]`라 unit마다 다를 수 있고 밴드와 무관하므로 절단하지
+        않는다. score k2wl2는 점수 재료(wn²/pair_dot)도 가는데, 그것은 **cold
+        인덱스로 모은 것**이어야 한다 — 순서가 어긋나면 마스크 비트가 다른 행을
+        가리키고 결과가 조용히 틀린다.
+
+        더미 슬롯도 키가 요구되므로 0으로 채운다 (`_dummy_weight`가 0이라 계산에
+        참여해도 무해하고, 애초에 그 스테이지는 돌지 않는다).
+        """
+        spec = self._plan.sparsity
+        key, E = group.key, group.num_experts
+        tile = cold_pack_tile_rows(key.kernel)
+        ng = int(spec.ng)
+        real = _SLOTS[key.entry]
+        tables: dict = {}
+        for slot in ("gate", "up", "down"):
+            if slot not in real:
+                tables[f"thr_{slot}"] = torch.zeros(E * ng, dtype=torch.float32)
+                continue
+            i = real.index(slot)
+            tables[f"thr_{slot}"] = torch.cat([
+                (u.sp[i].thr.reshape(-1) if u.sp[i] is not None
+                 else torch.zeros(ng, dtype=torch.float32))
+                for u in group.units
+            ]).contiguous()
+        if not spec.needs_wn:
+            return tables
+        # k1w1은 wn까지, k2wl2는 pair_dot까지. 안 쓰는 표는 아예 안 만든다 — kt가 무시하긴
+        # 하지만, 보내는 것이 곧 "이 점수가 그걸 쓴다"는 선언이라 헷갈릴 자리를 없앤다.
+        for slot in ("gate", "up", "down"):
+            if slot not in real:
+                rows = E * tile
+                tables[f"{slot}_wn_sq"] = torch.zeros(rows, dtype=torch.float32)
+                if spec.needs_pair_dot:
+                    tables[f"{slot}_pair_dot"] = torch.zeros(rows // 2, dtype=torch.float32)
+                continue
+            i = real.index(slot)
+            wn, pd = [], []
+            for u in group.units:
+                k_pad = u.colds[i].k_pad
+                if u.sp[i] is None or u.sp[i].cold is None:
+                    wn.append(torch.zeros(k_pad, dtype=torch.float32))
+                    pd.append(torch.zeros(k_pad // 2, dtype=torch.float32))
+                    continue
+                wn.append(u.sp[i].cold.wn_sq)
+                pd.append(u.sp[i].cold.pair_dot)
+            tables[f"{slot}_wn_sq"] = torch.cat(wn).contiguous()
+            if spec.needs_pair_dot:
+                tables[f"{slot}_pair_dot"] = torch.cat(pd).contiguous()
+        return tables
 
     # ── 로딩 ─────────────────────────────────────────────────────────────
     def _load_group(self, group: ColdGroup) -> None:
@@ -521,8 +649,14 @@ class KtLinearColdBackend:
             gate = _dummy_weight(E, tile, cfg.intermediate_size, down.dtype)
             up = _dummy_weight(E, tile, cfg.intermediate_size, down.dtype)
 
+        tables = None
+        if self._plan.sparsity is not None and any(b is not None for b in key.budget):
+            tables = self._sparsity_tables(group)
+        # 배율 있는 포맷(fp8pt)은 슬롯당 fp32 스칼라 하나를 proj별 [E]로 이어 붙인다.
+        # 더미 슬롯도 값이 있어야 한다 (wrapper가 원소 수를 검증한다) — 1.0을 넣는다.
+        scales = self._scale_kwargs(group, E)
         wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=key.kernel)
-        wrapper.load_weights_from_tensors(gate, up, down)
+        wrapper.load_weights_from_tensors(gate, up, down, sparsity_tables=tables, **scales)
         group.wrapper = wrapper
         # full 텐서 소멸 (계약 ③): pack이 끝났으므로 소유권은 C++다. 여기 참조를
         # 놓지 않으면 cold weight 한 벌이 host RAM에 그대로 남는다.

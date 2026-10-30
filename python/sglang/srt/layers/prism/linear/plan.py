@@ -64,9 +64,10 @@ Plan 파일(JSON) 형식::
           "k": 6656, "n": 4096, "sparse": false,
           "bands": [[0, 6656, "cold"]], "cold_shards": [[0, 0, 4096]]
         },
-        "mlp.down_proj": {
+        "mlp.down_proj": {                       # 인덱스형 — 컴파일러 plan의 형태
           "k": 17408, "n": 5120,
-          "bands": [[0, 17408, "cold"]],
+          "indices": {"hot": [7564, 7565, 6882, 6883, …],
+                      "cold": [0, 1, 2, 3, …]},
           "cold_shards": [[0, 0, 2560], [1, 2560, 5120]],
           "p": 0.5, "lambda": 0.0
         }
@@ -75,6 +76,12 @@ Plan 파일(JSON) 형식::
         {"layer": 3, "mlp.down_proj": {"bands": [[0, 17408, "hot"]]}}
       ]
     }
+
+**티어 멤버십은 `bands` 또는 `indices` 하나다** (조각마다). `bands`는 연속 반개구간의
+합집합이고, `indices`는 티어별 K행 번호 목록이다 — 컴파일러(`search_prism_dense`)가
+중요도 순으로 뽑은 행은 연속이 아니므로 그 plan은 인덱스형으로 온다. 인덱스 **순서가
+스토어·점수 재료·마스크 비트의 순서를 정의**하므로 파서는 정렬하지 않는다. 페어
+`(2j, 2j+1)`은 같은 티어에서 인접해야 한다 (계약 ① `PAIR_GROUP`; `_validate_indices`).
 
 `projs`가 모델 기하(k/n)와 기본 밴딩을 함께 준다. `overrides`는 특정 layer의
 밴딩만 갈아끼운다 — k/n/kernels/조각 구조는 모델 기하라 layer마다 같으므로
@@ -120,7 +127,20 @@ from sglang.srt.layers.prism.kernels import resolve_cpu_kernel, resolve_gpu_kern
 SUPPORTED_SCHEMA_VERSIONS = (1,)
 
 # sparsity score 변종 — calib 자산의 어느 테이블 계열을 쓰는지 (MoE와 동일).
-KNOWN_SPARSITY_SCORES = ("k2wl2",)
+# k2wl2 = 인접 페어의 실제 에너지 `sqrt(a0x0² + a1x1² + 2c·x0x1) >= thr`. 열 노름 wn²(a)과
+#         인접열 내적 pair_dot(c)을 요구하고 마스크는 페어(k/2 비트).
+# k1    = 순수 활성값 `|x_k| >= thr`. 가중치 통계를 쓰지 않아 thr 곡선만 요구하고 마스크는
+#         per-k(k 비트)다. 어느 score를 쓰는지는 **cold 커널 키가 함의**한다
+#         (`kernels.cold_sparsity_score`) — plan.score와 어긋나면 cold_backend가 startup에 즉사.
+# k1w1 = per-k에 **열 노름을 곱한** 점수 `|x_k|·wn_k >= thr` (2026-09-07 사용자 확인:
+#         dense 자산의 `tg/tu/td` 곡선이 이 점수의 분위수다). 판정은 제곱으로 한다
+#         (`x²·a >= thr²`, a = wn²) — 동치이고 sqrt가 없다. 마스크 단위는 k1과 같은
+#         per-k라 **커널은 같은 것**을 쓰고, 갈리는 것은 주입하는 테이블이다.
+KNOWN_SPARSITY_SCORES = ("k2wl2", "k1", "k1w1")
+SCORES_PER_K = ("k1", "k1w1")            # 마스크 단위가 k 하나 (페어가 아니다)
+SCORES_WITH_WN = ("k2wl2", "k1w1")       # 열 노름 wn을 점수에 쓴다
+SCORES_WITH_PAIR_DOT = ("k2wl2",)        # 인접 열 내적까지 쓴다
+SCORES_WITHOUT_WEIGHT_STATS = ("k1",)    # (하위 호환 이름)
 
 # sglang 런타임 prefix → (layer_idx, proj_name).
 # 예: "model.layers.7.self_attn.wq_b" → (7, "self_attn.wq_b")
@@ -178,6 +198,30 @@ class SparsitySpec:
     ng: int
     renorm_it: int
 
+    @property
+    def uses_weight_stats(self) -> bool:
+        """이 score가 가중치 통계를 쓰는가 (k2wl2·k1w1 참, k1 거짓).
+
+        **어느 통계인지는 이것으로 알 수 없다** — k1w1은 wn만, k2wl2는 wn과 pair_dot
+        둘 다다. 소비자는 아래 둘을 봐야 한다. 이 이름은 기존 호출부 호환으로 남긴다.
+        """
+        return self.score not in SCORES_WITHOUT_WEIGHT_STATS
+
+    @property
+    def needs_wn(self) -> bool:
+        """열 노름(wn)이 필요한가. k1w1은 여기까지만, k2wl2는 pair_dot까지."""
+        return self.score in SCORES_WITH_WN
+
+    @property
+    def needs_pair_dot(self) -> bool:
+        """인접 열 내적(pair_dot)이 필요한가 — 페어 에너지를 재구성하는 score만."""
+        return self.score in SCORES_WITH_PAIR_DOT
+
+    @property
+    def per_k(self) -> bool:
+        """마스크 단위가 k 하나인가 (페어가 아니라)."""
+        return self.score in SCORES_PER_K
+
 
 @dataclass(frozen=True)
 class ProjPart:
@@ -189,8 +233,14 @@ class ProjPart:
     name: Optional[str]      # None | "gate"/"up"/"q"/"k"/"v" — 조각 이름
     n_start: int             # 이 조각이 차지하는 weight 행 [n_start, n_end)
     n_end: int
+    # 티어 멤버십. **둘 중 하나만** 있다 (`_parse_membership`이 강제):
+    #   bands   — 연속 반개구간의 합집합. 손으로 쓴 plan과 초기 생성기의 형태.
+    #   indices — 티어별 K행 번호 목록 (순열 허용). 컴파일러 plan이 이 형태다
+    #             (`tile_list`) — 중요도 순으로 뽑은 행이라 연속이 아니다. 순서가
+    #             스토어·점수 재료·마스크 비트의 순서를 **정의**하므로 정렬하지 않는다.
     bands: Tuple[BandSpec, ...]
     cold_shards: Tuple[NumaShard, ...]
+    indices: Optional[Mapping[Tier, Tuple[int, ...]]] = None
     # 이 조각이 쓰는 calib 테이블 키 (`"g"`/`"u"`/`"d"`/`"q"`/`"k"`/`"v"`/`"o"`).
     # **plan이 말한다** — 어댑터가 모델의 이름 규약을 몰라도 되게. 모델마다
     # projection 이름이 다르므로(`wq_b` vs `q_proj` vs `in_proj_qkv`) 매핑을
@@ -210,10 +260,12 @@ class ProjPart:
         return self.n_end - self.n_start
 
     def rows(self, tier: Tier) -> int:
+        if self.indices is not None:
+            return len(self.indices.get(tier, ()))
         return sum(b.end - b.start for b in self.bands if b.tier is tier)
 
     def has_tier(self, tier: Tier) -> bool:
-        return any(b.tier is tier for b in self.bands)
+        return self.rows(tier) > 0
 
 
 @dataclass(frozen=True)
@@ -294,11 +346,32 @@ class LinearPlan:
 # ---------------------------------------------------------------------------
 
 
-def _parse_bands(obj: dict, where: str) -> Tuple[BandSpec, ...]:
+def _parse_membership(obj: dict, where: str):
+    """`("bands"|"indices")` → `(bands, indices)`. **둘 중 하나만** 허용한다.
+
+    둘 다 오면 어느 쪽이 이기는지가 조용한 정답 결정이 된다 — 한쪽으로 절단하고
+    다른 쪽으로 검증하면 티어가 어긋난 채 통과할 수 있다.
+    """
+    has_b, has_i = "bands" in obj, "indices" in obj
+    if has_b == has_i:
+        raise PlanError(
+            f"{where}: exactly one of 'bands' / 'indices' is required "
+            f"(got {'both' if has_b else 'neither'})"
+        )
+    if has_b:
+        try:
+            return tuple(BandSpec(int(a), int(b), Tier(t))
+                         for a, b, t in obj["bands"]), None
+        except (KeyError, TypeError, ValueError) as err:
+            raise PlanError(f"{where}: malformed bands: {err}") from err
     try:
-        return tuple(BandSpec(int(s), int(e), Tier(t)) for s, e, t in obj["bands"])
+        raw = obj["indices"]
+        if not isinstance(raw, dict):
+            raise TypeError(f"'indices' must be an object keyed by tier, got {type(raw).__name__}")
+        idx = {Tier(t): tuple(int(v) for v in rows) for t, rows in raw.items()}
     except (KeyError, TypeError, ValueError) as err:
-        raise PlanError(f"{where}: malformed bands: {err}") from err
+        raise PlanError(f"{where}: malformed indices: {err}") from err
+    return (), idx
 
 
 def _parse_shards(obj: dict, where: str) -> Tuple[NumaShard, ...]:
@@ -344,10 +417,12 @@ def _parse_parts(obj: dict, n_total: int, where: str) -> Tuple[ProjPart, ...]:
     raw = obj.get("parts")
     if raw is None:
         calib, sparse, p, lam = _parse_sparse_fields(obj, where)
+        bands, indices = _parse_membership(obj, where)
         return (
             ProjPart(
                 name=None, n_start=0, n_end=n_total,
-                bands=_parse_bands(obj, where), cold_shards=_parse_shards(obj, where),
+                bands=bands, indices=indices,
+                cold_shards=_parse_shards(obj, where),
                 calib=calib, sparse=sparse, sparsity_p=p, sparsity_lambda=lam,
             ),
         )
@@ -366,9 +441,11 @@ def _parse_parts(obj: dict, n_total: int, where: str) -> Tuple[ProjPart, ...]:
         if n <= 0:
             raise PlanError(f"{sub_where}: non-positive n={n}")
         calib, sparse, p, lam = _parse_sparse_fields(sub, sub_where)
+        sub_bands, sub_indices = _parse_membership(sub, sub_where)
         parts.append(ProjPart(
             name=nm, n_start=cursor, n_end=cursor + n,
-            bands=_parse_bands(sub, sub_where), cold_shards=_parse_shards(sub, sub_where),
+            bands=sub_bands, indices=sub_indices,
+            cold_shards=_parse_shards(sub, sub_where),
             calib=calib, sparse=sparse, sparsity_p=p, sparsity_lambda=lam,
         ))
         cursor += n
@@ -511,6 +588,63 @@ def parse_plan(source: Union[str, Path, dict]) -> LinearPlan:
 # ---------------------------------------------------------------------------
 
 
+def _validate_membership(part: ProjPart, k: int, where: str) -> None:
+    """티어 멤버십의 정합. 인덱스형이면 `_validate_indices`, 아니면 밴드 규칙."""
+    if part.indices is not None:
+        _validate_indices(part, k, where)
+        return
+    _validate_bands(part, k, where)
+
+
+def _validate_indices(part: ProjPart, k: int, where: str) -> None:
+    """티어별 인덱스 목록: [0, k)를 **정확히 한 번** 덮고, 페어가 붙어 있어야 한다.
+
+    보는 것 넷 (각각이 조용히 틀리는 방식이 다르다):
+
+      · 범위 밖 / 중복 / 누락 — 행이 두 번 계산되거나 빠진다. 빠진 행은 출력이
+        "그럴듯하게 나쁜" 값이 되어 정확도 테스트만으로는 안 잡힌다.
+      · 티어별 개수가 `ROW_GROUP` 배수 — 스토어와 마스크가 페어 단위로 움직인다.
+      · **페어 무결성**: 원본에서 인접한 `(2j, 2j+1)`이 같은 티어에 있고 gather 후에도
+        인접해야 한다 (계약 ① `PAIR_GROUP`). k2wl2 점수가 페어의 에너지라 반쪽만 가진
+        티어는 점수를 재구성할 수 없고, cold 커널의 skip 단위도 VNNI 페어다.
+        (`weights._index`가 같은 검사를 하지만 여기서 죽는 것이 startup이다.)
+      · 빈 조각 — 어느 티어에도 행이 없으면 그 조각은 계산되지 않는다.
+    """
+    seen = [0] * k
+    total = 0
+    for tier, rows in part.indices.items():
+        if not rows:
+            continue
+        total += len(rows)
+        if len(rows) % ROW_GROUP:
+            raise PlanError(
+                f"{where}: tier {tier.value} has {len(rows)} rows, not a multiple of "
+                f"ROW_GROUP={ROW_GROUP}"
+            )
+        for i, r in enumerate(rows):
+            if not 0 <= r < k:
+                raise PlanError(f"{where}: tier {tier.value} row {r} out of [0, {k})")
+            seen[r] += 1
+            if seen[r] > 1:
+                raise PlanError(f"{where}: row {r} appears in more than one tier position")
+        for j in range(0, len(rows), ROW_GROUP):
+            a, b = rows[j], rows[j + 1]
+            if a // ROW_GROUP != b // ROW_GROUP:
+                raise PlanError(
+                    f"{where}: tier {tier.value} splits a pair at position {j} "
+                    f"({a}, {b}) — 한 페어의 두 채널은 같은 티어에서 인접해야 한다"
+                )
+    if total == 0:
+        raise PlanError(f"{where}: no rows in any tier")
+    missing = [i for i, c in enumerate(seen) if c == 0]
+    if missing:
+        head = ", ".join(str(i) for i in missing[:8])
+        raise PlanError(
+            f"{where}: {len(missing)} of {k} rows are in no tier ({head}"
+            f"{'…' if len(missing) > 8 else ''}) — 그 행은 계산에서 빠진다"
+        )
+
+
 def _validate_bands(part: ProjPart, k: int, where: str) -> None:
     """[0, k) 완전 커버 + 무중첩 + 페어 정렬. MoE `_validate_bands`와 같은 규칙."""
     if not part.bands:
@@ -636,7 +770,7 @@ def validate_static(plan: LinearPlan) -> None:
             )
         for part in pp.parts:
             sub = where if part.name is None else f"{where} [{part.name}]"
-            _validate_bands(part, pp.k, sub)
+            _validate_membership(part, pp.k, sub)
             _validate_shards(part, sub)
             _validate_sparsity(part, spec is not None, sub)
 

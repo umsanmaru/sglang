@@ -246,7 +246,7 @@ def test_mxfp4_store_unsupported(weight):
     """dense는 bf16/fp8만 — mxfp4 체크포인트가 대상에 없다 (2026-08-31 확인)."""
     raw = copy.deepcopy(PLAN)
     raw["kernels"] = {"gpu_warm": "gemv_worklist_mxfp4", "cpu_cold": "kt_amx_fp4"}
-    with pytest.raises(PlanError, match=r"supports \['bf16', 'fp8'\]"):
+    with pytest.raises(PlanError, match=r"implies 'mxfp4'"):
         _prep(weight, raw)
 
 
@@ -706,3 +706,86 @@ def test_cold_shard_is_part_local(gu_weight):
     p = _prep_split(gu_weight)
     for q in p.parts:
         assert q.cold.n == I2
+
+
+# ── sparsity 재료 (calib → PartSparsity) ───────────────────────────────────
+#
+# 여기서 잡는 것은 **순서**와 **score 분기**다. 점수의 행 순서가 스토어의 행 순서와
+# 어긋나면 엉뚱한 채널이 죽고(출력이 "그럴듯하게 나쁜" 값이라 눈에 안 띈다), score를
+# 안 보면 k1 plan에 페어 재료가 붙어 커널이 다른 마스크를 만든다.
+
+
+def _calib_tables(k=K, ng=201, layers=2):
+    torch.manual_seed(1)
+    return {
+        "wn_q": torch.rand(layers, 1, k) + 0.5,
+        "cq": torch.randn(layers, 1, k // 2),
+        "tq2l": torch.rand(layers, 1, ng),
+        "tq": torch.rand(layers, 1, ng),
+    }
+
+
+def _sparse_raw(score="k2wl2", cold_kernel=None, sparse=True):
+    raw = copy.deepcopy(PLAN)
+    raw["sparsity"] = {
+        "score": score,
+        "calib": {"path": "assets/x.pt", "sha256": "0" * 64},
+        "pmax": 0.9, "grid": 0.005, "ng": 201, "renorm_it": 3,
+    }
+    if cold_kernel:
+        raw["kernels"]["cpu_cold"] = cold_kernel
+    proj = raw["projs"][NAME]
+    if sparse:
+        proj.update({"calib": "q", "p": 0.5, "lambda": 0.0})
+    else:
+        proj["sparse"] = False
+    return raw
+
+
+def _cal(score):
+    from sglang.srt.layers.prism.linear.calib import LinearCalibTables
+
+    return LinearCalibTables(_calib_tables(), score, 201)
+
+
+def test_k2wl2_material_follows_store_order(weight):
+    part = _prep(weight, _sparse_raw(), calib=_cal("k2wl2")).sole
+    sp = part.sparsity
+    assert sp is not None and sp.p == 0.5 and sp.lam == 0.0
+    torch.testing.assert_close(sp.thr, _calib_tables()["tq2l"][0].contiguous())
+    # warm: 스토어 인덱스 순서 그대로
+    rows = part.warm.k_index.to(torch.int64)
+    torch.testing.assert_close(sp.warm.wn, _calib_tables()["wn_q"][0, 0][rows])
+    # cold: 패딩까지 채우고 패딩 자리는 0 (weight도 0이라 기여가 없다)
+    assert sp.cold.wn.numel() == part.cold.k_pad
+    assert float(sp.cold.wn[part.cold.real_rows:].abs().max()) == 0.0
+    torch.testing.assert_close(
+        sp.cold.wn[: part.cold.real_rows],
+        _calib_tables()["wn_q"][0, 0][part.cold.k_index.to(torch.int64)[: part.cold.real_rows]])
+
+
+def test_k1_carries_thr_only(weight):
+    raw = _sparse_raw(score="k1", cold_kernel="kt_tile_k1_fp8b128")
+    # 포맷은 그대로 bf16(gpu_warm)이고 cold 키만 k1 커널이다 — 이 테스트가 보는 것은
+    # calib 분기이므로 스토어 형식 정합은 formats 쪽 게이트의 몫이다.
+    raw["kernels"]["cpu_cold"] = "kt_tile_k2_bf16"
+    cal = _cal("k1")
+    part = _prep(weight, raw, calib=cal).sole
+    sp = part.sparsity
+    torch.testing.assert_close(sp.thr, _calib_tables()["tq"][0].contiguous())
+    assert sp.warm is None and sp.cold is None   # 페어 재료를 만들지 않는다
+
+
+def test_sparse_false_part_gets_no_material(weight):
+    part = _prep(weight, _sparse_raw(sparse=False), calib=_cal("k2wl2")).sole
+    assert part.sparsity is None
+
+
+def test_calib_without_sparsity_block_dies(weight):
+    with pytest.raises(PlanError, match="plan에 sparsity 블록이 없다"):
+        _prep(weight, PLAN, calib=_cal("k2wl2"))
+
+
+def test_sparsity_block_without_calib_dies(weight):
+    with pytest.raises(PlanError, match="calib 자산이 없다"):
+        _prep(weight, _sparse_raw())

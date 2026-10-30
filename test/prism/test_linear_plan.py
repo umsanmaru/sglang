@@ -530,6 +530,18 @@ def test_p_out_of_range_dies():
         validate_static(parse_plan(_sparse_plan(gate={"p": 1.5, "lambda": 0.0})))
 
 
+def test_score_k1_parses_and_declares_no_weight_stats():
+    """k1은 thr 곡선만 쓰는 score다 — 소비자 셋이 이 한 속성을 본다."""
+    raw = _sparse_plan()
+    raw["sparsity"]["score"] = "k1"
+    raw["kernels"]["cpu_cold"] = "kt_tile_k1_fp8b128"
+    plan = parse_plan(raw)
+    validate_static(plan)
+    assert plan.sparsity.score == "k1"
+    assert not plan.sparsity.uses_weight_stats
+    assert parse_plan(_sparse_plan()).sparsity.uses_weight_stats
+
+
 def test_unknown_score_dies():
     raw = _sparse_plan()
     raw["sparsity"]["score"] = "l1"

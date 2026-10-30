@@ -211,16 +211,24 @@ def test_mismatched_shards_split_into_two_groups():
     assert all(g.num_experts == 1 for g in groups)
 
 
-def test_sparse_plan_is_rejected():
-    """sparse plan은 아직 배선되지 않았다 — 조용히 dense로 돌면 안 된다."""
+def _sparse_plan_dict(score="k2wl2", p=0.5):
     d = _plan_dict(0.0, 0.0)
-    d["sparsity"] = {"score": "k2wl2", "calib": {"path": "/x", "sha256": "0" * 64},
+    d["sparsity"] = {"score": score, "calib": {"path": "/x", "sha256": "0" * 64},
                      "pmax": 0.9, "grid": 0.005, "ng": 201, "renorm_it": 3}
     for proj in d["projs"].values():
         for part in proj.get("parts", [proj]):
-            part.update({"calib": "g", "p": 0.5, "lambda": 0.0})
-    plan = parse_plan(d)
-    with pytest.raises(NotImplementedError, match="sparse"):
+            part.update({"calib": "g", "p": p, "lambda": 0.0})
+    return d
+
+
+def test_score_kernel_mismatch_is_rejected():
+    """페어 커널 + score k1은 즉사해야 한다 — 마스크 규칙과 thr 분위수가 다르다.
+
+    안 잡으면 kt가 per-k 분위수 thr을 페어 에너지와 비교해 **의도한 것과 다른
+    nnz**로 돈다. 출력은 그럴듯하고 sparsity만 틀린다.
+    """
+    plan = parse_plan(_sparse_plan_dict(score="k1"))
+    with pytest.raises(PlanError, match=r"받는 score는 \['k2wl2'\]"):
         KtLinearColdBackend(plan, max_tokens=32, num_numa_nodes=NODES)
 
 

@@ -40,6 +40,11 @@ def _tables(dead_layers=(), keys=KEYS, k=K):
         for d in dead_layers:
             wn[d], c[d], thr[d] = 0, 0, 0
         t[f"wn_{key}"], t[f"c{key}"], t[f"t{key}2l"] = wn, c, thr
+        # k1 곡선(접미사 없음) — 실물 자산이 둘 다 담는다 (`assets/*.pt`).
+        thr_k1 = torch.rand(L, 1, NG)
+        for d in dead_layers:
+            thr_k1[d] = 0
+        t[f"t{key}"] = thr_k1
     return t
 
 
@@ -114,8 +119,46 @@ def test_zero_masks_everything_in_theory():
 
 
 def test_missing_table_dies(cal):
-    with pytest.raises(PlanError, match="has no table 'wn_zz'"):
+    # thr 곡선을 먼저 본다 — k1이 그것만 보므로 검사 순서가 그쪽에서 시작한다.
+    with pytest.raises(PlanError, match="has no table 'tzz2l'"):
         cal.check(0, "zz", K, "w")
+
+
+# ── score k1 (per-k) ──────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def cal_k1():
+    return LinearCalibTables(_tables(), "k1", NG)
+
+
+def test_k1_reads_the_unsuffixed_curve(cal_k1, cal):
+    """score가 곡선 계열을 고른다 — 같은 (층, 키)에서 값이 달라야 한다."""
+    torch.testing.assert_close(cal_k1.thr(0, "g"), cal_k1._table("tg", "")[0, 0])
+    assert not torch.equal(cal_k1.thr(0, "g"), cal.thr(0, "g"))
+
+
+def test_k1_needs_no_weight_stats(cal_k1):
+    """wn/c가 자산에 **없어도** 통과한다 — k1의 마스크는 |x| >= thr 하나다."""
+    thin = {k: v for k, v in _tables().items() if k.startswith("t") and not k.endswith("2l")}
+    cal = LinearCalibTables(thin, "k1", NG)
+    assert not cal.uses_weight_stats
+    cal.check(0, "g", K, "w")            # 안 죽는다
+    with pytest.raises(PlanError, match="가중치 통계를 쓰지 않는다"):
+        cal.gather(0, "g", torch.arange(8, dtype=torch.int64))
+
+
+def test_k1_zero_curve_still_dies():
+    """전부-0 게이트는 k1에서도 산다 — thr=0이면 |x| >= 0으로 전량 통과한다."""
+    cal = LinearCalibTables(_tables(dead_layers=(1,)), "k1", NG)
+    cal.check(0, "o", K, "w")
+    with pytest.raises(PlanError, match="calib table 'to' is all zeros at layer 1"):
+        cal.check(1, "o", K, "w")
+
+
+def test_k1_missing_curve_dies(cal_k1):
+    with pytest.raises(PlanError, match="has no table 'tzz'"):
+        cal_k1.check(0, "zz", K, "w")
 
 
 def test_k_mismatch_dies(cal):
@@ -196,3 +239,44 @@ def test_digest_mismatch_dies():
                         pmax=0.9, grid=0.005, ng=201, renorm_it=3)
     with pytest.raises(PlanError, match="digest mismatch"):
         LinearCalibTables.load(spec)
+
+
+# ── check_plan은 죽이지 않는다 (실재하지 않을 좌표) ────────────────────────
+#
+# plan 생성기는 `self_attn.*`를 전 층에 선언하는데 실행 트리는 일부 층에만 그 모듈을
+# 만든다 (Qwen3.8은 full_attention 16층). calib이 나머지 층을 0으로 둔 것은 **정확한
+# 사실**이고, 전수 대조로 죽이면 42층 웨이트를 채운 뒤 기동이 죽는다 (2026-09-01).
+
+
+def _plan_with_sparsity(dead_layer_proj=True):
+    raw = {
+        "schema_version": 1,
+        "model_id": "test/dense",
+        "dims": {"num_layers": L, "dtype": "bfloat16"},
+        "kernels": {"gpu_warm": "gemv_worklist", "cpu_cold": "kt_tile_k2_bf16"},
+        "sparsity": {"score": "k2wl2", "calib": {"path": "/x", "sha256": "0" * 64},
+                     "pmax": 0.9, "grid": 0.005, "ng": NG, "renorm_it": 3},
+        "projs": {
+            "self_attn.o_proj": {"k": K, "n": 32, "bands": [[0, K, "hot"]],
+                                 "calib": "o", "p": 0.5, "lambda": 0.0},
+        },
+    }
+    return parse_plan(raw)
+
+
+def test_check_plan_reports_instead_of_dying():
+    """비치명 프리스캔: 문제 목록을 돌려주고 죽지 않는다."""
+    cal = LinearCalibTables(_tables(dead_layers=(1, 2)), "k2wl2", NG)
+    bad = cal.check_plan(_plan_with_sparsity())
+    assert len(bad) == 2 and "layer 1" in bad[0]
+
+
+def test_check_plan_strict_still_dies():
+    cal = LinearCalibTables(_tables(dead_layers=(1,)), "k2wl2", NG)
+    with pytest.raises(PlanError, match="all zeros"):
+        cal.check_plan(_plan_with_sparsity(), strict=True)
+
+
+def test_check_plan_is_empty_when_covered():
+    cal = LinearCalibTables(_tables(), "k2wl2", NG)
+    assert cal.check_plan(_plan_with_sparsity()) == []

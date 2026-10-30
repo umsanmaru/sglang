@@ -13,7 +13,7 @@ dense에서 그 역할은 `method.py`가 `LinearBase`의 `weight`/`weight_scale_
 | 코드 | `[N, K]` bf16 | `[N, K]` e4m3 (u8로 다룬다) |
 | 배율 | 없음 | `[N/128, K/128]` fp32 `scale_inv` |
 | K 정렬 | 2 (페어) | **128** |
-| cold 커널 | `kt_amx_bf16`, `kt_tile_k2_bf16`(+`_nopf`) | `kt_tile_k2_fp8b128` |
+| cold 커널 | `kt_amx_bf16`, `kt_tile_k2_bf16`(+`_nopf`), `kt_tile_k1_bf16` | `kt_tile_k2_fp8b128` |
 
 fp8의 128은 임의 상수가 아니다: 배율 하나가 원본 128k × 128n 블록을 덮으므로, 티어
 경계가 블록을 쪼개면 두 티어가 같은 배율을 나눠 갖게 되어 "블록당 배율 1"이 깨진다.
@@ -31,13 +31,14 @@ from typing import Optional, Tuple
 
 import torch
 
-from sglang.srt.layers.prism.geometry import PAIR_GROUP, PlanError
+from sglang.srt.layers.prism.geometry import COL_GROUP, PAIR_GROUP, PlanError
 from sglang.srt.layers.prism.kernels import cold_slab_layout, gpu_store_format_tag
 from sglang.srt.layers.prism.store import IDX_DTYPE
 
 # 이 포맷들이 받아들이는 cold slab 레이아웃 태그 (`kernels.cold_slab_layout`).
-_BF16_COLD_LAYOUTS = ("kt_bf16",)
+_BF16_COLD_LAYOUTS = ("kt_bf16", "kt_bf16k1")
 _FP8_COLD_LAYOUTS = ("kt_tile8", "kt_tile8k1")
+_FP8PT_COLD_LAYOUTS = ("kt_tile8pt", "kt_tile8ptk1")
 
 
 class LinearStoreFormat:
@@ -51,6 +52,17 @@ class LinearStoreFormat:
     # ── 검증 ────────────────────────────────────────────────────────────
     def check(self, weight, scale, k: int, n: int, where: str) -> None:
         raise NotImplementedError
+
+    def part_scale(self, scale, part_index: int, n_start: int, n_end: int, where: str):
+        """조각(N축 슬라이스)이 쓰는 배율. **포맷이 축을 안다**.
+
+        blockwise는 배율의 N축이 블록이라 행 슬라이스([n_start/B, n_end/B))이고,
+        per-tensor는 **조각당 스칼라 하나**라 융합 모듈의 배율 벡터에서 조각 번호로
+        고른다 (`qkv_proj`의 `weight_scale`가 `[3]`인 식 — sglang 로더가 논리 shard
+        마다 하나를 채운다). 이 갈림을 호출부에 두면 포맷이 늘 때마다 절단 코드를
+        고쳐야 하고, 잘못 고르면 **엉뚱한 배율로 조용히 다른 수치**가 된다.
+        """
+        return scale
 
     def check_rows(self, rows: torch.Tensor, where: str) -> None:
         """티어가 가져가는 K행이 이 포맷의 절단 단위를 지키는가.
@@ -239,6 +251,15 @@ class Fp8LinearFormat(LinearStoreFormat):
     def _codes(self, weight):
         return weight if weight.dtype == torch.uint8 else weight.view(torch.uint8)
 
+    def part_scale(self, scale, part_index, n_start, n_end, where):
+        B = self.BLOCK
+        if n_start % B or n_end % B:
+            raise PlanError(
+                f"{where}: part rows [{n_start}, {n_end}) are not {B}-aligned — "
+                f"배율 블록을 쪼갤 수 없다"
+            )
+        return scale[n_start // B : n_end // B]
+
     def _scale_rows(self, rows: torch.Tensor) -> torch.Tensor:
         """K행 → 배율의 K-블록 행. `check_rows`가 통째 블록임을 보장한 뒤에만 유효하다."""
         return rows.to(torch.int64).reshape(-1, self.BLOCK)[:, 0] // self.BLOCK
@@ -290,10 +311,140 @@ class Fp8LinearFormat(LinearStoreFormat):
         warmup_grouped()
 
 
+class Fp8PtLinearFormat(Fp8LinearFormat):
+    """static-tensor FP8 — e4m3 코드 + **행렬당 fp32 배율 하나**.
+
+    Mistral-Medium-3.5-128B 류 (`quantization_config`가 `weight_block_size: null`,
+    `activation_scheme: "static"`). 코드 바이트는 blockwise와 같고 배율 기하만 다르다:
+
+    | | blockwise (`fp8`) | per-tensor (`fp8pt`) |
+    |---|---|---|
+    | 배율 | `[N/128, K/128]` fp32 | 조각당 fp32 스칼라 1개 |
+    | K 정렬 | 128 (배율 블록) | **32** (커널 타일) |
+    | cold 커널 | `kt_tile_k2_fp8b128`, `kt_tile_k1_fp8b128` | `kt_tile_k2_fp8pt`, `kt_tile_k1_fp8pt` |
+    | GPU 커널 | `gemv_worklist_fp8` | `gemv_worklist_fp8pt` |
+
+    K 정렬이 32로 풀리는 것이 실질적인 차이다 — 배율 블록이 없으니 티어를 32행
+    단위로 자를 수 있고, 컴파일러 plan의 페어 단위 인덱스가 그대로 들어온다.
+
+    **융합 모듈의 배율은 논리 shard마다 하나**다 (`qkv_proj`면 `[3]`). 그래서
+    `part_scale`이 조각 번호로 고른다 — 블록 행 슬라이스가 아니다.
+    """
+
+    name = "fp8pt"
+    k_align = 32
+    cold_layouts = _FP8PT_COLD_LAYOUTS
+
+    def check_rows(self, rows: torch.Tensor, where: str) -> None:
+        """fp8pt의 K 정렬은 **개수** 조건이다 — 원본 K 좌표의 블록 정렬이 아니다.
+
+        부모(`Fp8LinearFormat`)의 검사는 128×128 배율 블록을 두 티어가 나눠 갖지
+        못하게 원본 K에서 정렬된 연속 블록을 요구한다. per-tensor에는 그 블록이
+        없다: `gather`는 임의의 행 목록을 index_select해 `[r_tier, N]` 스토어를
+        만들고 배율은 스칼라 하나이며, `cold_flat`은 k_pad로 패딩한다 (둘 다 원본
+        정렬을 쓰지 않는다). 남는 요구는 warm GPU 커널의 32행 타일, 즉 스토어 행 수가
+        32의 배수라는 것뿐이다. 부모 검사를 그대로 상속한 채로는 컴파일러의 페어 단위
+        plan이 layer 0 첫 warm 티어에서 죽었다 (2026-09-08 Mistral-Med-128B) — 위
+        docstring이 약속한 "페어 인덱스가 그대로 들어온다"가 성립하려면 이 override가
+        필요하다.
+        """
+        n_rows = int(rows.numel())
+        if n_rows % self.k_align:
+            raise PlanError(
+                f"{where}: row count {n_rows} is not a multiple of k_align={self.k_align} "
+                f"({self.name}: the warm kernel works in {self.k_align}-row tiles of the "
+                f"gathered store; the tier must move in whole tiles, any rows)"
+            )
+
+    def check(self, weight, scale, k, n, where):
+        if weight.dtype not in (torch.float8_e4m3fn, torch.uint8, torch.int8):
+            raise PlanError(
+                f"{where}: fp8 codes must be float8_e4m3fn (or raw bytes), got {weight.dtype}"
+            )
+        _check_2d(weight, (n, k), "weight", where)
+        if k % self.k_align or n % COL_GROUP:
+            raise PlanError(
+                f"{where}: fp8pt needs k % {self.k_align} == 0 and n % {COL_GROUP} == 0, "
+                f"got k={k} n={n}"
+            )
+        if scale is None:
+            raise PlanError(f"{where}: fp8pt store needs the per-tensor weight_scale")
+        # proj 단위 배율은 **논리 shard마다 스칼라 하나**다 (`qkv_proj`면 `[3]`) — 그래서
+        # 1-D(또는 0-dim)만 받는다. blockwise의 `[N/128, K/128]`은 2-D라 여기서 걸린다:
+        # 안 걸리면 그 표의 첫 원소를 전체 배율로 써 **조용히 다른 수치**가 된다.
+        if scale.dim() > 1:
+            raise PlanError(
+                f"{where}: per-tensor scale must be a scalar per logical shard, got "
+                f"{tuple(scale.shape)} — blockwise `scale_inv`를 fp8pt 스토어에 준 것이다"
+            )
+        if scale.numel() < 1:
+            raise PlanError(f"{where}: per-tensor scale is empty")
+        if scale.dtype != torch.float32:
+            raise PlanError(f"{where}: per-tensor scale must be fp32, got {scale.dtype}")
+
+    def part_scale(self, scale, part_index, n_start, n_end, where):
+        """조각 번호로 고른다. 융합 모듈의 배율은 `[조각 수]`이고 순서가 조각 순서다."""
+        flat = scale.reshape(-1)
+        if flat.numel() == 1:
+            return flat
+        if part_index >= flat.numel():
+            raise PlanError(
+                f"{where}: per-tensor scale has {flat.numel()} entries but this is part "
+                f"{part_index} — plan의 조각 수와 체크포인트의 논리 shard 수가 다르다"
+            )
+        return flat[part_index : part_index + 1]
+
+    def _one(self, scale, where="fp8pt store"):
+        """조각의 배율 스칼라. 여러 개면 `part_scale`이 안 불린 것이다."""
+        if scale is None or scale.numel() != 1:
+            raise PlanError(
+                f"{where}: per-tensor 조각 배율은 스칼라 하나여야 한다 (got "
+                f"{None if scale is None else tuple(scale.shape)}) — 융합 모듈이면 "
+                f"`part_scale`로 조각 번호를 골라야 한다"
+            )
+        return scale.reshape(1).to(torch.float32).contiguous()
+
+    def gather(self, weight, scale, rows, contiguous, k_start):
+        """codes만 K축으로 모은다 — 배율은 스칼라라 절단할 것이 없다."""
+        return _gather_km(self._codes(weight), rows, contiguous, k_start), self._one(scale)
+
+    def cold_flat(self, weight, scale, rows, tile):
+        real = int(rows.numel())
+        k_pad = ((real + tile - 1) // tile) * tile
+        codes = _pad_ckpt(self._codes(weight), rows, k_pad, 0)
+        # 패딩 코드는 0x00(= +0.0)이라 배율과 무관하게 기여가 없다.
+        return codes, self._one(scale), _pad_index(rows, k_pad), real
+
+    def gemv(self, *, pinned, sparse):
+        from sglang.jit_kernel import prism_gemv_fp8 as k
+
+        return {
+            (False, False): k.gemv_fp8pt_indexed,
+            (True, False): k.gemv_fp8pt_indexed_pinned,
+            (False, True): k.gemv_fp8pt_indexed_sparse,
+            (True, True): k.gemv_fp8pt_indexed_pinned_sparse,
+        }[(pinned, sparse)]
+
+    def grouped(self, *, pinned):
+        from sglang.jit_kernel import prism_grouped_fp8 as k
+
+        # prefill도 같은 codes 레이아웃이고 배율만 스칼라다. per-tensor 진입점이
+        # 없으면 여기서 죽는 것이 맞다 — blockwise 진입점에 스칼라를 넘기면 배율
+        # 표를 스칼라 하나로 읽어 **조용히 다른 수치**가 된다.
+        fn = "grouped_fp8pt_indexed_pinned" if pinned else "grouped_fp8pt_indexed"
+        if not hasattr(k, fn):
+            raise PlanError(
+                f"prism dense fp8pt: {fn} 진입점이 없다 — per-tensor prefill 커널이 "
+                f"붙기 전에는 이 포맷으로 prefill을 돌릴 수 없다"
+            )
+        return getattr(k, fn)
+
+
 BF16 = Bf16LinearFormat()
 FP8 = Fp8LinearFormat()
+FP8PT = Fp8PtLinearFormat()
 
-FORMATS = {BF16.name: BF16, FP8.name: FP8}
+FORMATS = {BF16.name: BF16, FP8.name: FP8, FP8PT.name: FP8PT}
 
 
 def store_format(gpu_warm: str, cpu_cold: str) -> LinearStoreFormat:

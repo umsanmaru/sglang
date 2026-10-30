@@ -41,7 +41,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.layers.prism.geometry import Tier
+from sglang.srt.layers.prism.geometry import PlanError, Tier
 from sglang.srt.layers.prism.linear.weights import LinearTierShard, PreparedPart
 
 # 어느 GPU 티어가 sparse로 계산하는가 — MoE와 같은 선택 (`moe/prism/tiers.py`의
@@ -53,6 +53,62 @@ from sglang.srt.layers.prism.linear.weights import LinearTierShard, PreparedPart
 # 아니다 — 같은 행을 warm↔hot으로 옮기면 출력이 달라진다(계약 ⑤의 plan 불변성이
 # sparse plan + hot에서 성립하지 않는다).
 SPARSE_TIERS = frozenset({Tier.WARM})
+
+
+@dataclass(frozen=True)
+class LinearSparseSpec:
+    """GPU 커널이 threshold를 스스로 계산하는 데 필요한 전부 — 전부 device 상주.
+
+    필드 이름이 MoE `moe/prism/tiers.SparseSpec`과 같은 것은 우연이 아니다: GEMV
+    래퍼(`jit_kernel/prism_gemv*.py`)가 이 객체를 **덕 타이핑**으로 읽으므로 두
+    레인이 같은 커널을 부르려면 이름이 같아야 한다. 타입을 따로 두는 이유는
+    dense의 사실(E=1, `lam` 무효)을 타입이 말하게 하기 위해서다.
+
+    `a`(wn²)는 k2wl2·k1w1이 채우고 `c`(pair_dot)는 k2wl2만 채운다. `per_k`가 참이면
+    커널은 k 단위로 판정하고, 그때 `a`가 있으면 `x²·a >= thr²`(k1w1), 없으면
+    `|x| >= thr`(k1)이다. `thr`은 `[1, ng]` (커널이 `thr[e]`로 읽는다).
+    """
+
+    thr: torch.Tensor
+    p: float
+    lam: float
+    pmax: float
+    grid: float
+    ng: int
+    renorm_it: int
+    a: Optional[torch.Tensor] = None
+    c: Optional[torch.Tensor] = None
+    per_k: bool = False
+
+
+def build_part_specs(part, spec, device) -> dict:
+    """한 조각의 `{Tier: LinearSparseSpec}`. 마스킹 재료가 없으면 빈 dict.
+
+    SPARSE_TIERS(=WARM)만 만든다 — hot은 계약 ①이 마스킹하지 않는다. cold는 kt가
+    자기 마스크를 만들므로 spec이 아니라 표 주입이다 (`cold_backend`).
+    """
+    if spec is None or part.sparsity is None or part.warm is None:
+        return {}
+    ps = part.sparsity
+    # 마스크 단위(per_k)와 필요한 통계(a/c)는 **따로**다:
+    #   k2wl2  페어 마스크 + a(wn²) + c(pair_dot)
+    #   k1w1   per-k 마스크 + a — 커널이 x²·a >= thr²로 판정한다
+    #   k1     per-k 마스크, 통계 없음
+    per_k = spec.per_k
+    thr = ps.thr.to(device)
+    a = c = None
+    if spec.needs_wn:
+        if ps.warm is None:
+            raise PlanError(
+                f"part {part.name}: score {spec.score}는 warm 점수 재료를 요구하는데 "
+                f"calib gather가 없다"
+            )
+        a = ps.warm.wn_sq.to(device)
+        if spec.needs_pair_dot:
+            c = ps.warm.pair_dot.to(device)
+    return {Tier.WARM: LinearSparseSpec(
+        thr=thr, p=ps.p, lam=ps.lam, pmax=spec.pmax, grid=spec.grid, ng=spec.ng,
+        renorm_it=spec.renorm_it, a=a, c=c, per_k=per_k)}
 
 
 @dataclass(frozen=True)

@@ -231,9 +231,27 @@ gateup 그룹의 down_bc뿐이고(그 축은 `hidden_size`에 묶여 못 깎는�
 
 ---
 
-## 4. 그다음 — sparse
+## 4. sparse — **배선됨 (2026-09-07)**, 실기 게이트만 남았다
 
-calib 어댑터(`calib.py`)와 자산은 이미 있다. 남은 것은 `SparseSpec` 조립과 배선이다.
+`plan.py`/`calib.py`/`weights.py`/`tiers.py`/`executor.py`/`method.py`/`cold_backend.py`가
+score `{k2wl2, k1}` 둘을 안다. 들어간 것:
+
+| 자리 | 무엇 |
+|---|---|
+| `plan.py` | `KNOWN_SPARSITY_SCORES=("k2wl2","k1")`, `SparsitySpec.uses_weight_stats` |
+| `calib.py` | k1 분기 — thr 곡선만 검증·조회하고 `gather()`는 거절. 전부-0 게이트는 k1에서도 산다 (thr=0이면 `|x|>=0`으로 전량 통과) |
+| `weights.py` | `PartSparsity(thr,p,lam,warm,cold)`를 조각마다 붙인다. 점수 재료는 **티어 인덱스로** gather (cold는 패딩까지, 패딩 자리는 0). plan↔calib 유무 불일치는 양방향 즉사 |
+| `tiers.py` | `LinearSparseSpec`(MoE와 같은 필드 이름 — GEMV 래퍼가 덕 타이핑) + `build_part_specs`. WARM만, 조각마다 따로 |
+| `executor.py` | `register(..., sparsity=, warm_masking=)` — 조각별 spec을 여기서 만든다 |
+| `method.py` | startup에 calib 로드 + `check_plan`; `gpu_warm_supports_score`가 거짓이면 warm을 dense로 돌리고 경고 |
+| `cold_backend.py` | 커널↔score 정합 즉사, `GroupKey.budget`(예산이 다르면 다른 인스턴스), thr/점수 재료 주입(`_sparsity_tables`) |
+| `kernels.py` | `gpu_warm_supports_score` — k1 진입점은 현재 fp8 worklist에만 있다 |
+
+**남은 것 (실기 필요)**: `test_linear_cold.py`에 sparse 케이스 — p=0에서 dense와
+비트일치, `M ∈ {1,2,5,17}`, 실효 keep 측정. 그리고 bf16의 k1은 **cold 커널이 없다**
+(`kt_tile_k1_bf16` 포팅 = 루트의 `PLAN_dense_k1_sp50.md` P4).
+
+초판의 계획 메모는 아래에 남긴다 —
 
 | | |
 |---|---|

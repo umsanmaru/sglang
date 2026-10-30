@@ -43,14 +43,22 @@ from typing import Mapping, Optional
 import torch
 
 from sglang.srt.layers.prism.geometry import PAIR_GROUP, PlanError
-from sglang.srt.layers.prism.linear.plan import LinearPlan, SparsitySpec
+from sglang.srt.layers.prism.linear.plan import (
+    SCORES_WITH_PAIR_DOT,
+    SCORES_WITH_WN,
+    LinearPlan,
+    SparsitySpec,
+)
 
-# score → threshold 테이블 이름의 접미사. `wn_*`/`c*`는 score와 무관하게 공유된다.
-#   k2wl2 : tg2l/tu2l/td2l/tq2l/…   (인접 페어의 실제 에너지, 교차항 포함)
-#   k1    : tg/tu/td/tq/…           (자산에 있지만 **아직 배선하지 않았다** —
-#           kt의 sparse 경로가 페어 마스크 `uint16*`를 전제하므로 커널 확인이 선행돼야
-#           한다. `plan.KNOWN_SPARSITY_SCORES`가 k2wl2만 통과시킨다.)
-_THR_SUFFIX = {"k2wl2": "2l", "k1": ""}
+# score → threshold 테이블 이름의 접미사.
+#   k2wl2 : tg2l/tu2l/td2l/tq2l/…   (인접 페어의 실제 에너지, 교차항 포함) + `wn_*`/`c*`
+#   k1    : tg/tu/td/tq/…           (per-k |x| 분위수). 가중치 통계를 쓰지 않는다.
+#   k1w1  : tg/tu/td/tq/…           (per-k **|x|·wn** 분위수) — **곡선은 k1과 같은 표**이고
+#           점수가 다르다. 2026-09-07 사용자 확인: dense 자산(`assets/{qwen38_27b,
+#           muse_glimer,mistral_med_128B}.pt`)의 무접미사 곡선이 이 점수의 분위수다.
+#           그래서 `wn_*`를 읽고(제곱해 a로), `c*`는 읽지 않는다.
+# 어느 통계가 필요한지는 `SparsitySpec.needs_wn / needs_pair_dot`가 말한다.
+_THR_SUFFIX = {"k2wl2": "2l", "k1": "", "k1w1": ""}
 
 
 @dataclass(frozen=True)
@@ -87,6 +95,27 @@ class LinearCalibTables:
         self._score = score
         self._suffix = _THR_SUFFIX[score]
         self._ng = int(ng)
+        self._needs_wn = score in SCORES_WITH_WN
+        self._needs_pair_dot = score in SCORES_WITH_PAIR_DOT
+        self._weight_stats = self._needs_wn
+
+    @property
+    def score(self) -> str:
+        return self._score
+
+    @property
+    def uses_weight_stats(self) -> bool:
+        """가중치 통계를 읽는 score인가 (k2wl2·k1w1 참, k1 거짓)."""
+        return self._weight_stats
+
+    @property
+    def needs_wn(self) -> bool:
+        return self._needs_wn
+
+    @property
+    def needs_pair_dot(self) -> bool:
+        """인접 열 내적까지 읽는가 — 페어 에너지 score만 (k1w1은 wn까지)."""
+        return self._needs_pair_dot
 
     # ── 로딩 ─────────────────────────────────────────────────────────────
     @classmethod
@@ -136,18 +165,28 @@ class LinearCalibTables:
         **전부 0이면 즉사한다** — 모듈 docstring의 무증상 실패를 막는 유일한 게이트다.
         """
         wn_n, pd_n, thr_n = self._names(key)
-        wn, pd, thr = (self._table(n, where) for n in (wn_n, pd_n, thr_n))
-        L = wn.shape[0]
+        thr = self._table(thr_n, where)
+        # 읽는 표만 검증한다: k1은 thr만, k1w1은 thr+wn, k2wl2는 thr+wn+pair_dot.
+        # 안 읽는 표가 자산에 없거나 그 층이 0이어도 정상이다.
+        checked = []
+        wn = None
+        if self._needs_wn:
+            wn = self._table(wn_n, where)
+            checked.append((wn_n, wn, k))
+        if self._needs_pair_dot:
+            checked.append((pd_n, self._table(pd_n, where), k // PAIR_GROUP))
+        checked.append((thr_n, thr, self._ng))
+        L = checked[0][1].shape[0]
         if not 0 <= layer_idx < L:
             raise PlanError(f"{where}: layer {layer_idx} out of calib range [0, {L})")
-        for n, t, exp in ((wn_n, wn, k), (pd_n, pd, k // PAIR_GROUP),
-                          (thr_n, thr, self._ng)):
+        for n, t, exp in checked:
             if t.shape[2] != exp:
                 raise PlanError(
                     f"{where}: table '{n}' has K={t.shape[2]} but expected {exp} — "
                     f"자산이 다른 모델/설정의 것이다"
                 )
-        for n, t in ((wn_n, wn), (thr_n, thr)):
+        zero_gated = [(thr_n, thr)] + ([(wn_n, wn)] if wn is not None else [])
+        for n, t in zero_gated:
             if not bool(t[layer_idx, 0].any()):
                 raise PlanError(
                     f"{where}: calib table '{n}' is all zeros at layer {layer_idx} — "
@@ -156,15 +195,33 @@ class LinearCalibTables:
                     f"(마스킹이 조용히 사라지고 성능만 달라진다)"
                 )
 
-    def check_plan(self, plan: LinearPlan) -> None:
-        """plan이 마스킹하겠다고 한 모든 (layer, proj, 조각)을 대조한다 (startup 1회)."""
+    def check_plan(self, plan: LinearPlan, *, strict: bool = False) -> list:
+        """plan이 마스킹하겠다고 한 모든 (layer, proj, 조각)을 대조한다 (startup 1회).
+
+        **plan은 실행 트리가 어느 층에 어느 모듈을 실제로 만드는지 모른다.** 생성기는
+        `self_attn.*`를 64층 전부에 선언하는데 Qwen3.8-27B에서 그 모듈은 full_attention
+        16층에만 있고, calib이 나머지 48층을 0으로 둔 것은 **정확한 사실**이다. 그래서
+        전수 대조로 죽이면 존재하지 않을 좌표가 실모델 기동을 죽인다 (2026-09-01에
+        실제로 그랬다 — 42층 웨이트를 다 채운 뒤였다).
+
+        진짜 게이트는 `weights._prepare_part`에 있다 — 그 모듈이 실재할 때만 도는
+        자리이고, 거기서의 0 테이블은 무증상 실패다. 여기는 기본이 비치명이고,
+        돌려주는 목록을 호출자가 로그로 내보내 "이 자산이 안 덮는 자리"를 남긴다.
+        """
+        bad = []
         for (layer, name), pp in plan.projs.items():
             for part in pp.parts:
                 if not part.sparse or part.calib is None:
                     continue
                 sub = f"layer {layer} proj '{name}'" + (
-                    "" if part.half is None else f" [{part.half}]")
-                self.check(layer, part.calib, pp.k, sub)
+                    "" if part.name is None else f" [{part.name}]")
+                try:
+                    self.check(layer, part.calib, pp.k, sub)
+                except PlanError as err:
+                    if strict:
+                        raise
+                    bad.append(str(err).split(" — ")[0])
+        return bad
 
     # ── 조회 ─────────────────────────────────────────────────────────────
     def thr(self, layer_idx: int, key: str) -> torch.Tensor:
@@ -181,9 +238,20 @@ class LinearCalibTables:
         `k_index`는 스토어가 쓴 그 인덱스여야 한다 (cold면 타일 경계까지 패딩된 것).
         `real_rows`가 주어지면 그 뒤는 패딩이라 0으로 남긴다 — weight도 0이라 수치
         기여가 없고, kt가 마스크 tail 비트를 끈다.
+
+        score k1에서는 부를 것이 아니다 (즉사) — 마스크가 `|x_k| >= thr` 하나라
+        점수 재료가 없고, 불렀다면 호출자가 score를 안 보고 있다는 뜻이다.
         """
+        if not self._needs_wn:
+            raise PlanError(
+                f"{where}: score '{self._score}'는 가중치 통계를 쓰지 않는다 — "
+                f"gather()를 부르지 말고 thr()만 쓴다"
+            )
         wn_all = self._table(f"wn_{key}", where)[layer_idx, 0]   # [K]
-        pd_all = self._table(f"c{key}", where)[layer_idx, 0]     # [K // PAIR_GROUP]
+        # pair_dot은 페어 에너지 score만 읽는다. k1w1은 wn까지이므로 자리만 0으로 둔다 —
+        # 소비자(kt·GPU)가 그 포인터를 아예 안 보므로 값이 아니라 **모양**만 맞으면 된다.
+        pd_all = (self._table(f"c{key}", where)[layer_idx, 0] if self._needs_pair_dot
+                  else torch.zeros(wn_all.numel() // PAIR_GROUP, dtype=torch.float32))
         total = int(k_index.numel())
         if total % PAIR_GROUP:
             raise PlanError(
@@ -197,5 +265,6 @@ class LinearCalibTables:
             wn[:kr] = wn_all[rows]
             # 페어 id는 gather된 순서의 짝수 위치가 가리키는 원본 페어다 (페어
             # 무결성이 보장되므로 홀수 위치는 같은 페어의 반대쪽).
-            pair_dot[: kr // PAIR_GROUP] = pd_all[rows[::PAIR_GROUP] // PAIR_GROUP]
+            if self._needs_pair_dot:
+                pair_dot[: kr // PAIR_GROUP] = pd_all[rows[::PAIR_GROUP] // PAIR_GROUP]
         return LinearCalibShard(wn=wn.contiguous(), pair_dot=pair_dot.contiguous())

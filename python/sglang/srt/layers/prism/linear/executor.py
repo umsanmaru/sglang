@@ -37,7 +37,11 @@ import torch
 
 from sglang.srt.layers.prism.geometry import PlanError, Tier
 from sglang.srt.layers.prism.linear.rejoin import rejoin
-from sglang.srt.layers.prism.linear.tiers import LinearGpuTier, build_part_tiers
+from sglang.srt.layers.prism.linear.tiers import (
+    LinearGpuTier,
+    build_part_specs,
+    build_part_tiers,
+)
 from sglang.srt.layers.prism.linear.weights import PreparedLinear
 
 
@@ -98,7 +102,19 @@ class LinearExecutor:
 
     # ── 등록 ─────────────────────────────────────────────────────────────
     def register(self, layer_idx: int, name: str, prepared: PreparedLinear,
-                 specs: Optional[Mapping] = None) -> None:
+                 specs: Optional[Mapping] = None, sparsity=None,
+                 warm_masking: bool = True) -> None:
+        """한 (layer, proj)를 등록한다.
+
+        `sparsity`(plan의 `SparsitySpec`)를 주면 warm 티어의 `LinearSparseSpec`을
+        **조각마다** 만든다 — gate와 up은 thr 곡선도 p도 다르므로 proj 하나에 spec
+        하나를 달면 한쪽의 마스크가 다른 쪽에 적용된다. `specs`는 그 조립을 호출자가
+        직접 하는 탈출구다 (테스트).
+
+        `warm_masking=False`면 warm을 dense로 돌린다 — GPU 커널에 그 score의 진입점이
+        없을 때다 (`kernels.gpu_warm_supports_score`). cold는 kt가 자기 마스크를 만드는
+        별개 경로라 영향받지 않는다.
+        """
         key = (layer_idx, name)
         if key in self._projs:
             raise RuntimeError(f"{key} already registered")
@@ -113,7 +129,10 @@ class LinearExecutor:
             self._cold.register(layer_idx, name, prepared)
         per_tier: dict[Tier, list] = {}
         for part in prepared.parts:
-            for tier, adapter in build_part_tiers(part, specs).items():
+            part_specs = specs
+            if part_specs is None and sparsity is not None and warm_masking:
+                part_specs = build_part_specs(part, sparsity, self._device)
+            for tier, adapter in build_part_tiers(part, part_specs).items():
                 per_tier.setdefault(tier, []).append(adapter)
         if not per_tier and not has_cold:
             raise PlanError(

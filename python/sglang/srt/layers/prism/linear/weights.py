@@ -122,6 +122,22 @@ class LinearColdShard:
 
 
 @dataclass
+class PartSparsity:
+    """한 조각의 마스킹 재료. `thr`은 티어와 무관, 점수 재료는 티어마다 따로다.
+
+    `thr`이 `[1, ng]`인 것은 커널·kt 둘 다 `thr[e]`로 읽기 때문이다 (E=1 퇴화).
+    `warm`/`cold`는 score k2wl2에서만 채워진다 — k1은 마스크가 `|x_k| >= thr`
+    하나라 가중치 통계가 없다 (`calib.LinearCalibTables.uses_weight_stats`).
+    """
+
+    thr: torch.Tensor                       # [1, ng] fp32 (host — 거처는 소비자가 정한다)
+    p: float
+    lam: float
+    warm: Optional["LinearCalibShard"] = None
+    cold: Optional["LinearCalibShard"] = None
+
+
+@dataclass
 class PreparedPart:
     """한 N축 조각의 세 티어. 분할이 없으면 조각이 하나(`name=None`)다.
 
@@ -135,6 +151,9 @@ class PreparedPart:
     hot: Optional[LinearTierShard]
     warm: Optional[LinearTierShard]
     cold: Optional[LinearColdShard]
+    # 마스킹 재료. plan.sparsity가 없거나 이 조각이 `"sparse": false`면 None이고,
+    # 그때 티어들은 dense로 돈다 (executor가 spec을 달지 않는다).
+    sparsity: Optional[PartSparsity] = None
 
     @property
     def n(self) -> int:
@@ -201,10 +220,16 @@ class PreparedLinear:
 
 
 def tier_rows(part: ProjPart, tier: Tier) -> List[int]:
-    """이 티어가 소유하는 K행 번호 (밴드 순서대로 이어 붙인다).
+    """이 티어가 소유하는 K행 번호.
 
-    티어당 밴드가 여러 개여도 된다 — 인덱스 표현에 "티어당 단일 밴드" 제약은 없다.
+    인덱스형 plan이면 **plan이 적은 순서 그대로** 돌려준다 — 그 순서가 스토어의 행
+    순서이고, 따라서 점수 재료(`calib.gather`)와 마스크 비트의 순서다. 정렬하면
+    마스크가 다른 행을 가리킨다.
+
+    밴드형이면 밴드 순서대로 이어 붙인다. 티어당 밴드가 여러 개여도 된다.
     """
+    if part.indices is not None:
+        return list(part.indices.get(tier, ()))
     rows: List[int] = []
     for b in part.bands:
         if b.tier is tier:
@@ -264,6 +289,7 @@ def prepare_linear_weights(
     device: Optional[torch.device] = None,
     warm_node: Optional[int] = None,
     pin_memory: bool = True,
+    calib=None,
 ) -> PreparedLinear:
     """한 linear의 full weight를 Plan대로 절단·배치한다.
 
@@ -317,10 +343,20 @@ def prepare_linear_weights(
     idx_device = device if device is not None else torch.device("cpu")
     tile = cold_pack_tile_rows(pp.kernels.cpu_cold)
 
+    if calib is not None and plan.sparsity is None:
+        raise PlanError(
+            f"{where}: calib 자산이 주어졌는데 plan에 sparsity 블록이 없다 — "
+            f"마스킹이 조용히 사라지고 점수 계산 비용만 남는다"
+        )
+    if calib is None and plan.sparsity is not None:
+        raise PlanError(
+            f"{where}: plan은 sparsity({plan.sparsity.score})를 말하는데 calib 자산이 "
+            f"없다 — dense로 돌면 sparse 벤치 결론이 마스킹 없이 나온다"
+        )
     parts = tuple(
         _prepare_part(part, weight, scale, fmt, where, idx_device, device,
-                      warm_node, pin_memory, tile)
-        for part in pp.parts
+                      warm_node, pin_memory, tile, layer_idx, calib, i)
+        for i, part in enumerate(pp.parts)
     )
     return PreparedLinear(
         name=name, layer_idx=layer_idx, k=k, n=n, parts=parts, fmt=fmt
@@ -329,7 +365,8 @@ def prepare_linear_weights(
 
 def _prepare_part(part: ProjPart, weight, scale, fmt: LinearStoreFormat, where: str,
                   idx_device, device, warm_node, pin_memory: bool,
-                  tile: int) -> PreparedPart:
+                  tile: int, layer_idx: int = 0, calib=None,
+                  part_index: int = 0) -> PreparedPart:
     """조각 하나: N축 슬라이스 → 티어별 K-split.
 
     N 슬라이스가 먼저인 이유는 조각마다 밴딩이 다를 수 있어서다 — 합쳐 두면 두
@@ -339,13 +376,8 @@ def _prepare_part(part: ProjPart, weight, scale, fmt: LinearStoreFormat, where: 
     w = weight if part.name is None else weight[part.n_start : part.n_end]
     s = scale
     if s is not None and part.name is not None:
-        block = getattr(fmt, "BLOCK", 1)
-        if part.n_start % block or part.n_end % block:
-            raise PlanError(
-                f"{sub}: part rows [{part.n_start}, {part.n_end}) are not "
-                f"{block}-aligned — 배율 블록을 쪼갤 수 없다"
-            )
-        s = scale[part.n_start // block : part.n_end // block]
+        # 배율의 축은 포맷이 안다 (blockwise = 블록 행 슬라이스, per-tensor = 조각 번호).
+        s = fmt.part_scale(scale, part_index, part.n_start, part.n_end, sub)
 
     def rows_of(tier: Tier):
         built = _index(tier_rows(part, tier), f"{sub} {tier.value}")
@@ -388,5 +420,26 @@ def _prepare_part(part: ProjPart, weight, scale, fmt: LinearStoreFormat, where: 
             w_flat=w_flat, k_index=idx, real_rows=real, contiguous=contiguous,
             fmt=fmt, s_flat=s_flat)
 
+    sparsity = None
+    if calib is not None and part.sparse and part.calib is not None:
+        # thr 곡선은 밴드와 무관하다 (절단하지 않는다). 점수 재료는 **티어 인덱스로**
+        # 모은다 — 마스크 비트 ↔ 스토어 행의 대응이 그 순서에 걸려 있다.
+        # **진짜 게이트.** 이 조각은 실재하는 모듈의 것이므로 여기서 0 테이블은
+        # 무증상 실패다 (마스킹이 사라지고 성능만 달라진다). plan 전수 대조와 달리
+        # 존재하지 않을 좌표를 잡지 않는다 (`calib.check_plan` docstring).
+        calib.check(layer_idx, part.calib, int(weight.shape[1]), sub)
+        thr = calib.thr(layer_idx, part.calib).unsqueeze(0).contiguous()
+        warm_c = cold_c = None
+        if calib.uses_weight_stats:
+            if warm is not None:
+                warm_c = calib.gather(layer_idx, part.calib, warm.k_index.cpu(),
+                                      where=f"{sub} warm")
+            if cold is not None:
+                cold_c = calib.gather(layer_idx, part.calib, cold.k_index.cpu(),
+                                      real_rows=cold.real_rows, where=f"{sub} cold")
+        sparsity = PartSparsity(thr=thr, p=float(part.sparsity_p),
+                                lam=float(part.sparsity_lambda),
+                                warm=warm_c, cold=cold_c)
+
     return PreparedPart(name=part.name, n_start=part.n_start, n_end=part.n_end,
-                        hot=hot, warm=warm, cold=cold)
+                        hot=hot, warm=warm, cold=cold, sparsity=sparsity)
