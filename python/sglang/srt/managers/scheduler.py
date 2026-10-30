@@ -51,6 +51,12 @@ suppress_noisy_warnings()
 import psutil  # isort: skip
 import setproctitle
 import torch
+
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    _ASYNC_LAUNCH as _ASYNC_GRAPH_LAUNCH,
+    _FORWARD_THREAD as _PRISM_FORWARD_THREAD,
+    wait_pending_launch as _wait_pending_graph_launch,
+)
 import torch.distributed
 from torch.distributed import barrier
 
@@ -1758,6 +1764,153 @@ class Scheduler(
     @DynamicGradMode()
     def event_loop_overlap(self):
         """A scheduler loop that overlaps the CPU processing and GPU computation."""
+        if _PRISM_FORWARD_THREAD:
+            return self._event_loop_overlap_forward_thread()
+        return self._event_loop_overlap_single_thread()
+
+    def _event_loop_overlap_forward_thread(self):
+        """Experiment (2026-09-17): run_batch + sampling on a dedicated forward
+        thread; this thread only schedules. Needed because a CUDA graph with host
+        nodes (prism cold submit/sync) makes cudaGraphLaunch block ~90% of the
+        graph, which serializes the scheduler's Python with the GPU. All
+        forward_stream work stays on the forward thread, in order; the scheduler
+        waits for `reads_done` (set after run_batch returned, i.e. the launch is
+        fully submitted) before touching schedule_stream, so the WAR barrier
+        keeps its meaning."""
+        import queue as _queue
+        import threading as _threading
+
+        class _Job:
+            __slots__ = ("batch", "snapshot", "result", "reads_done", "done", "exc")
+
+            def __init__(self, batch):
+                self.batch = batch
+                self.snapshot = None
+                self.result = None
+                self.reads_done = _threading.Event()
+                self.done = _threading.Event()
+                self.exc = None
+
+        self.result_queue: Deque[Tuple[ScheduleBatch, _Job]] = deque()
+        jobs: "_queue.Queue[_Job]" = _queue.Queue()
+        device_index = torch.cuda.current_device()
+
+        def _forward_worker():
+            torch.cuda.set_device(device_index)
+            while True:
+                job = jobs.get()
+                if job is None:
+                    return
+                try:
+                    job.result = self.run_batch(job.batch)
+                    job.snapshot = job.batch.copy()
+                    job.reads_done.set()
+                    if self.is_generation:
+                        self.launch_batch_sample_if_needed(job.result, job.batch)
+                except BaseException as e:  # surfaced on the scheduler thread
+                    job.exc = e
+                    job.reads_done.set()
+                finally:
+                    job.done.set()
+
+        worker = _threading.Thread(target=_forward_worker, name="prism-forward", daemon=True)
+        worker.start()
+        logger.info("[prism] forward-thread overlap loop active (SGLANG_PRISM_FORWARD_THREAD=1)")
+
+        import time as _time
+        import os as _os
+        _stats_on = _os.environ.get("SGLANG_PRISM_FT_STATS") == "1"
+        _acc = {"wait": 0.0, "pop": 0.0, "sched": 0.0, "period": 0.0, "n": 0, "t_last": None}
+
+        def pop_and_process():
+            tmp_batch, job = self.result_queue.popleft()
+            job.done.wait()
+            if job.exc is not None:
+                raise job.exc
+            self.process_batch_result(job.snapshot, job.result)
+
+        while True:
+            if self.gracefully_exit:
+                jobs.put(None)
+                break
+            _t_top = _time.perf_counter()
+
+            recv_reqs = self.request_receiver.recv_requests()
+            self.process_input_requests(recv_reqs)
+
+            if self._engine_paused:
+                continue
+
+            plan = self.get_next_batch_to_run(
+                running_batch=self.running_batch, last_batch=self.last_batch
+            )
+            self.running_batch = plan.running_batch
+            batch = plan.batch_to_run
+            self.cur_batch_for_debug = batch
+
+            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
+                batch, last_batch=self.last_batch
+            )
+            if disable_overlap_for_batch:
+                pop_and_process()
+                if self.enable_unified_memory:
+                    try:
+                        self.token_to_kv_pool_allocator.flush_opportunistic()
+                    except Exception:
+                        pass
+
+            if batch:
+                job = _Job(batch)
+                _t_enq = _time.perf_counter()
+                jobs.put(job)
+                # run_batch (incl. the blocking launch) runs on the forward thread;
+                # wait until it returned so every forward_stream op of this step is
+                # submitted, then fence schedule_stream writes behind its reads.
+                job.reads_done.wait()
+                _t_ready = _time.perf_counter()
+                if job.exc is not None:
+                    raise job.exc
+                self._apply_war_barrier()
+                self.result_queue.append((batch, job))
+            else:
+                self._sched_idled = True
+                _t_enq = _t_ready = _time.perf_counter()
+
+            if self.last_batch:
+                if not disable_overlap_for_batch:
+                    pop_and_process()
+            elif batch is None:
+                self.on_idle()
+            if _stats_on and batch is not None and batch.forward_mode.is_decode():
+                _t_end = _time.perf_counter()
+                _acc["sched"] += _t_enq - _t_top
+                _acc["wait"] += _t_ready - _t_enq
+                _acc["pop"] += _t_end - _t_ready
+                if _acc["t_last"] is not None:
+                    _acc["period"] += _t_top - _acc["t_last"]
+                _acc["t_last"] = _t_top
+                _acc["n"] += 1
+                if _acc["n"] >= 100:
+                    n = _acc["n"]
+                    logger.info(
+                        f"[prism-ft] sched-thread per step: top->enqueue(recv+get_next) {1e3*_acc['sched']/n:.2f} ms | "
+                        f"wait reads_done {1e3*_acc['wait']/n:.2f} ms | barrier+pop {1e3*_acc['pop']/n:.2f} ms | "
+                        f"loop period {1e3*_acc['period']/(n-1):.2f} ms"
+                    )
+                    for k in ("wait", "pop", "sched", "period"): _acc[k] = 0.0
+                    _acc["n"] = 0
+            else:
+                _acc["t_last"] = None
+
+            # Sampling of the current batch is launched by the forward thread
+            # (grammar-dependent sampling is not supported in this mode).
+            self.last_batch = batch
+
+            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
+                self.invariant_checker.self_check_during_busy()
+
+    def _event_loop_overlap_single_thread(self):
+        """The stock single-thread overlap loop."""
         self.result_queue: Deque[
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
@@ -1805,8 +1958,24 @@ class Scheduler(
             if batch:
                 batch_result = self.run_batch(batch)
                 # Fence result processing behind this forward's shared reads.
-                self._apply_war_barrier()
+                if _ASYNC_GRAPH_LAUNCH:
+                    # Deferred: the graph may still be launching on a helper
+                    # thread; the barrier is applied after joining it, right
+                    # before the sample launch below.
+                    pass
+                else:
+                    self._apply_war_barrier()
                 self.result_queue.append((batch.copy(), batch_result))
+                if _ASYNC_GRAPH_LAUNCH:
+                    # Variant B (2026-09-17): join the helper launch here, i.e. at
+                    # the original WAR-barrier position, so nothing below touches
+                    # schedule_stream/forward_stream before the graph is fully
+                    # submitted. Overlap then comes only from the graph tail that
+                    # remains after cudaGraphLaunch returns.
+                    _wait_pending_graph_launch()
+                    runner = self.model_worker.last_shared_read_runner
+                    runner.shared_read_done_event = None
+                    self.schedule_stream.wait_stream(self.forward_stream)
             else:
                 batch_result = None
                 self._sched_idled = True
@@ -3695,12 +3864,24 @@ class Scheduler(
                                     self._advance_pending_grammar
                                 )
 
+                        # Forward-thread mode: the scheduler thread may already be
+                        # preparing the next decode step (seq_lens += 1) while this
+                        # thread sits in the blocking graph launch, so read seq_lens
+                        # BEFORE the forward and publish that value afterwards.
+                        _next_seq_lens = (
+                            batch.seq_lens + 1
+                            if (_PRISM_FORWARD_THREAD and batch.spec_algorithm.is_none())
+                            else None
+                        )
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
                         if batch.spec_algorithm.is_none():
-                            self.future_map.publish(future_indices, batch.seq_lens + 1)
+                            self.future_map.publish(
+                                future_indices,
+                                _next_seq_lens if _next_seq_lens is not None else batch.seq_lens + 1,
+                            )
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
                         # ring slot as the SB attr snapshot).
@@ -3746,7 +3927,9 @@ class Scheduler(
                         else:
                             batch_result.future_indices = future_indices
 
-                # Next-iter input_ids relayed via future_map.
+                # Next-iter input_ids relayed via future_map. (Also in forward-thread
+                # mode: the scheduler waits for run_batch to return before it touches
+                # this batch again, so clearing here cannot race.)
                 batch.input_ids = None
 
                 if not batch.spec_algorithm.is_none():
