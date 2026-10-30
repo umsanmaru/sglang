@@ -362,13 +362,17 @@ class PrismExecutor:
         self._tiers[layer_idx] = build_layer_tiers(
             prepared, self._plan, layer_idx, cold_gpu=cold_gpu,
             warm_kt=warm_kt, warm_kt_calib=warm_kt_calib)
+        # load_warm_layer가 이 원본 텐서를 이미 C++ slab으로 pack했고, 티어 구성이
+        # 그 calib을 방금 소비했다. executor가 층마다 warm full weight 사본을 하나
+        # 더 들고 있으면 안 된다 — 티어 구성이 실패하면 호출자가 재시도할 수 있게 남긴다.
+        if prepared.warm_kt is not None:
+            prepared.warm_kt = None
         self._layer_has_cold[layer_idx] = has_cold
         if self._mask_stats is not None:
             self._mask_stats.register_layer(layer_idx)
         self._layer_cold_gpu[layer_idx] = cold_gpu is not None
         self._layer_warm_kt[layer_idx] = warm_kt is not None
 
-    # ── 모드 결정 ──────────────────────────────────────────────────────────
     # ── 모드 결정 ──────────────────────────────────────────────────────────
     def _plan_cold_channel(self, m: int, topk_ids: torch.Tensor, *,
                            needs_host_ids: bool = True) -> _ColdChannel:
