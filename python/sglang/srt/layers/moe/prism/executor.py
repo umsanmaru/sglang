@@ -369,8 +369,14 @@ class PrismExecutor:
 
     # ── 모드 결정 ──────────────────────────────────────────────────────────
     # ── 모드 결정 ──────────────────────────────────────────────────────────
-    def _plan_cold_channel(self, m: int, topk_ids: torch.Tensor) -> _ColdChannel:
-        """cold 호출을 내보낼 통로를 고른다 (graph-safe 여부와 그 귀결)."""
+    def _plan_cold_channel(self, m: int, topk_ids: torch.Tensor, *,
+                           needs_host_ids: bool = True) -> _ColdChannel:
+        """cold 호출을 내보낼 통로를 고른다 (graph-safe 여부와 그 귀결).
+
+        needs_host_ids=False는 "이 호출에 expert_ids의 host 소비자가 없다"는 뜻이다
+        (순수 GPU prefill: cold가 GPU로 가고 hybrid·warm-CPU도 없다). 그때 blocking
+        D2H는 큐에 쌓인 GPU 작업을 비우기만 하므로 건너뛴다 (qwen 레인, 2026-10-30).
+        """
         graph_flow = (
             torch.cuda.is_current_stream_capturing()
             or self._force_graph_path
@@ -395,7 +401,7 @@ class PrismExecutor:
         # 순수 eager(스트림 통합 없음): cold가 expert_ids를 host에서 읽으므로 blocking
         # D2H 1회. 그 blocking이 뒤따르는 host 쓰기(qlen_pin)의 사실상 throttle이다
         # (계약 ④ Task8-3). cold_async는 자기 stream에서 async로 내린다.
-        if self._cold_async:
+        if self._cold_async or not needs_host_ids:
             ids_cpu = None
         else:
             with _nvtx("s1.topk_d2h"):
@@ -445,7 +451,25 @@ class PrismExecutor:
         여기 한곳에 모여 있다.
         """
         dims = self._plan.dims
-        channel = self._plan_cold_channel(m, topk_ids)
+        # D2H가 필요한지는 통로를 열기 **전에** 안다: cold가 GPU로 가고 hybrid·warm-CPU가
+        # 없으면 host는 expert_ids를 읽지 않는다. 아래 cold_on_gpu/cpu_warm과 같은 식이다
+        # (grouping은 m >= grouped_min_m과 동치).
+        has_cold_rows = self._layer_has_cold[layer_idx]
+        cold_gpu_pre = bool(
+            has_cold_rows and m >= self._grouped_min_m
+            and self._cold_gpu_min_m is not None and m >= self._cold_gpu_min_m
+            and self._layer_cold_gpu[layer_idx]
+        )
+        warm_cpu_pre = bool(
+            self._layer_warm_kt.get(layer_idx, False)
+            and ((self._warm_cpu_max_m is not None and 1 < m < self._warm_cpu_max_m)
+                 or (self._warm_cpu_min_m is not None and m >= self._warm_cpu_min_m))
+        )
+        channel = self._plan_cold_channel(
+            m, topk_ids,
+            needs_host_ids=((has_cold_rows and not cold_gpu_pre)
+                            or self._hybrid_frac is not None or warm_cpu_pre),
+        )
 
         # sparsity (계약 ①): cold만, decode에서만 (prefill-dense).
         masking = self._sparse and m == 1
@@ -463,7 +487,6 @@ class PrismExecutor:
         # cold를 GPU가 읽는가 (대배치 prefill). 이 결정 하나가 "cold partial을
         # CPU와 GPU가 둘 다 내는" 이중계산을 막는다 — hybrid만이 예외이고,
         # 거기서는 두 partial의 (m, j) 행이 서로소다.
-        has_cold_rows = self._layer_has_cold[layer_idx]
         cold_on_gpu = bool(
             has_cold_rows and grouping is not None
             and self._cold_gpu_min_m is not None and m >= self._cold_gpu_min_m

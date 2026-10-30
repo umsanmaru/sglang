@@ -112,7 +112,7 @@ class ColdCpuProfiler:
                  threads: Optional[int] = None,
                  cpu_kernel: Optional[str] = None, dtype: str = "bf16",
                  seed: int = 0, numa_map: Optional[Sequence[int]] = None,
-                 m: int = 1):
+                 m: int = 1, max_len=None, sparse: bool = True):
         """`sparsity=None`은 kt **dense 경로**다 — 테이블을 설치하지 않으므로 마스크
         빌드·plan 인코딩이 없다. `sparsity=0.0`(전부 살리는 sparse 경로)과 다른 코드
         경로이고, dense 레인(`srt/layers/prism/linear`)의 cold가 부르는 것은 이쪽이다.
@@ -122,6 +122,11 @@ class ColdCpuProfiler:
         `sparsity=None`이어야 한다. 모든 토큰이 같은 expert 집합을 쓴다 — dense 레인은
         한 호출에 슬롯 하나이고, MoE prefill의 토큰별 라우팅은 여기서 흉내내지 않는다.
         """
+        # 호환 별칭 (prism-eval/runs/bench_cold_prefill.py): max_len → m, sparse=False → sparsity=None.
+        if max_len is not None:
+            m = int(max_len)
+        if not sparse:
+            sparsity = None
         from kt_kernel import kt_kernel_ext
         from kt_kernel.experts_partial import PartialMoEWrapper
 
@@ -256,7 +261,7 @@ class ColdCpuProfiler:
                          down_scale=scales["down"]))
         self.wrapper.load_weights_from_tensors(
             weights["gate"], weights["up"], weights["down"],
-            sparsity_tables=tables, **scale_kw)
+            **({"sparsity_tables": tables} if sparse else {}), **scale_kw)
 
     def close(self) -> None:
         self.wrapper = None

@@ -724,23 +724,16 @@ def _cold_flat_rows(src: torch.Tensor, ti: TierIndex, real_rows, tile: int, *, p
     if (ti.contiguous and E and all(int(r) == kr0 for r in real_rows) and kr0 and pad[0] == kr0):
         start = int(ti.idx[0])   # ti는 이미 행 단위(div로 나눈) 인덱스다
         rlen = kr0 // div
-        if bool(torch.all(ti.row_off[1:] - ti.row_off[:-1] == rlen)):
+        starts = ti.idx.to(torch.int64)[ti.row_off[:-1].long()]
+        if bool(torch.all(ti.row_off[1:] - ti.row_off[:-1] == rlen)) and bool(torch.all(starts == start)):
             flat = src[:, :, start: start + rlen].contiguous().reshape(-1)
             idx = (torch.arange(kr0, dtype=torch.int64) + start).repeat(E) if div == 1 \
                 else torch.zeros(total_k, dtype=torch.int64)
             return flat, off, idx, real_t
-    flat = torch.full((total_k // div * N,), pad_value, dtype=src.dtype)
-    idx = torch.zeros(total_k, dtype=torch.int64)
-    for e in range(E):
-        kr, kp, o0 = int(real_rows[e]), pad[e], int(off[e])
-        if kr == 0:
-            continue
-        rows = ti.idx[int(ti.row_off[e]): int(ti.row_off[e]) + kr // div].to(torch.int64)
-        if div == 1:
-            idx[o0: o0 + kr] = rows
-        blk = flat[(o0 // div) * N: ((o0 + kp) // div) * N].view(N, kp // div)
-        blk[:, : kr // div] = src[e].index_select(1, rows)
-    return flat.contiguous(), off, idx, real_t
+    from sglang.srt.layers.moe.prism.loading_gather import gather_padded_columns
+
+    return gather_padded_columns(src, ti, real_rows, tile, pad_value=pad_value, div=div)
+
 
 
 def _tensor_view(ptr: int, nbytes: int, dtype: torch.dtype) -> torch.Tensor:

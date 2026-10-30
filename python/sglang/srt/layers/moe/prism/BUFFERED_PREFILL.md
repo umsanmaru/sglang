@@ -1,55 +1,109 @@
-# Bounded bf16 prefill (2026-09-09)
+# BF16 prefill in the Qwen runtime
 
-The bf16 runtime defaults to packed warm weights (`SGLANG_PRISM_WARM_KT=1`).
-Warm prefill runs on CPU for `1 < M < 1536`, including stream and graph execution.
-At `M >= 1536`, warm and cold packed weights use GPU staging and grouped GEMM.
-The existing decode path at `M=1` remains in place. Explicit cold-GPU thresholds,
-warm-KT opt-out, and the legacy warm-CPU minimum override retain their meanings.
+Implementation: `sglang.jit_kernel.prism_prefill`, dispatched by
+`prism_grouped`. This change is in **sglang-qwen**, the tree used by the measured
+Qwen lane. No checkpoint loading is needed for its microbenchmarks.
 
-`prism_buffered.grouped_packed_buffered` allocates one arena with capacity
-`top_k * aligned(max_expert_projection_elements)` bf16 elements. Each batch
-contains at most top-k consecutive experts; their contiguous host range is copied
-with one DMA. Gate and up reuse the same arena, as do subsequent batches. Copies
-and GEMMs run on the caller's stream, so a slot is overwritten only after its
-consumer finishes. There is no second weight buffer and no copy/compute overlap
-within this stream.
+## Execution and memory
 
-The packed GEMM reads the device arena using its original layout. Grouping retains
-global pair coordinates, but tile offsets and weight offsets are rebased for each
-batch. Variable K, empty experts, expert masks and partial final batches are
-supported. Shared memory stays at the ordinary fixed GEMM tile size (about 35 KiB),
-and the Wres `[M * top_k, output_width]` fp32 scratch is not allocated. Normal
-activation/output tensors and small grouping metadata still scale with token count.
+The eager BF16 path builds one CPU schedule from the existing device Grouping
+(offsets and hybrid masks). The schedule is shared across projections/tier
+calls for that forward. It sorts active experts by token count to reduce BMM
+padding. Inactive or CPU-masked experts are never staged.
 
-This implementation targets **bf16 packed stores**. FP8/MXFP4 dispatch is unchanged.
-Warm-KT retains its existing requirement for warm rows on gate, up and down;
-plans with warm on only some projections must keep `SGLANG_PRISM_WARM_KT=0`.
-Staging currently copies inactive experts too; it avoids a routing D2H sync.
+One device arena holds exactly `top_k` expert slots. Its element capacity is
+`top_k * max(max(32, K_max) * N)` over the projections in a call. For the measured
+K=1952, N=320, top-k=10 projection it holds 6,246,400 BF16 elements (12,492,800
+bytes). GU projections reuse the arena. This bound describes **weight staging**;
+inputs, outputs and activation workspaces are separate.
 
-## Validation
+A Triton staging kernel reads registered host storage in physical byte order
+and writes row-major KxN device weights. It decodes either legacy KT tiles or
+BufferBNC tiles during this copy. There is no full device weight bank, second
+packed device buffer, or extra host weight copy. Gathering happens once per
+expert/row chunk, using that expert's own K indices. cuBLAS BMM consumes the
+contiguous inputs and weights, and scatter writes the original pair positions.
+K differs across experts and GU projections; padding is zero-filled. Activation
+chunks have at most 1024 rows per slot, independent of prompt length.
 
-CUDA tests compare staged packed GEMM against independently packed indexed weights
-with exact integer inputs, variable/zero K, skewed routing, E not divisible by
-top-k, gate/up reuse, pair-indexed down input, and graph replay. An allocation
-check verifies that fused gate/up requests only one top-k-sized weight arena.
-Executor tests check the CPU/GPU boundary at M=1, 7, 1535 and 1536 in eager and
-stream mode, plus small-prefill CPU graph replay.
+Optional overlap splits the **same** arena into ceil(top-k/2) and floor(top-k/2)
+slots. CUDA events prevent overwriting a bank still consumed by GEMM. Sequential
+staging is the default because 5+5 overlap did not improve the measured cases.
+The caller stream owns temporary allocations and joins every staging write
+before reuse/release. CUDA graph capture keeps the previous GPU kernels.
 
-Synthetic benchmark on RTX 5090, bf16, E=32, top-k=8, K=N=1024, one projection:
+## Default policy
 
-| M | Wres time | Buffered time | Wres temporary GPU memory | Buffered temporary GPU memory |
-|---|---:|---:|---:|---:|
-| 1536 | 1.935 ms | 2.418 ms | 48 MiB | 16.002 MiB |
-| 3072 | 3.253 ms | 3.129 ms | 96 MiB | 16.002 MiB |
+- Eligible BF16 plans automatically prepare warm KT storage when cold GPU views
+  are enabled and all three projections have some warm rows. Explicit WARM_KT
+  settings take precedence. This replaces the previous row-major warm store.
+- Eager grouped prefill below M=1536 computes warm on CPU. Decode keeps the GPU
+  GEMV path. Existing stream/graph restrictions of the CPU path still apply.
+- At M>=1536 warm and cold compute on GPU. Buffered BMM is selected when the
+  largest active expert has at least 256 routed pairs. If every expert has fewer
+  pairs, the existing UVA Wres kernel remains faster in measurements and is
+  retained. The 256 threshold is an empirical heuristic, not a universal
+  crossover claim.
 
-Outputs matched exactly in both benchmark cases. These are five-iteration CUDA
-event averages after two warmups, not full-model TTFT results. Staging bounds
-memory but does not improve latency at every M.
+The installed TileK2 BF16 MoE producer uses N-contiguous tile order. ColdSlab now
+records this explicitly, and both grouped and packed GEMV (dense/sparse) loaders
+interpret it correctly, including paths that do not use buffering.
 
-Reproduce with the repository Python package on `PYTHONPATH` and a CUDA/kt-capable
-environment:
+For an expert with warm rows on only one GU side, the absent side is represented
+by a zero weight tile. The KT adapter exposes a zero-valued dummy pair to satisfy
+its `padding < one tile` validation; calibration and shard real_rows remain zero.
+No nonzero weight or contribution is introduced. This handles the warm-CPU
+startup failure observed in the nonuniform Qwen plan without rebuilding KT.
+
+## Controls
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `SGLANG_PRISM_BUFFERED_PREFILL` | `auto` | `0`: old GPU path; `1`: force new path above minimum M; `auto`: apply expert-row heuristic |
+| `SGLANG_PRISM_BUFFERED_MIN_M` | `1536` | Minimum M for buffered GPU dispatch |
+| `SGLANG_PRISM_BUFFERED_OVERLAP` | `0` | `1`: split the same top-k slots into two banks |
+| `SGLANG_PRISM_BUFFERED_STAGE_BLOCKS` | `0` | Optional staging CTA cap; 0 is unlimited. GEMM itself is not capped. |
+| `SGLANG_PRISM_WARM_KT` | automatic | `0` retains row-major warm GPU storage; `1` requires warm KT storage |
+| `SGLANG_PRISM_WARM_CPU_MAX_M` | `1536` | Exclusive upper bound for eager grouped warm CPU; 0 disables it |
+
+The existing explicit `WARM_CPU_MIN_M` setting preserves its legacy behavior and
+suppresses the default maximum. Cold GPU switching still honors
+`SGLANG_PRISM_COLD_GPU_MIN_M`.
+
+## Validation and limitations
+
+`test_buffered_bmm.py` covers shuffled expert-specific K, variable/zero K, both KT
+layouts, tail batches, top-k=1, odd top-k overlap, row chunking, projection reuse,
+hybrid masks, caller side streams, dense/sparse packed runtime, and the warm
+CPU/GPU boundary with one-sided empty GU. The relevant suite passed 97 tests;
+6 pre-existing cold_async tests are explicitly disabled for their ordering bug.
+
+Microbenchmarks include actual host weight reads, decode-to-row-major, gather,
+BMM and scatter. Fresh-schedule results also include the one D2H scheduling
+step. Grouping construction is shared by both paths and outside these timings.
+Timings are after JIT/warmup. First-use Triton compilation is not represented.
+The benchmarks use synthetic routing/weights; no full-model TTFT is claimed.
+
+From the workspace root, run with the prism-glm Python environment:
 
 ```bash
-python -m pytest -q test/prism/test_buffered_prefill.py test/prism/test_grouped_gemm.py test/prism/test_executor.py
-python test/prism/bench_buffered_prefill.py
+PYTHONPATH=sglang-qwen/python python scripts/bench_buffered_bmm.py \
+  --m 4148 --active 64 --output results/prefill-diagnosis/buffered_bmm_final_m4148.json
+PYTHONPATH=sglang-qwen/python python scripts/bench_buffered_bmm.py \
+  --m 8244 --active 512 --hot-active 64 \
+  --output results/prefill-diagnosis/buffered_bmm_all512_hot64.json
 ```
+
+Bind the process/memory to the GPU-local NUMA node for comparable PCIe timings.
+The benchmark explicitly calls each implementation and disables auto dispatch
+for the Wres baseline; the new implementation is measured even where `auto`
+would retain Wres. Full measurements and rejected tuning variants are in
+`results/prefill-diagnosis/` at the workspace root.
+
+## Legacy module: `prism_buffered` (2026-09-09, from the fork tree)
+
+`sglang.jit_kernel.prism_buffered.grouped_packed_buffered` is the earlier bounded
+arena + packed grouped-GEMM staging that the fork tree (`prism-orchestration`)
+carried. It is **not dispatched** by `prism_grouped` any more; the Qwen-lane
+`prism_prefill` path above replaced it (2026-10-30 consolidation). The module and
+`test/prism/test_buffered_prefill.py` are kept as a direct-call reference.

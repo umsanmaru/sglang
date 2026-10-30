@@ -20,6 +20,7 @@ gateup·down·hot·warm이 공유한다 (topk가 같으므로).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 import torch
 
@@ -32,6 +33,17 @@ class Grouping:
     pair_off: torch.Tensor     # int32 [E+1]
     tile_off: torch.Tensor     # int32 [E+1]
     tile_m: int = TILE_M
+
+    @cached_property
+    def prefill_schedule(self):
+        # One small synchronization per eager layer, reused by GU/DN and tiers.
+        # tile_off also encodes hybrid expert masks: never schedule CPU experts.
+        po, to = torch.stack((self.pair_off, self.tile_off)).cpu().tolist()
+        experts = sorted((e for e in range(len(po) - 1)
+                          if po[e + 1] > po[e] and to[e + 1] > to[e]),
+                         key=lambda e: po[e + 1] - po[e], reverse=True)
+        ids = torch.tensor(experts, dtype=torch.int32, device=self.pair_off.device)
+        return ids, tuple(experts), tuple(po[e + 1] - po[e] for e in experts)
 
 
 def build_grouping(topk_ids: torch.Tensor, num_experts: int,

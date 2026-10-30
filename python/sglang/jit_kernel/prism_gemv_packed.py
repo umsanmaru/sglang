@@ -42,12 +42,13 @@ def gemv_packed(x2d, topk_ids, slab, out3d, out_col_offset, x_row_is_pair, strea
     with torch.cuda.stream(stream):
         module.gemv_packed(x2d, topk_ids, out3d, slab.slab, slab.blk_off, slab.row_off,
                            slab.k_index, int(out_col_offset) + int(slab.n_start), int(slab.n),
-                           int(slab.n_block), int(slab.k_block), int(bool(x_row_is_pair)))
+                           int(slab.n_block), int(slab.k_block), int(bool(x_row_is_pair)),
+                           int(slab.layout == "kt_bf16_nc"))
 
 
 def gemv_packed_gateup(x2d, topk_ids, gate, up, out3d, out_col_gate, out_col_up,
                        x_row_is_pair, stream) -> None:
-    if (gate.n, gate.n_start, gate.n_block, gate.k_block) != (up.n, up.n_start, up.n_block, up.k_block):
+    if (gate.n, gate.n_start, gate.n_block, gate.k_block, gate.layout) != (up.n, up.n_start, up.n_block, up.k_block, up.layout):
         raise ValueError("packed gateup fusion requires gate/up slabs of the same node instance")
     module = _jit_prism_gemv_packed_module()
     with torch.cuda.stream(stream):
@@ -56,7 +57,8 @@ def gemv_packed_gateup(x2d, topk_ids, gate, up, out3d, out_col_gate, out_col_up,
             gate.slab, gate.blk_off, gate.row_off, gate.k_index,
             up.slab, up.blk_off, up.row_off, up.k_index,
             int(out_col_gate) + int(gate.n_start), int(out_col_up) + int(up.n_start),
-            int(gate.n), int(gate.n_block), int(gate.k_block), int(bool(x_row_is_pair)))
+            int(gate.n), int(gate.n_block), int(gate.k_block), int(bool(x_row_is_pair)),
+            int(gate.layout == "kt_bf16_nc"))
 
 
 def gemv_packed_sparse(x2d, topk_ids, topk_weights, slab, sp, out3d, out_col_offset,
@@ -69,7 +71,7 @@ def gemv_packed_sparse(x2d, topk_ids, topk_weights, slab, sp, out3d, out_col_off
             sp.a, sp.c, sp.thr, topk_weights,
             int(out_col_offset) + int(slab.n_start), int(slab.n), int(slab.n_block), int(slab.k_block),
             int(bool(x_row_is_pair)), float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid),
-            int(sp.ng), int(sp.renorm_it))
+            int(sp.ng), int(sp.renorm_it), int(slab.layout == "kt_bf16_nc"))
 
 
 def gemv_packed_sparse_gateup(x2d, topk_ids, topk_weights, gate, up, sp_gate, sp_up, out3d,
@@ -87,4 +89,4 @@ def gemv_packed_sparse_gateup(x2d, topk_ids, topk_weights, gate, up, sp_gate, sp
             int(out_col_gate) + int(gate.n_start), int(out_col_up) + int(up.n_start),
             int(gate.n), int(gate.n_block), int(gate.k_block), int(bool(x_row_is_pair)),
             float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
-            float(sp_gate.pmax), float(sp_gate.grid), int(sp_gate.ng), int(sp_gate.renorm_it))
+            float(sp_gate.pmax), float(sp_gate.grid), int(sp_gate.ng), int(sp_gate.renorm_it), int(gate.layout == "kt_bf16_nc"))
