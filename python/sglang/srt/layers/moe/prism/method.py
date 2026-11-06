@@ -26,7 +26,6 @@ TP: MoE-TP owner(rank 0)만 expert를 갖고 나머지 rank는 0을 낸다 (is_t
 from __future__ import annotations
 
 import logging
-import os
 from typing import Optional
 
 import torch
@@ -35,89 +34,58 @@ from sglang.srt.layers.moe.prism.activation import Activation
 from sglang.srt.layers.moe.prism.plan import Plan, PlanError, Proj, Tier, parse_plan, validate_static
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 
-logger = logging.getLogger(__name__)
+from sglang.srt.layers.moe.prism.runtime.config import (
+    PrismEnvConfig,
+    _ENV_PLAN as _ENV_PLAN,
+    _ENV_MAX_TOKENS as _ENV_MAX_TOKENS,
+    _ENV_CPUINFER as _ENV_CPUINFER,
+    _ENV_NUMA_MAP as _ENV_NUMA_MAP,
+    _ENV_COLD_STREAM as _ENV_COLD_STREAM,
+    _ENV_GROUPED_MIN_M as _ENV_GROUPED_MIN_M,
+    _ENV_SPLIT_STREAMS as _ENV_SPLIT_STREAMS,
+    _ENV_COLD_GPU_MIN_M as _ENV_COLD_GPU_MIN_M,
+    _ENV_COLD_HYBRID_FRAC as _ENV_COLD_HYBRID_FRAC,
+    _ENV_WARM_KT as _ENV_WARM_KT,
+    _ENV_WARM_CPU_MIN_M as _ENV_WARM_CPU_MIN_M,
+    _ENV_WARM_CPU_MAX_M as _ENV_WARM_CPU_MAX_M,
+    _ENV_COLD_ASYNC as _ENV_COLD_ASYNC,
+    _ENV_COLD_SPLIT as _ENV_COLD_SPLIT,
+    _ENV_LOAD_THREADS as _ENV_LOAD_THREADS,
+    _ENV_MASK_STATS as _ENV_MASK_STATS,
+    _ENV_MASK_STATS_EVERY as _ENV_MASK_STATS_EVERY,
+    _ENV_MASK_STATS_NANPROBE as _ENV_MASK_STATS_NANPROBE,
+)
 
-_ENV_PLAN = "SGLANG_PRISM_PLAN"
-_ENV_MAX_TOKENS = "SGLANG_PRISM_MAX_TOKENS"
-_ENV_CPUINFER = "SGLANG_PRISM_CPUINFER_THREADS"
-# 실험 노브: 콤마 구분 NUMA node id 리스트 (예: "1" = node 1 단독).
-# 설정 시 subpool을 그 노드들에만 만들고, plan의 shard "node i"는
-# i번째 서브풀(= 리스트의 i번째 실제 노드)로 매핑된다. 미설정 = 전 노드.
-_ENV_NUMA_MAP = "SGLANG_PRISM_NUMA_MAP"
-# eager에서도 cold submit/sync를 stream host node로 보내는 opt-in.
-# (graph 경로는 env와 무관하게 항상 stream 통합 — executor 참조.)
-_ENV_COLD_STREAM = "SGLANG_PRISM_COLD_STREAM"
-# prefill grouped GEMM 임계 M (미설정 = executor 기본값). 벤치·회귀 비교용 노브.
-_ENV_GROUPED_MIN_M = "SGLANG_PRISM_GROUPED_MIN_M"
-# grouped 경로에서 hot/warm 스트림 분리 (기본 1). "0"으로 끄면 직렬 발행.
-_ENV_SPLIT_STREAMS = "SGLANG_PRISM_SPLIT_STREAMS"
-# 이 M 이상의 prefill에서 cold를 GPU가 packed slab 제자리 읽기로 계산.
-# 미설정 = executor.COLD_GPU_MIN_M(실측 교차점), "0" = 끔 (slab host-register도 안 함
-# — 등록은 cold 전량을 pinned로 만들어 프로세스 수명 동안 잠근다).
-_ENV_COLD_GPU_MIN_M = "SGLANG_PRISM_COLD_GPU_MIN_M"
-# cold hybrid: cold GPU 조건에서 expert의 이 비율만 GPU, 나머지 CPU 동시 계산 (미설정 = 끔).
-_ENV_COLD_HYBRID_FRAC = "SGLANG_PRISM_COLD_HYBRID_FRAC"
-# warm을 kt 포맷 slab(pinned) 한 벌로 (row-major pinned 대신). GPU는 packed GEMV /
-# cold-layout grouped로 읽는다. bf16은 기본 ON; GPU view가 필요하다.
-_ENV_WARM_KT = "SGLANG_PRISM_WARM_KT"
-# 명시적 실험 override: 이 M 이상 warm CPU. bf16 미설정 기본은 1 < M < 1536 CPU.
-_ENV_WARM_CPU_MIN_M = "SGLANG_PRISM_WARM_CPU_MIN_M"
-_ENV_WARM_CPU_MAX_M = "SGLANG_PRISM_WARM_CPU_MAX_M"
-# cold를 전용 stream + 플래그 wait로 (블로킹 콜백 없음). eager 전용. hybrid와 동시 불가.
-_ENV_COLD_ASYNC = "SGLANG_PRISM_COLD_ASYNC"
-# cold submit/sync host node를 곁 스트림에 얹는다 (P2). graph decode에서
-# sync가 hot/warm 커널 완료를 기다리던 가짜 의존을 끊는다 — 실측 down phase −31%.
-_ENV_COLD_SPLIT = "SGLANG_PRISM_COLD_SPLIT"
-# 로딩 훅(process_weights_after_loading)의 torch intra-op 스레드 수. model_runner가
-# load_model 진입부에서 전역 1로 고정하는데(평범한 로딩의 memcpy 스레드 경합 방지),
-# prism의 훅은 memcpy가 아니라 층당 3.4 GB를 훑는 K-슬라이스 repack이라 그 값이
-# 그대로 병목이 된다 (실측 1스레드 4.0 s vs 16스레드 0.87 s = 4.7×).
-# 미설정 = 물리 코어 수(HT 제외). cold_load 시점의 kt 워커들은 50 ms 뒤 condvar에서
-# 잠들므로(worker_pool.cpp) prepare 구간에 코어를 다 써도 경합하지 않는다.
-_ENV_LOAD_THREADS = "SGLANG_PRISM_LOAD_THREADS"
-# effective sparsity 실측 (mask_stats.py): 출력 json 경로. sparse plan + eager decode에서만 값이 쌓인다.
-_ENV_MASK_STATS = "SGLANG_PRISM_MASK_STATS"
-_ENV_MASK_STATS_EVERY = "SGLANG_PRISM_MASK_STATS_EVERY"
-# NaN 진단: 층 입력/act의 유한성을 prefill 포함해 검사 (층당 GPU 리덕션 + 동기).
-_ENV_MASK_STATS_NANPROBE = "SGLANG_PRISM_MASK_STATS_NANPROBE"
+# Keep legacy environment-name imports available to profilers and tests.
+logger = logging.getLogger(__name__)
+_CONFIG = PrismEnvConfig()
 
 
 def _load_threads() -> int:
-    default = max(1, (os.cpu_count() or 4) // 2)
-    return max(1, int(os.environ.get(_ENV_LOAD_THREADS, str(default))))
+    return _CONFIG.load_threads()
 
 
 def _hybrid_local_node(device) -> int:
     from sglang.srt.layers.moe.prism.numa import gpu_numa_node
 
-    phys = gpu_numa_node(device)
-    numa_map = os.environ.get(_ENV_NUMA_MAP)
-    if numa_map:
-        nodes = [int(x) for x in numa_map.split(",")]
-        return nodes.index(phys) if phys in nodes else 0
-    return phys
+    return _CONFIG.hybrid_local_node(gpu_numa_node(device))
 
 
 def _cold_gpu_min_m():
     from sglang.srt.layers.moe.prism.executor import PrismExecutor
 
-    raw = os.environ.get(_ENV_COLD_GPU_MIN_M)
-    if raw is None:
-        # 기본값은 스토어 포맷이 정한다 (bf16: 실측 교차점, mxfp4/fp8: grouped 경계 = CPU prefill 없음).
-        gmin = os.environ.get(_ENV_GROUPED_MIN_M)
+    def default(grouped_min_m):
         return _get_runtime().fmt.default_cold_gpu_min_m(
             PrismExecutor.COLD_GPU_MIN_M,
-            PrismExecutor.GROUPED_MIN_M if gmin is None else int(gmin))
-    v = int(raw)
-    return None if v <= 0 else v
+            PrismExecutor.GROUPED_MIN_M if grouped_min_m is None
+            else _CONFIG.parse_grouped_min_m(grouped_min_m))
+
+    return _CONFIG.cold_gpu_min_m(default)
 
 
 def _warm_kt_enabled(fmt, *, has_cold: bool = True, all_proj_warm: bool = True):
-    """warm 스토어를 kt 포맷(packed host)으로 둘지. 명시 env가 우선이고, 자동 기본값은
-    bf16 + cold-GPU 경로 + cold 존재 + 세 proj 모두 warm 행 존재일 때만 "1"이다."""
-    auto = (fmt.name == "bf16" and _cold_gpu_min_m() is not None
-            and has_cold and all_proj_warm)
-    return os.environ.get(_ENV_WARM_KT, "1" if auto else "0") == "1"
+    return _CONFIG.warm_kt_enabled(
+        fmt.name, _cold_gpu_min_m, has_cold=has_cold, all_proj_warm=all_proj_warm)
 
 
 def _sglang_capture_mode() -> bool:
@@ -181,7 +149,7 @@ class _PrismRuntime:
         # sparsity 점수·threshold 테이블 (dense plan이면 None). 프로세스에 1벌 —
         # 레이어마다 다시 열면 382MB 자산을 40번 읽게 된다.
         self.calib = calib
-        self.max_tokens = int(os.environ.get(_ENV_MAX_TOKENS, "4096"))
+        self.max_tokens = _CONFIG.max_tokens
         self._resources = None
         self._cold = None
         self._executor = None
@@ -210,36 +178,31 @@ class _PrismRuntime:
             self._resources = ExecutionResources(spec)
             # 조립 지점: env·runner 같은 외부 입력은 전부 여기서 읽어 명시
             # 인자로 주입한다 (executor는 hidden input 없음).
-            gmin = os.environ.get(_ENV_GROUPED_MIN_M)
+            gmin = _CONFIG.grouped_min_m_raw
             mask_stats = None
-            if os.environ.get(_ENV_MASK_STATS):
+            if _CONFIG.mask_stats_path:
                 from sglang.srt.layers.moe.prism.mask_stats import MaskStats
 
-                mask_stats = MaskStats(self.plan, self.calib, os.environ[_ENV_MASK_STATS],
-                                       every=int(os.environ.get(_ENV_MASK_STATS_EVERY, "16")),
-                                       nan_probe=os.environ.get(_ENV_MASK_STATS_NANPROBE) == "1")
+                mask_stats = MaskStats(self.plan, self.calib, _CONFIG.mask_stats_path,
+                                       every=_CONFIG.mask_stats_every,
+                                       nan_probe=_CONFIG.mask_stats_nan_probe)
             self._executor = PrismExecutor(
                 self.plan, self._resources,
                 self.cold() if (self.has_cold or
                                 (self.has_warm and _warm_kt_enabled(self.fmt))) else None,
-                cold_stream=os.environ.get(_ENV_COLD_STREAM) == "1",
+                cold_stream=_CONFIG.cold_stream,
                 capture_mode_fn=_sglang_capture_mode,
-                grouped_min_m=None if gmin is None else int(gmin),
-                split_streams=os.environ.get(_ENV_SPLIT_STREAMS, "1") != "0",
+                grouped_min_m=_CONFIG.parse_grouped_min_m(gmin),
+                split_streams=_CONFIG.split_streams,
                 cold_gpu_min_m=_cold_gpu_min_m(),
-                cold_hybrid_frac=(tuple(float(v) for v in os.environ[_ENV_COLD_HYBRID_FRAC].split(","))
-                                  if os.environ.get(_ENV_COLD_HYBRID_FRAC) else None),
+                cold_hybrid_frac=_CONFIG.cold_hybrid_frac,
                 # plan shard 인덱스 중 GPU-local NUMA 노드: NUMA_MAP이 있으면 그 리스트에서 찾고,
                 # 없으면 shard 인덱스 = 물리 노드.
                 hybrid_local_node=_hybrid_local_node(device),
-                warm_cpu_min_m=(int(os.environ[_ENV_WARM_CPU_MIN_M])
-                                if os.environ.get(_ENV_WARM_CPU_MIN_M) else None),
-                warm_cpu_max_m=(int(os.environ.get(_ENV_WARM_CPU_MAX_M,
-                                                    PrismExecutor.COLD_GPU_MIN_M))
-                                if self.fmt.name == "bf16" and not os.environ.get(_ENV_WARM_CPU_MIN_M)
-                                else None),
-                cold_async=os.environ.get(_ENV_COLD_ASYNC) == "1",
-                cold_split=os.environ.get(_ENV_COLD_SPLIT) == "1",
+                warm_cpu_min_m=_CONFIG.warm_cpu_min_m,
+                warm_cpu_max_m=_CONFIG.warm_cpu_max_m(self.fmt.name, PrismExecutor.COLD_GPU_MIN_M),
+                cold_async=_CONFIG.cold_async,
+                cold_split=_CONFIG.cold_split,
                 mask_stats=mask_stats,
             )
         return self._executor
@@ -252,9 +215,8 @@ class _PrismRuntime:
             # 기본값 = 물리 코어 − 2 (HT 제외, 메인/tokenizer 여유).
             # 과다구독은 submit/sync 고정비를 폭증시킨다 (실측 2026-08-20:
             # 물리 16코어에 60스레드 → sync 회당 1.85ms, 14스레드 → 0.05ms).
-            default_threads = max(2, (os.cpu_count() or 4) // 2 - 2)
-            threads = int(os.environ.get(_ENV_CPUINFER, str(default_threads)))
-            numa_map = os.environ.get(_ENV_NUMA_MAP)
+            threads = _CONFIG.cpuinfer_threads
+            numa_map = _CONFIG.numa_map_raw
             # cold GPU 읽기가 켜져 있으면 slab을 이 device에 host-register한다.
             gpu_view_device = (
                 torch.device(torch.cuda.current_device())
@@ -263,7 +225,7 @@ class _PrismRuntime:
             if numa_map:
                 from kt_kernel import kt_kernel_ext
 
-                nodes = [int(x) for x in numa_map.split(",")]
+                nodes = _CONFIG.parse_numa_map(numa_map)
                 cfg = kt_kernel_ext.WorkerPoolConfig()
                 cfg.subpool_count = len(nodes)
                 cfg.subpool_numa_map = nodes
@@ -277,7 +239,7 @@ class _PrismRuntime:
                     num_numa_nodes=len(nodes),
                     cpuinfer=kt_kernel_ext.CPUInfer(cfg),
                     gpu_view_device=gpu_view_device,
-                    hybrid_mask=bool(os.environ.get(_ENV_COLD_HYBRID_FRAC)),
+                    hybrid_mask=_CONFIG.hybrid_mask,
                 )
             else:
                 self._cold = KtColdBackend(
@@ -286,7 +248,7 @@ class _PrismRuntime:
                     num_numa_nodes=numa_node_count(),
                     cpuinfer_threads=threads,
                     gpu_view_device=gpu_view_device,
-                    hybrid_mask=bool(os.environ.get(_ENV_COLD_HYBRID_FRAC)),
+                    hybrid_mask=_CONFIG.hybrid_mask,
                 )
         return self._cold
 
@@ -319,7 +281,7 @@ def is_tp_owner() -> bool:
 def _get_runtime() -> _PrismRuntime:
     global _RUNTIME
     if _RUNTIME is None:
-        plan_path = os.environ[_ENV_PLAN]
+        plan_path = _CONFIG.plan_path
         from sglang.srt.layers.moe.prism.loading_cache import load_plan_cached
 
         import time
@@ -570,7 +532,7 @@ class PrismMoEMethod(FusedMoEMethodBase):
 # ---------------------------------------------------------------------------
 
 def _prism_predicate(layer, server_args):
-    if not os.environ.get(_ENV_PLAN):
+    if not _CONFIG.enabled:
         return None
     return {"layer_id": layer.layer_id}
 
