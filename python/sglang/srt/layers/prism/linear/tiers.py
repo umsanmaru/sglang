@@ -79,6 +79,8 @@ class LinearSparseSpec:
     a: Optional[torch.Tensor] = None
     c: Optional[torch.Tensor] = None
     per_k: bool = False
+    # Keep counter read by the shared sparse GEMV wrappers; the linear path has no controller.
+    ctr: Optional[torch.Tensor] = None
 
 
 def build_part_specs(part, spec, device) -> dict:

@@ -120,6 +120,23 @@ def gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx, out3d,
                                             int(bool(x_row_is_pair)), int(vec))
 
 
+_NO_KEEP_CTR: dict = {}
+
+
+def keep_ctr_arg(sp) -> torch.Tensor:
+    """The spec's keep counter (int64 [2] = {kept, total} on its device), or an empty tensor (off).
+
+    Shared by every sparse GEMV wrapper; the kernels skip counting when the tensor is empty.
+    """
+    if sp.ctr is not None:
+        return sp.ctr
+    dev = sp.thr.device
+    empty = _NO_KEEP_CTR.get(dev)
+    if empty is None:
+        empty = _NO_KEEP_CTR[dev] = torch.empty(0, dtype=torch.int64, device=dev)
+    return empty
+
+
 def _per_k(sp) -> bool:
     """이 spec이 per-k 마스크인가 (k1 또는 k1w1). 없으면 페어(k2wl2)로 본다."""
     return bool(getattr(sp, "per_k", False))
@@ -145,14 +162,15 @@ def _sparse_call(fn, fn_k1, fn_k1w, x2d, topk_ids, topk_weights, w_flat, row_off
         if _per_k_w(sp):
             # score k1w1: a(wn²) + thr. 커널이 x²·a >= thr²로 판정한다.
             fn_k1w(x2d, topk_ids, w_flat, row_off, kidx, out3d, sp.a, sp.thr,
-                   topk_weights, *tail)
+                   topk_weights, keep_ctr_arg(sp), *tail)
             return
         if _per_k(sp):
             # score k1: 진입점이 a/c를 받지 않는다 (마스크가 |x_k| >= thr 하나).
-            fn_k1(x2d, topk_ids, w_flat, row_off, kidx, out3d, sp.thr, topk_weights, *tail)
+            fn_k1(x2d, topk_ids, w_flat, row_off, kidx, out3d, sp.thr, topk_weights,
+            keep_ctr_arg(sp), *tail)
             return
         fn(x2d, topk_ids, w_flat, row_off, kidx, out3d,
-           sp.a, sp.c, sp.thr, topk_weights, *tail)
+           sp.a, sp.c, sp.thr, topk_weights, keep_ctr_arg(sp), *tail)
 
 
 def gemv_worklist_indexed_sparse(x2d, topk_ids, topk_weights, w_flat, row_off,
@@ -245,19 +263,22 @@ def gemv_worklist_indexed_sparse_gateup(
             module.gemv_worklist_indexed_sparsek1w_gateup(
                 x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
                 w_up, row_off_up, kidx_up, out3d,
-                sp_gate.a, sp_gate.thr, sp_up.a, sp_up.thr, topk_weights, *tail)
+                sp_gate.a, sp_gate.thr, sp_up.a, sp_up.thr, topk_weights,
+                keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
             return
         if _per_k(sp_gate):
             module.gemv_worklist_indexed_sparsek1_gateup(
                 x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
                 w_up, row_off_up, kidx_up, out3d,
-                sp_gate.thr, sp_up.thr, topk_weights, *tail)
+                sp_gate.thr, sp_up.thr, topk_weights,
+                keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
             return
         module.gemv_worklist_indexed_sparse_gateup(
             x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
             w_up, row_off_up, kidx_up, out3d,
             sp_gate.a, sp_gate.c, sp_gate.thr,
-            sp_up.a, sp_up.c, sp_up.thr, topk_weights, *tail)
+            sp_up.a, sp_up.c, sp_up.thr, topk_weights,
+            keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
 
 
 def gemv_worklist_indexed_pinned_sparse_gateup(
@@ -286,16 +307,19 @@ def gemv_worklist_indexed_pinned_sparse_gateup(
             module.gemv_worklist_indexed_pinned_sparsek1w_gateup(
                 x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
                 w_up, row_off_up, kidx_up, out3d,
-                sp_gate.a, sp_gate.thr, sp_up.a, sp_up.thr, topk_weights, *tail)
+                sp_gate.a, sp_gate.thr, sp_up.a, sp_up.thr, topk_weights,
+                keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
             return
         if _per_k(sp_gate):
             module.gemv_worklist_indexed_pinned_sparsek1_gateup(
                 x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
                 w_up, row_off_up, kidx_up, out3d,
-                sp_gate.thr, sp_up.thr, topk_weights, *tail)
+                sp_gate.thr, sp_up.thr, topk_weights,
+                keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
             return
         module.gemv_worklist_indexed_pinned_sparse_gateup(
             x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
             w_up, row_off_up, kidx_up, out3d,
             sp_gate.a, sp_gate.c, sp_gate.thr,
-            sp_up.a, sp_up.c, sp_up.thr, topk_weights, *tail)
+            sp_up.a, sp_up.c, sp_up.thr, topk_weights,
+            keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)

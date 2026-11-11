@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.jit_kernel.prism_gemv import keep_ctr_arg
 from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
@@ -100,15 +101,16 @@ def _sparse(name):
             if _per_k_w(sp):
                 getattr(module, name.replace("sparse", "sparsek1w"))(
                     x2d, topk_ids, codes, scales, row_off, kidx, out3d, sp.a, sp.thr,
-                    topk_weights, *tail)
+                    topk_weights, keep_ctr_arg(sp), *tail)
                 return
             if _per_k(sp):
                 getattr(module, name.replace("sparse", "sparsek1"))(
-                    x2d, topk_ids, codes, scales, row_off, kidx, out3d, sp.thr, topk_weights, *tail)
+                    x2d, topk_ids, codes, scales, row_off, kidx, out3d, sp.thr, topk_weights,
+                    keep_ctr_arg(sp), *tail)
             else:
                 getattr(module, name)(
                     x2d, topk_ids, codes, scales, row_off, kidx, out3d,
-                    sp.a, sp.c, sp.thr, topk_weights, *tail)
+                    sp.a, sp.c, sp.thr, topk_weights, keep_ctr_arg(sp), *tail)
     fn.__name__ = name
     return fn
 
@@ -144,12 +146,14 @@ def _sparse_gateup(name):
                 getattr(module, name.replace("sparse", "sparsek1"))(
                     x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
                     codes_u, scales_u, row_off_u, kidx_u, out3d,
-                    sp_gate.thr, sp_up.thr, topk_weights, *tail)
+                    sp_gate.thr, sp_up.thr, topk_weights,
+                    keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
             else:
                 getattr(module, name)(
                     x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
                     codes_u, scales_u, row_off_u, kidx_u, out3d,
-                    sp_gate.a, sp_gate.c, sp_gate.thr, sp_up.a, sp_up.c, sp_up.thr, topk_weights, *tail)
+                    sp_gate.a, sp_gate.c, sp_gate.thr, sp_up.a, sp_up.c, sp_up.thr, topk_weights,
+                    keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
     fn.__name__ = name
     return fn
 

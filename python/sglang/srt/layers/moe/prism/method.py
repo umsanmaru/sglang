@@ -80,6 +80,8 @@ _ENV_MASK_STATS = "SGLANG_PRISM_MASK_STATS"
 _ENV_MASK_STATS_EVERY = "SGLANG_PRISM_MASK_STATS_EVERY"
 # NaN 진단: 층 입력/act의 유한성을 prefill 포함해 검사 (층당 GPU 리덕션 + 동기).
 _ENV_MASK_STATS_NANPROBE = "SGLANG_PRISM_MASK_STATS_NANPROBE"
+# JSON path for the threshold controller's per-window (alpha, sparsity) report, written at exit.
+_ENV_THR_CTRL_LOG = "SGLANG_PRISM_THR_CTRL_LOG"
 
 
 def _load_threads() -> int:
@@ -181,6 +183,12 @@ class _PrismRuntime:
         # sparsity 점수·threshold 테이블 (dense plan이면 None). 프로세스에 1벌 —
         # 레이어마다 다시 열면 382MB 자산을 40번 읽게 된다.
         self.calib = calib
+        # Online threshold controller (thr_ctrl.py); None keeps the calibrated tables fixed.
+        self.thr_ctrl = None
+        if plan.sparsity is not None and plan.sparsity.controller is not None:
+            from sglang.srt.layers.moe.prism.thr_ctrl import ThresholdController
+
+            self.thr_ctrl = ThresholdController(plan, log_path=os.environ.get(_ENV_THR_CTRL_LOG))
         self.max_tokens = int(os.environ.get(_ENV_MAX_TOKENS, "4096"))
         self._resources = None
         self._cold = None
@@ -217,7 +225,8 @@ class _PrismRuntime:
 
                 mask_stats = MaskStats(self.plan, self.calib, os.environ[_ENV_MASK_STATS],
                                        every=int(os.environ.get(_ENV_MASK_STATS_EVERY, "16")),
-                                       nan_probe=os.environ.get(_ENV_MASK_STATS_NANPROBE) == "1")
+                                       nan_probe=os.environ.get(_ENV_MASK_STATS_NANPROBE) == "1",
+                                       thr_ctrl=self.thr_ctrl)
             self._executor = PrismExecutor(
                 self.plan, self._resources,
                 self.cold() if (self.has_cold or
@@ -241,6 +250,7 @@ class _PrismRuntime:
                 cold_async=os.environ.get(_ENV_COLD_ASYNC) == "1",
                 cold_split=os.environ.get(_ENV_COLD_SPLIT) == "1",
                 mask_stats=mask_stats,
+                thr_ctrl=self.thr_ctrl,
             )
         return self._executor
 
@@ -509,9 +519,16 @@ class PrismMoEMethod(FusedMoEMethodBase):
         )
         del full
         _t2 = _time.perf_counter()
+        keep_counter = None
+        if runtime.thr_ctrl is not None:
+            # From here on every consumer reads the controller's live tables, not the calib curves.
+            ctrl_state = runtime.thr_ctrl.register_layer(self.layer_id, prepared.thr, device)
+            prepared.thr = ctrl_state.host_tables()
+            keep_counter = ctrl_state.cpu_ctr
         ep = runtime.plan.expert(self.layer_id, 0)
         if any(ep.proj(p).has_tier(Tier.COLD) for p in Proj):
-            runtime.cold().load_layer(self.layer_id, prepared.cold, prepared.thr)
+            runtime.cold().load_layer(self.layer_id, prepared.cold, prepared.thr,
+                                      keep_counter=keep_counter)
             prepared.cold = None  # 주입 완료 — 소유권은 C++ (계약 ③)
         _t3 = _time.perf_counter()
         if prepared.warm_kt is not None:

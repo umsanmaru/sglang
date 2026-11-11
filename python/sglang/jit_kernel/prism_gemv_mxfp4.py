@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.jit_kernel.prism_gemv import keep_ctr_arg
 from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
@@ -63,7 +64,7 @@ def _sparse(name):
         with torch.cuda.stream(stream):
             getattr(module, name)(
                 x2d, topk_ids, codes, scales, row_off, kidx, out3d,
-                sp.a, sp.c, sp.thr, topk_weights,
+                sp.a, sp.c, sp.thr, topk_weights, keep_ctr_arg(sp),
                 int(out_col_offset), int(bool(x_row_is_pair)),
                 float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid),
                 int(sp.ng), int(sp.renorm_it))
@@ -99,6 +100,7 @@ def _sparse_gateup(name):
                 x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
                 codes_u, scales_u, row_off_u, kidx_u, out3d,
                 sp_gate.a, sp_gate.c, sp_gate.thr, sp_up.a, sp_up.c, sp_up.thr, topk_weights,
+                keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up),
                 int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
                 float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
                 float(sp_gate.pmax), float(sp_gate.grid), int(sp_gate.ng), int(sp_gate.renorm_it))
