@@ -108,12 +108,16 @@ def build_splits(shape: Shape, *, hot_frac: float, warm_frac: float,
                  cold_frac: Optional[float] = None, hot_spread: float = 0.0,
                  warm_spread: float = 0.0, cold_spread: float = 0.0,
                  dtype: str = "bf16", shuffle: bool = False,
-                 seed: int = 0) -> dict:
+                 seed: int = 0, independent_gate_up: bool = False) -> dict:
     """proj별 `ProjSplit`. `cold_frac=None`이면 hot·warm이 안 가진 행 전부가 cold다.
 
     세 티어에 **같은 `seed`** 로 `tier_indices`를 부르고 `skip`을 누적해서 준다 —
     expert e의 순열 하나에서 앞을 hot, 그 다음을 warm, 그 다음을 cold가 갖는다.
     `skip`이 expert마다 다른 것이 핵심이다 (앞 티어의 행 수가 expert마다 다르므로).
+
+    `independent_gate_up`이면 up이 gate와 **다른 순열**을 쓴다 (계약: gate/up 인덱스는
+    독립). False(옛 동작)면 gate와 up이 같은 인덱스를 받아 kt가 pack을 공유하는
+    단일 pack 경로(`dual_pack() == false`)를 탄다 — 컴파일 plan에서는 일반적이지 않다.
     """
     store = store_of(dtype)
     step = store.rows_step()
@@ -139,11 +143,13 @@ def build_splits(shape: Shape, *, hot_frac: float, warm_frac: float,
                 raise ValueError(f"{proj} expert {e}: cold rows {c} < 0")
         skip_w = tuple(hot)
         skip_c = tuple(h + w for h, w in zip(hot, warm))
-        hot_idx, _ = tier_indices(axis, hot, E, skip=0, shuffle=shuffle, seed=seed)
+        # 순열 시드: up만 독립 옵션에서 갈린다 (E개 expert 시드 구간과 겹치지 않게 E만큼 띄운다)
+        ps = seed + (E + 7919 if independent_gate_up and proj == "up" else 0)
+        hot_idx, _ = tier_indices(axis, hot, E, skip=0, shuffle=shuffle, seed=ps)
         warm_idx, _ = tier_indices(axis, warm, E, skip=skip_w, shuffle=shuffle,
-                                   seed=seed)
+                                   seed=ps)
         cold_idx, _ = tier_indices(axis, cold, E, skip=skip_c, shuffle=shuffle,
-                                   seed=seed)
+                                   seed=ps)
         out[proj] = ProjSplit(proj=proj, k_axis=axis, n_cols=shape.n_cols(proj),
                               hot=hot, warm=warm, cold=cold, hot_idx=hot_idx,
                               warm_idx=warm_idx, cold_idx=cold_idx)
@@ -307,7 +313,21 @@ class FullLayerProfiler:
                  cpu_kernel: Optional[str] = None, threads: Optional[int] = None,
                  numa_map: Optional[Sequence[int]] = None,
                  warm_node: Optional[int] = None, shuffle_index: bool = False,
-                 flush_mb: Optional[int] = None, seed: int = 0):
+                 flush_mb: Optional[int] = None, seed: int = 0,
+                 independent_gate_up: bool = True, inputs_in_graph: bool = True,
+                 flush_cold: bool = False, kt_max_len: Optional[int] = None):
+        """런타임과의 대조(`runtime_layer.py`)에서 드러난 차이를 고르는 노브 셋. 앞의 둘은 기본이
+        런타임과 같은 쪽(True)이다 — 옛 동작은 False로 남아 있다. 실측(fp8 E128, 2026-11-17)에서
+        둘 다 이 프로파일러의 구성 간 잡음(down ±10%) 안의 효과였다:
+
+        independent_gate_up — gate/up cold·warm·hot 인덱스를 서로 다른 순열로 (`build_splits`).
+        inputs_in_graph     — cold 입력 D2H(x 또는 act, topk_w)를 executor처럼 **graph 안에서**
+                              매 iteration 내린다. False면 타이밍 밖에서 한 번 채운다.
+        flush_cold          — cold를 포함한 변형에도 L2 flush 차분을 건다. 차분이 낮게 치우친다
+                              (flush가 cold 대기와 겹친다: 실측 layer 248 → 238) — 끄는 것이 맞다.
+        kt_max_len          — kt MOEConfig.max_len과 staging max_tokens. None(옛 동작) = 1.
+                              런타임은 SGLANG_PRISM_MAX_TOKENS(기본 4096)를 둘 다에 쓴다.
+        """
         from sglang.srt.layers.moe.prism.numa import gpu_numa_node
         from sglang.srt.layers.moe.prism.resources import (
             ExecutionResources,
@@ -330,7 +350,9 @@ class FullLayerProfiler:
             shape, hot_frac=hot_frac, warm_frac=warm_frac, cold_frac=cold_frac,
             hot_spread=hot_spread, warm_spread=warm_spread,
             cold_spread=cold_spread, dtype=self.store, shuffle=shuffle_index,
-            seed=seed)
+            seed=seed, independent_gate_up=independent_gate_up)
+        self.inputs_in_graph = inputs_in_graph
+        self.flush_cold = flush_cold
 
         # score는 cold 커널 키가 함의한다 — per-k면 warm GPU도 per-k, 세 티어가 같은 레벨 x를 본다.
         from sglang.srt.layers.moe.prism.profile.common import kernel_mask_per_k, per_k_levels
@@ -353,16 +375,17 @@ class FullLayerProfiler:
                                 warm_rows=self.splits[p].warm_idx,
                                 cold_rows=self.splits[p].cold_idx)
                        for p in PROJS}
+        self.kt_max_len = kt_max_len or 1
         self.cold = ColdTier(
             shape, cold_splits, sparsity=self.sparsity, pattern=mask_pattern,
             seed=seed, numa_split=numa_split, threads=self.threads,
             kernel_key=cpu_kernel, dtype=self.store, numa_map=numa_map,
             rows_per_expert={p: self.splits[p].cold for p in PROJS},
             index_per_expert={p: self.splits[p].cold_idx for p in PROJS},
-            x_levels=self.x_levels)
+            x_levels=self.x_levels, max_len=self.kt_max_len)
 
         self.res = ExecutionResources(ResourceSpec(
-            max_tokens=1, top_k=shape.topk, hidden_size=shape.hidden,
+            max_tokens=self.kt_max_len, top_k=shape.topk, hidden_size=shape.hidden,
             intermediate_size=shape.inter, device=self.device))
         self._qlen = torch.ones(1, dtype=torch.int32).pin_memory()
         self.flush = L2Flush(self.device, flush_mb)
@@ -380,6 +403,9 @@ class FullLayerProfiler:
             "warm_node": self.warm_node, "node_tables": self.cold.node_tables,
             "flush_mb": self.flush.mb, "l2_mb": self.flush.l2_mb,
             "shuffle_index": shuffle_index, "seed": seed,
+            "independent_gate_up": independent_gate_up,
+            "inputs_in_graph": inputs_in_graph, "flush_cold": flush_cold,
+            "kt_max_len": self.kt_max_len,
         }
 
     # ── 수명 ─────────────────────────────────────────────────────────────
@@ -506,6 +532,18 @@ class FullLayerProfiler:
         out_hot = torch.zeros(1, topk, width, dtype=torch.bfloat16, device=dev)
         out_warm = torch.zeros(1, topk, width, dtype=torch.bfloat16, device=dev)
 
+        def stage(i: int) -> None:
+            """cold 입력을 staging에 내린다 — executor의 `fill_inputs`와 같은 비동기 D2H.
+            inputs_in_graph=False면 expert_ids만 (옛 동작: x/act·topk_w는 타이밍 밖)."""
+            if self.inputs_in_graph:
+                if group == "gateup":
+                    st.fill_x(x, non_blocking=True)
+                else:
+                    st.fill_act(x.reshape(1, topk, shape.inter), non_blocking=True)
+            st.fill_expert_ids(ids_dev[i], non_blocking=True)
+            if self.inputs_in_graph and group == "gateup":
+                st.fill_topk_w(tw, non_blocking=True)
+
         def gpu_launch(tiers, out, i: int) -> None:
             if group == "gateup":
                 GpuTier.launch_gateup(tiers["gate"], tiers["up"], x, ids_dev[i],
@@ -530,7 +568,7 @@ class FullLayerProfiler:
 
         def combined(i: int) -> None:
             # executor와 같은 순서: cold를 먼저 던지고 GPU 일을 한 뒤 거둔다.
-            st.fill_expert_ids(ids_dev[i], non_blocking=True)
+            stage(i)
             stream = torch.cuda.current_stream().cuda_stream
             submit(qlen_ptr, topk, st.expert_ids_ptr(), cold_in, cold_out, stream, w_ptr)
             gpu_only(i)
@@ -541,7 +579,7 @@ class FullLayerProfiler:
             # "GPU 일이 cold와 겹쳤는가"의 답이다 — 겹쳤으면 차가 0에 가깝고,
             # 직렬화면 gpu_only만큼 늘어난다. `cold_only`(eager)와의 차는 host
             # node 디스패치 비용이다.
-            st.fill_expert_ids(ids_dev[i], non_blocking=True)
+            stage(i)
             stream = torch.cuda.current_stream().cuda_stream
             submit(qlen_ptr, topk, st.expert_ids_ptr(), cold_in, cold_out, stream, w_ptr)
             self.cold.wrapper.sync(stream)
@@ -563,7 +601,7 @@ class FullLayerProfiler:
             side = self.res.cold_stream
             side.wait_stream(main)                 # x·topk·ids 준비 완료 시점
             with torch.cuda.stream(side):
-                st.fill_expert_ids(ids_dev[i], non_blocking=True)
+                stage(i)
                 ss = side.cuda_stream
                 submit(qlen_ptr, topk, st.expert_ids_ptr(), cold_in, cold_out, ss, w_ptr)
                 self.cold.wrapper.sync(ss)
@@ -578,7 +616,7 @@ class FullLayerProfiler:
             (GPU 안의 hot↔warm 간섭 + warm의 PCIe 읽기가 cold의 host DRAM 대역폭과
             벌이는 경쟁). 스토어·plan은 그대로 두고 launch만 뺀다.
             """
-            st.fill_expert_ids(ids_dev[i], non_blocking=True)
+            stage(i)
             stream = torch.cuda.current_stream().cuda_stream
             submit(qlen_ptr, topk, st.expert_ids_ptr(), cold_in, cold_out, stream, w_ptr)
             hot_only(i)
@@ -604,16 +642,18 @@ class FullLayerProfiler:
         # 더 중요한 것은 **겹침 판정이 뺄셈**이라는 점이다 — `combined − cold_graph`.
         # 한쪽만 차분하면 잡음이 한쪽에만 실려 그 뺄셈이 무의미해진다. 그래서
         # cold를 포함한 넷은 `flush` 인자와 무관하게 항상 flush 없이 잰다.
+        # flush_cold=True면 위 판단을 뒤집는다 (런타임 대조에서 고를 수 있게 노브로 남긴다).
+        fc = flush and self.flush_cold
         VARIANTS = (
             ("hot_only", hot_only, flush),
             ("warm_only", warm_only, flush),
             ("gpu_only", gpu_only, flush),
-            ("cold_graph", cold_graph, False),
-            ("combined_nowarm", combined_nowarm, False),
-            ("combined", combined, False),
-            ("combined_split", combined_split, False),
-            ("layer", _with_rejoin(combined), False),
-            ("layer_split", _with_rejoin(combined_split), False),
+            ("cold_graph", cold_graph, fc),
+            ("combined_nowarm", combined_nowarm, fc),
+            ("combined", combined, fc),
+            ("combined_split", combined_split, fc),
+            ("layer", _with_rejoin(combined), fc),
+            ("layer_split", _with_rejoin(combined_split), fc),
         )
 
         want = (lambda name: not only or name in only)
