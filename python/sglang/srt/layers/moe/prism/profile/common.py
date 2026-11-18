@@ -656,7 +656,8 @@ class Timing:
             us=round(statistics.median(s), 3),
             min_us=round(s[0], 3),
             max_us=round(s[-1], 3),
-            p90_us=round(s[min(len(s) - 1, int(0.9 * len(s)))], 3),
+            # nearest-rank p90: ceil(0.9·n)번째 (1-based). n=10이면 9번째 값이지 최댓값이 아니다.
+            p90_us=round(s[max(0, -(-9 * len(s) // 10) - 1)], 3),
             replays=len(s),
         )
 

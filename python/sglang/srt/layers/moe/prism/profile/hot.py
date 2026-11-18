@@ -283,7 +283,11 @@ def hot_dense_gemv(shape: Shape, *, hot_frac: float = 1.0,
                     device=dev, shuffle_index=shuffle_index, seed=seed,
                     dtype=store))
 
+    # 실제로 잰 커널 이름 — gateup(융합)은 gemv_gateup 진입점이다 (proj별로 다를 수 있다).
     params["kernel"] = store.fmt.gemv(pinned=False, sparse=False).__name__
+    fused = store.fmt.gemv_gateup(pinned=False, sparse=False)
+    params["kernels"] = {r.proj: (fused.__name__ if r.proj == "gateup" and fused is not None
+                                  else params["kernel"]) for r in results}
     return HotGemvReport(shape=shape, params=params, results=tuple(results),
                          env=env_stamp(dev))
 

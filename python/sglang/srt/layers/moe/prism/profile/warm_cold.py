@@ -251,8 +251,16 @@ class ColdTier:
                  numa_map: Optional[Sequence[int]] = None,
                  rows_per_expert: Optional[Mapping[str, Sequence[int]]] = None,
                  index_per_expert: Optional[Mapping[str, torch.Tensor]] = None,
-                 x_levels: Optional[Mapping[str, torch.Tensor]] = None):
+                 x_levels: Optional[Mapping[str, torch.Tensor]] = None,
+                 max_len: int = 1, cpuinfer=None):
         """`sparsity`는 스칼라 또는 expert당 하나의 시퀀스다.
+
+        `max_len`은 kt `MOEConfig.max_len`이다. 기본 1(sparse는 decode 전용, qlen==1)이고,
+        런타임(`KtColdBackend`)은 max_tokens로 굽는다 — 버퍼 크기가 decode 시간에 주는
+        영향을 재려면 그 값을 준다 (components.py의 요인).
+
+        `cpuinfer`를 주면 그 CPUInfer 풀을 공유한다 (런타임처럼 층 여러 개가 풀 하나를
+        쓰게 — components.py의 n_layers). None이면 자기 풀을 만든다.
 
         per-k 커널(`kernel_mask_per_k(kernel_key)`)이면 마스크를 `x_levels[proj]`(K축 레벨 x,
         없으면 여기서 만든다)와 expert별 thr(밴드 안 순서통계)로 실현한다 — expert마다 다른
@@ -286,7 +294,10 @@ class ColdTier:
         # 같은 경로(WorkerPoolConfig)다. shard table의 항목 수는 tp_count(=subpool
         # 수)와 같아야 하므로 nodes도 같이 좁힌다 — 안 그러면 kt가
         # "partial shard table size != tp_count"로 즉사한다.
-        if numa_map:
+        if cpuinfer is not None:
+            self.cpuinfer = cpuinfer
+            self.nodes = len(numa_map) if numa_map else numa_nodes()
+        elif numa_map:
             pool_cfg = kt_kernel_ext.WorkerPoolConfig()
             pool_cfg.subpool_count = len(numa_map)
             pool_cfg.subpool_numa_map = list(numa_map)
@@ -300,7 +311,9 @@ class ColdTier:
             self.cpuinfer = kt_kernel_ext.CPUInfer(threads)
             self.nodes = numa_nodes()
         cfg = kt_kernel_ext.moe.MOEConfig(E, topk, H, I, 0)
-        cfg.max_len = 1              # sparse는 decode 전용 (qlen==1)
+        if int(max_len) < 1:
+            raise ValueError(f"max_len must be >= 1, got {max_len}")
+        cfg.max_len = int(max_len)   # 기본 1 — sparse는 decode 전용 (qlen==1)
         cfg.layer_idx = 0
         cfg.partial.enabled = True
         cfg.partial.n_total = I
@@ -754,10 +767,11 @@ class WarmColdProfiler:
             "group": group,
             "warm": [self.splits[p].as_dict() for p in projs],
             "warm_bytes_dense": sum(
-                topk * self.splits[p].k_warm * self.splits[p].n_cols * 2
+                int(topk * self.splits[p].k_warm * self.splits[p].n_cols * self.store.elem_bytes)
                 for p in projs),
             "cold_bytes_dense": sum(
-                topk * cold.rows_of(p) * shape.n_cols(p) * 2 for p in projs),
+                int(topk * cold.rows_of(p) * shape.n_cols(p) * self.store.elem_bytes)
+                for p in projs),
             "warm_keep_frac": round(warm[projs[0]].keep_frac, 4),
             "cold_keep_frac": round(cold.keep_frac[projs[0]], 4),
             "reps": reps, "replays": replays, "warm_fused": fuse_now,
