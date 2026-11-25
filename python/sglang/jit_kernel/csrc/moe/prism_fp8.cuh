@@ -1,8 +1,14 @@
 #pragma once
 
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
 #include <cuda_bf16.h>
+#include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+
+#include "prism_host_common.cuh"
 
 // FP8 e4m3 (128×128 블록 fp32 배율) 디코드 — GEMV·grouped 두 커널의 공용 device 헬퍼.
 //
@@ -48,5 +54,46 @@ __device__ __forceinline__ __nv_bfloat16 e4m3_to_bf16(uint32_t b) {
 }
 
 constexpr int kBlk = 128;  // 배율 블록 (n·k 양 축)
+
+
+constexpr int kPtRowAlign = 32;  // per-tensor stores need k rows in whole 32-row chunks
+
+// Checks one store slot and returns its k rows. kidx fixes the rows; codes match them and
+// scales are [R/128, N/128] (block) or [E] (per-tensor), or the kernel reads other rows.
+inline int64_t verify_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
+                            tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+                            host::SymbolicSize& E1, host::SymbolicSize& N,
+                            host::SymbolicDevice& cuda_device, bool w_on_device, bool pt,
+                            const char* what) {
+  using namespace host;
+  auto R = SymbolicSize{"total_rows"};
+  auto Rb = SymbolicSize{"total_k_blocks"};
+  auto Nb = SymbolicSize{"n_blocks"};
+  auto Es = SymbolicSize{"scale_experts"};
+  TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(row_off);
+  TensorMatcher({R}).with_dtype<uint16_t>().with_device(cuda_device).verify(kidx);
+  if (w_on_device) {
+    TensorMatcher({R, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(codes);
+    if (pt) TensorMatcher({Es}).with_dtype<float>().with_device(cuda_device).verify(scales);
+    else TensorMatcher({Rb, Nb}).with_dtype<float>().with_device(cuda_device).verify(scales);
+  } else {
+    TensorMatcher({R, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(codes);
+    if (pt) TensorMatcher({Es}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
+    else TensorMatcher({Rb, Nb}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
+  }
+  if (pt) {
+    RuntimeCheck(Es.unwrap() + 1 == E1.unwrap(), what, ": per-tensor scales has ", Es.unwrap(),
+                 " entries but row_off implies ", E1.unwrap() - 1, " experts");
+    RuntimeCheck(R.unwrap() % kPtRowAlign == 0, what, ": per-tensor store rows ", R.unwrap(),
+                 " must be a multiple of ", kPtRowAlign);
+  } else {
+    RuntimeCheck(Rb.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rb.unwrap(),
+                 " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/", kBlk, ")");
+    RuntimeCheck(Nb.unwrap() * kBlk == N.unwrap(), what, ": scales has ", Nb.unwrap(),
+                 " block cols but the store has ", N.unwrap(), " columns (must be exactly 1/", kBlk, ")");
+  }
+  RuntimeCheck(prism_host::aligned16(codes.data_ptr()), what, ": codes must be 16-byte aligned");
+  return R.unwrap();
+}
 
 }  // namespace prism_fp8

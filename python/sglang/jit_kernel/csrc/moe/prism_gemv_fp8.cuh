@@ -308,44 +308,6 @@ inline void launch_gemv_fp8(const DLDevice& device, tvm::ffi::TensorView topk,
   }
 }
 
-// 스토어 한 슬롯의 검증. R(k 행 수)은 kidx가 정하고 codes는 그와 같은 행 수, scales는
-// 블록판이면 R/128 × N/128, PT면 [E](= row_off 길이 − 1)이어야 한다 — 오프셋 테이블과 스토어가
-// 어긋나면 조용히 남의 행을 읽는다. PT는 R % 32 == 0(청크)만 요구한다.
-inline int64_t verify_f8_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
-                               tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-                               host::SymbolicSize& E1, host::SymbolicSize& N,
-                               host::SymbolicDevice& cuda_device, bool w_on_device, bool pt,
-                               const char* what) {
-  using namespace host;
-  auto R = SymbolicSize{"total_rows"};
-  auto Rb = SymbolicSize{"total_k_blocks"};
-  auto Nb = SymbolicSize{"n_blocks"};
-  auto Es = SymbolicSize{"scale_experts"};
-  TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(row_off);
-  TensorMatcher({R}).with_dtype<uint16_t>().with_device(cuda_device).verify(kidx);
-  if (w_on_device) {
-    TensorMatcher({R, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(codes);
-    if (pt) TensorMatcher({Es}).with_dtype<float>().with_device(cuda_device).verify(scales);
-    else TensorMatcher({Rb, Nb}).with_dtype<float>().with_device(cuda_device).verify(scales);
-  } else {
-    TensorMatcher({R, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(codes);
-    if (pt) TensorMatcher({Es}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
-    else TensorMatcher({Rb, Nb}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
-  }
-  if (pt) {
-    RuntimeCheck(Es.unwrap() + 1 == E1.unwrap(), what, ": per-tensor scales has ", Es.unwrap(),
-                 " entries but row_off implies ", E1.unwrap() - 1, " experts");
-    RuntimeCheck(R.unwrap() % kChunk == 0, what, ": per-tensor store rows ", R.unwrap(),
-                 " must be a multiple of ", kChunk);
-  } else {
-    RuntimeCheck(Rb.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rb.unwrap(),
-                 " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/", kBlk, ")");
-    RuntimeCheck(Nb.unwrap() * kBlk == N.unwrap(), what, ": scales has ", Nb.unwrap(),
-                 " block cols but the store has ", N.unwrap(), " columns (must be exactly 1/", kBlk, ")");
-  }
-  RuntimeCheck(prism_host::aligned16(codes.data_ptr()), what, ": codes must be 16-byte aligned");
-  return R.unwrap();
-}
 
 inline SparseArgs fill_sparse(const SparseIn& sin, host::SymbolicSize& E, host::SymbolicSize& Ng,
                               host::SymbolicSize& M, host::SymbolicSize& K,
@@ -410,8 +372,8 @@ inline void gemv_fp8_impl(
   TensorMatcher({M, K}).with_dtype<int32_t, int64_t>().with_device<kDLCUDA>(cuda_device).verify(topk);
   TensorMatcher({Rx, Kx}).with_dtype<bf16_t>().with_device(cuda_device).verify(x);
   TensorMatcher({M, K, W_row}).with_dtype<bf16_t>().with_device(cuda_device).verify(out);
-  const int64_t rows0 = verify_f8_store(codes, scales, row_off, kidx, E1, N, cuda_device,
-                                        w_on_device, pt, "gemv_fp8");
+  const int64_t rows0 = prism_fp8::verify_store(codes, scales, row_off, kidx, E1, N, cuda_device,
+                                                w_on_device, pt, "gemv_fp8");
 
   const int64_t m = M.unwrap(), top_k = K.unwrap();
   const int64_t n_cols = N.unwrap(), out_row = W_row.unwrap();
@@ -447,8 +409,8 @@ inline void gemv_fp8_impl(
   const bool fused = (codes_up != nullptr);
   if (fused) {
     RuntimeCheck(scales_up && row_off_up && kidx_up, "gemv_fp8_gateup: up slot needs all four tensors");
-    const int64_t rows1 = verify_f8_store(*codes_up, *scales_up, *row_off_up, *kidx_up, E1, N,
-                                          cuda_device, w_on_device, pt, "gemv_fp8_gateup(up)");
+    const int64_t rows1 = prism_fp8::verify_store(*codes_up, *scales_up, *row_off_up, *kidx_up, E1, N,
+                                                  cuda_device, w_on_device, pt, "gemv_fp8_gateup(up)");
     RuntimeCheck(out_col_offset_up >= 0 && out_col_offset_up % 8 == 0 &&
                  out_col_offset_up + n_cols <= out_row,
                  "gemv_fp8_gateup: up out cols [", out_col_offset_up, ",",

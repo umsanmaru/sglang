@@ -318,42 +318,6 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
   }  // tile loop
 }
 
-inline int64_t verify_f8_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
-                               tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-                               host::SymbolicSize& E1, host::SymbolicSize& N,
-                               host::SymbolicDevice& cuda_device, bool w_on_device, bool pt,
-                               const char* what) {
-  using namespace host;
-  auto R = SymbolicSize{"total_rows"};
-  auto Rb = SymbolicSize{"total_k_blocks"};
-  auto Nb = SymbolicSize{"n_blocks"};
-  auto Es = SymbolicSize{"scale_experts"};
-  TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(row_off);
-  TensorMatcher({R}).with_dtype<uint16_t>().with_device(cuda_device).verify(kidx);
-  if (w_on_device) {
-    TensorMatcher({R, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(codes);
-    if (pt) TensorMatcher({Es}).with_dtype<float>().with_device(cuda_device).verify(scales);
-    else TensorMatcher({Rb, Nb}).with_dtype<float>().with_device(cuda_device).verify(scales);
-  } else {
-    TensorMatcher({R, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(codes);
-    if (pt) TensorMatcher({Es}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
-    else TensorMatcher({Rb, Nb}).with_dtype<float>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
-  }
-  if (pt) {
-    RuntimeCheck(Es.unwrap() + 1 == E1.unwrap(), what, ": per-tensor scales has ", Es.unwrap(),
-                 " entries but row_off implies ", E1.unwrap() - 1, " experts");
-    RuntimeCheck(R.unwrap() % 32 == 0, what, ": per-tensor store rows ", R.unwrap(),
-                 " must be a multiple of 32");
-  } else {
-    RuntimeCheck(Rb.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rb.unwrap(),
-                 " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/", kBlk, ")");
-    RuntimeCheck(Nb.unwrap() * kBlk == N.unwrap(), what, ": scales has ", Nb.unwrap(),
-                 " block cols but the store has ", N.unwrap(), " columns");
-  }
-  RuntimeCheck(prism_host::aligned16(codes.data_ptr()), what, ": codes must be 16-byte aligned");
-  return R.unwrap();
-}
-
 // 공통 검증 + launch. `w_on_device`로 스토어의 거처 제약만 갈린다 (hot/warm 쌍둥이).
 // max_blocks: launch 블록 수 상한 (0 = 없음).
 inline void grouped_fp8_impl(
@@ -408,7 +372,7 @@ inline void grouped_fp8_impl(
     RuntimeCheck(E.unwrap() + 1 == E1.unwrap(), "grouped_fp8_cold: blk_off must have E entries");
     N.set_value(cold_n_cols);
   } else {
-    verify_f8_store(codes, scales, row_off, kidx, E1, N, cuda_device, w_on_device, pt, "grouped_fp8");
+    prism_fp8::verify_store(codes, scales, row_off, kidx, E1, N, cuda_device, w_on_device, pt, "grouped_fp8");
   }
 
   const int64_t m = M.unwrap(), top_k = K.unwrap(), p = P.unwrap();
@@ -452,8 +416,8 @@ inline void grouped_fp8_impl(
       TensorMatcher({E2}).with_dtype<int64_t>().with_device(cuda_device).verify(*blk_off_up);
     } else {
       RuntimeCheck(scales_up != nullptr, "grouped_fp8_gateup: up slot needs scales");
-      verify_f8_store(*codes_up, *scales_up, *row_off_up, *kidx_up, E1, N, cuda_device,
-                      w_on_device, pt, "grouped_fp8_gateup(up)");
+      prism_fp8::verify_store(*codes_up, *scales_up, *row_off_up, *kidx_up, E1, N, cuda_device,
+                              w_on_device, pt, "grouped_fp8_gateup(up)");
     }
     RuntimeCheck(out_col_offset_up % 8 == 0 && out_col_offset_up >= 0 &&
                  out_col_offset_up + n_cols <= out_row,
