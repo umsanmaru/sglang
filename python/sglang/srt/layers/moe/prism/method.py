@@ -100,7 +100,7 @@ def _sglang_capture_mode() -> bool:
     (runner 미탑재 경량 환경)는 False = "캡처 구간 아님"으로 처리한다.
     """
     try:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+        from sglang.srt.model_executor.runner import get_is_capture_mode
     except Exception:
         return False
     return get_is_capture_mode()
