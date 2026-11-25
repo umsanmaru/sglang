@@ -357,33 +357,6 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_mxfp4(
   }  // tile loop
 }
 
-inline int64_t verify_mx4_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
-                                tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-                                host::SymbolicSize& E1, host::SymbolicSize& N,
-                                host::SymbolicDevice& cuda_device, bool w_on_device,
-                                const char* what) {
-  using namespace host;
-  auto R = SymbolicSize{"total_rows"};
-  auto Rp = SymbolicSize{"total_pairs"};
-  auto Rg = SymbolicSize{"total_blocks"};
-  TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(row_off);
-  TensorMatcher({R}).with_dtype<uint16_t>().with_device(cuda_device).verify(kidx);
-  if (w_on_device) {
-    TensorMatcher({Rp, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(codes);
-    TensorMatcher({Rg, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(scales);
-  } else {
-    TensorMatcher({Rp, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(codes);
-    TensorMatcher({Rg, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
-  }
-  RuntimeCheck(Rp.unwrap() * 2 == R.unwrap(), what, ": codes has ", Rp.unwrap(),
-               " pair rows but kidx has ", R.unwrap(), " rows (must be exactly half)");
-  RuntimeCheck(Rg.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rg.unwrap(),
-               " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/32)");
-  RuntimeCheck(prism_host::aligned16(codes.data_ptr()) && prism_host::aligned16(scales.data_ptr()),
-               what, ": codes/scales must be 16-byte aligned");
-  return R.unwrap();
-}
-
 // 공통 검증 + launch. `w_on_device`로 스토어의 거처 제약만 갈린다 (hot/warm 쌍둥이).
 // max_blocks: launch 블록 수 상한 (0 = 없음) — PCIe 바운드 launch가 SM을 비워두게 하는 노브.
 inline void grouped_mxfp4_impl(
@@ -435,7 +408,7 @@ inline void grouped_mxfp4_impl(
     RuntimeCheck(E.unwrap() + 1 == E1.unwrap(), "grouped_mxfp4_cold: blk_off must have E entries");
     N.set_value(cold_n_cols);
   } else {
-    verify_mx4_store(codes, scales, row_off, kidx, E1, N, cuda_device, w_on_device, "grouped_mxfp4");
+    prism_mxfp4::verify_store(codes, scales, row_off, kidx, E1, N, cuda_device, w_on_device, "grouped_mxfp4");
   }
 
   const int64_t m = M.unwrap(), top_k = K.unwrap(), p = P.unwrap();
@@ -477,8 +450,8 @@ inline void grouped_mxfp4_impl(
       auto E2 = SymbolicSize{"num_experts_up"};
       TensorMatcher({E2}).with_dtype<int64_t>().with_device(cuda_device).verify(*blk_off_up);
     } else {
-      verify_mx4_store(*codes_up, *scales_up, *row_off_up, *kidx_up, E1, N, cuda_device,
-                       w_on_device, "grouped_mxfp4_gateup(up)");
+      prism_mxfp4::verify_store(*codes_up, *scales_up, *row_off_up, *kidx_up, E1, N, cuda_device,
+                                w_on_device, "grouped_mxfp4_gateup(up)");
     }
     RuntimeCheck(out_col_offset_up % 8 == 0 && out_col_offset_up >= 0 &&
                  out_col_offset_up + n_cols <= out_row,

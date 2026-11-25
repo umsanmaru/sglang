@@ -265,35 +265,6 @@ inline void launch_gemv_mxfp4(const DLDevice& device, tvm::ffi::TensorView topk,
   }
 }
 
-// 스토어 한 슬롯의 검증. R(k 행 수)은 kidx가 정하고 codes/scales는 그 절반/32분의 1이어야
-// 한다 — 오프셋 테이블과 스토어가 어긋나면 조용히 남의 행을 읽으므로 여기서 잡는다.
-inline int64_t verify_mx4_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
-                                tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-                                host::SymbolicSize& E1, host::SymbolicSize& N,
-                                host::SymbolicDevice& cuda_device, bool w_on_device,
-                                const char* what) {
-  using namespace host;
-  auto R = SymbolicSize{"total_rows"};
-  auto Rp = SymbolicSize{"total_pairs"};
-  auto Rg = SymbolicSize{"total_blocks"};
-  TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(row_off);
-  TensorMatcher({R}).with_dtype<uint16_t>().with_device(cuda_device).verify(kidx);
-  if (w_on_device) {
-    TensorMatcher({Rp, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(codes);
-    TensorMatcher({Rg, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(scales);
-  } else {
-    TensorMatcher({Rp, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(codes);
-    TensorMatcher({Rg, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
-  }
-  RuntimeCheck(Rp.unwrap() * 2 == R.unwrap(), what, ": codes has ", Rp.unwrap(),
-               " pair rows but kidx has ", R.unwrap(), " rows (must be exactly half)");
-  RuntimeCheck(Rg.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rg.unwrap(),
-               " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/32)");
-  RuntimeCheck(prism_host::aligned16(codes.data_ptr()) && prism_host::aligned16(scales.data_ptr()),
-               what, ": codes/scales must be 16-byte aligned");
-  return R.unwrap();
-}
-
 inline SparseArgs fill_sparse(const SparseIn& sin, host::SymbolicSize& E, host::SymbolicSize& Ng,
                               host::SymbolicSize& M, host::SymbolicSize& K,
                               host::SymbolicDevice& cuda_device, int64_t rows, const char* what) {
@@ -350,8 +321,8 @@ inline void gemv_mxfp4_impl(
   TensorMatcher({M, K}).with_dtype<int32_t, int64_t>().with_device<kDLCUDA>(cuda_device).verify(topk);
   TensorMatcher({Rx, Kx}).with_dtype<bf16_t>().with_device(cuda_device).verify(x);
   TensorMatcher({M, K, W_row}).with_dtype<bf16_t>().with_device(cuda_device).verify(out);
-  const int64_t rows0 = verify_mx4_store(codes, scales, row_off, kidx, E1, N, cuda_device,
-                                         w_on_device, "gemv_mxfp4");
+  const int64_t rows0 = prism_mxfp4::verify_store(codes, scales, row_off, kidx, E1, N, cuda_device,
+                                                  w_on_device, "gemv_mxfp4");
 
   const int64_t m = M.unwrap(), top_k = K.unwrap();
   const int64_t n_cols = N.unwrap(), out_row = W_row.unwrap();
@@ -387,8 +358,8 @@ inline void gemv_mxfp4_impl(
   const bool fused = (codes_up != nullptr);
   if (fused) {
     RuntimeCheck(scales_up && row_off_up && kidx_up, "gemv_mxfp4_gateup: up slot needs all four tensors");
-    const int64_t rows1 = verify_mx4_store(*codes_up, *scales_up, *row_off_up, *kidx_up, E1, N,
-                                           cuda_device, w_on_device, "gemv_mxfp4_gateup(up)");
+    const int64_t rows1 = prism_mxfp4::verify_store(*codes_up, *scales_up, *row_off_up, *kidx_up, E1, N,
+                                                    cuda_device, w_on_device, "gemv_mxfp4_gateup(up)");
     RuntimeCheck(out_col_offset_up >= 0 && out_col_offset_up % 8 == 0 &&
                  out_col_offset_up + n_cols <= out_row,
                  "gemv_mxfp4_gateup: up out cols [", out_col_offset_up, ",",

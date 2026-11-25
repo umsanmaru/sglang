@@ -1,8 +1,14 @@
 #pragma once
 
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
+
 #include <cuda_bf16.h>
+#include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+
+#include "prism_host_common.cuh"
 
 // MXFP4 (e2m1 코드 + E8M0 32-블록 배율) 디코드 — GEMV·grouped 두 커널의 공용 device 헬퍼.
 //
@@ -41,6 +47,37 @@ __device__ __forceinline__ float e8m0_half(uint32_t e) {
 // 코드 nibble + 배율 → bf16 (정확표현: e2m1 × 2^e는 bf16 격자에 있다).
 __device__ __forceinline__ __nv_bfloat16 fp4_to_bf16(uint32_t nib, float scale_half) {
   return __float2bfloat16_rn(fp4_val2(nib) * scale_half);
+}
+
+constexpr int kScaleBlock = 32;  // k rows per E8M0 scale
+
+// Checks one pair-row store slot and returns its k rows. kidx fixes the rows; codes and
+// scales must be exactly 1/2 and 1/32 of it, or the kernel silently reads other rows.
+inline int64_t verify_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
+                            tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+                            host::SymbolicSize& E1, host::SymbolicSize& N,
+                            host::SymbolicDevice& cuda_device, bool w_on_device,
+                            const char* what) {
+  using namespace host;
+  auto R = SymbolicSize{"total_rows"};
+  auto Rp = SymbolicSize{"total_pairs"};
+  auto Rg = SymbolicSize{"total_blocks"};
+  TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(row_off);
+  TensorMatcher({R}).with_dtype<uint16_t>().with_device(cuda_device).verify(kidx);
+  if (w_on_device) {
+    TensorMatcher({Rp, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(codes);
+    TensorMatcher({Rg, N}).with_dtype<uint8_t>().with_device(cuda_device).verify(scales);
+  } else {
+    TensorMatcher({Rp, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(codes);
+    TensorMatcher({Rg, N}).with_dtype<uint8_t>().with_device<kDLCPU, kDLCUDAHost>().verify(scales);
+  }
+  RuntimeCheck(Rp.unwrap() * 2 == R.unwrap(), what, ": codes has ", Rp.unwrap(),
+               " pair rows but kidx has ", R.unwrap(), " rows (must be exactly half)");
+  RuntimeCheck(Rg.unwrap() * kScaleBlock == R.unwrap(), what, ": scales has ", Rg.unwrap(),
+               " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/32)");
+  RuntimeCheck(prism_host::aligned16(codes.data_ptr()) && prism_host::aligned16(scales.data_ptr()),
+               what, ": codes/scales must be 16-byte aligned");
+  return R.unwrap();
 }
 
 }  // namespace prism_mxfp4
