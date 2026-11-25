@@ -11,6 +11,7 @@
 #include <cstdint>
 
 #include "prism_mxfp4.cuh"
+#include "prism_host_common.cuh"
 #include "prism_sparse_common.cuh"
 
 namespace {
@@ -215,15 +216,6 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_mxfp4(
   }
 }
 
-// SM 수는 launch마다 물어보면 (CUDA graph 캡처 중이라도) host 시간이 든다 — device당 한 번만.
-inline uint32_t sm_count_of(int device_id) {
-  constexpr int kMaxDev = 16;
-  static uint32_t cache[kMaxDev] = {};
-  if (device_id < 0 || device_id >= kMaxDev) return host::runtime::get_sm_count(device_id);
-  if (cache[device_id] == 0) cache[device_id] = host::runtime::get_sm_count(device_id);
-  return cache[device_id];
-}
-
 #define PRISM_MX4_LAUNCH(V, NX, NY)                                                        \
   do {                                                                                     \
     const dim3 block((NX), (NY));                                                          \
@@ -260,7 +252,7 @@ inline void launch_gemv_mxfp4(const DLDevice& device, tvm::ffi::TensorView topk,
   // **w_on_device·슬롯 수와 무관한 순수 함수**여야 한다: 그래야 pinned==device(계약,
   // test_indexed_pinned_matches_device)와 융합==2회 launch(test_gemv_gateup_fusion_*)가
   // 유지된다. 둘 다 일반 입력 기준이라 "정확표현이면 순서 무관"으로는 못 넘어간다.
-  const int64_t sm = static_cast<int64_t>(sm_count_of(device.device_id));
+  const int64_t sm = static_cast<int64_t>(prism_host::sm_count(device.device_id));
   const int64_t blocks = div_ceil(n_cols, static_cast<int64_t>(32)) * pairs;
   // 블록이 SM의 2배에 못 미치면서 32-k 블록이 64개 이상 있을 때만 블록당 워프를 2배로.
   const bool wide_ny = blocks < 2 * sm && avg_rows >= 2048;

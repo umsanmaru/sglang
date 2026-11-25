@@ -12,6 +12,7 @@
 #include <type_traits>
 
 #include "prism_fp8.cuh"
+#include "prism_host_common.cuh"
 #include "prism_sparse_common.cuh"
 
 namespace {
@@ -249,15 +250,6 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_fp8(
   }
 }
 
-// SM 수는 device당 한 번만 물어본다 (launch마다면 graph 캡처 중에도 host 시간이 든다).
-inline uint32_t sm_count_of(int device_id) {
-  constexpr int kMaxDev = 16;
-  static uint32_t cache[kMaxDev] = {};
-  if (device_id < 0 || device_id >= kMaxDev) return host::runtime::get_sm_count(device_id);
-  if (cache[device_id] == 0) cache[device_id] = host::runtime::get_sm_count(device_id);
-  return cache[device_id];
-}
-
 #define PRISM_F8_LAUNCH(V, NX, NY)                                                         \
   do {                                                                                     \
     const dim3 block((NX), (NY));                                                          \
@@ -298,7 +290,7 @@ inline void launch_gemv_fp8(const DLDevice& device, tvm::ffi::TensorView topk,
   // 그만큼 먼저 대역폭 영역에 들어가고, 거기서는 스레드를 늘리는 것(kV↓)보다 요청을 넓게
   // 쓰는 것(kV↑)이 이긴다 — kV=4를 그대로 쓰면 dsv4 down이 오히려 느려진다 (37.8→41.6 µs).
   // SM당 읽는 바이트로 가른다 (실측: 49/74 KB/SM → kV=4, 296 KB/SM → kV=8).
-  const int64_t sm = static_cast<int64_t>(sm_count_of(device.device_id));
+  const int64_t sm = static_cast<int64_t>(prism_host::sm_count(device.device_id));
   const int64_t bytes_per_sm = pairs * avg_rows * n_cols / sm;  // 슬롯 수를 세지 않는다
   const int64_t kv_dev = (bytes_per_sm >= (128 << 10)) ? 8 : 4;
   // 블록 수 추정도 같은 이유로 device 타일 기준 · 슬롯 무관이다 (pinned도 이 kNY를 쓴다).

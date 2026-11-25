@@ -10,6 +10,7 @@
 
 #include <cstdint>
 
+#include "prism_host_common.cuh"
 #include "prism_sparse_common.cuh"
 
 namespace {
@@ -349,15 +350,6 @@ inline void launch_gemv_worklist(
   }
 }
 
-// SM 수는 device당 한 번만 물어본다 (launch마다면 graph 캡처 중에도 host 시간이 든다).
-inline uint32_t sm_count_bf16(int device_id) {
-  constexpr int kMaxDev = 16;
-  static uint32_t cache[kMaxDev] = {};
-  if (device_id < 0 || device_id >= kMaxDev) return host::runtime::get_sm_count(device_id);
-  if (cache[device_id] == 0) cache[device_id] = host::runtime::get_sm_count(device_id);
-  return cache[device_id];
-}
-
 // W 로드 폭 선택. uint2/uint4 정렬 조건은 (a) n_cols가 V의 배수, (b) 스토어
 // 시작 주소가 V*2 바이트 정렬. (a)는 계약 ①의 COL_GROUP=32가 보증하고,
 // row_off[e]는 임의여도 된다 — 행 시작이 n_cols 원소의 배수이므로 (a)가
@@ -642,7 +634,7 @@ inline void gemv_worklist_indexed_impl(
   // 넣으면 융합 launch와 단일 launch가 서로 다른 NY를 골라 누산 순서가 갈린다 — 융합이
   // 2회 launch와 비트일치여야 한다는 계약(test_gemv_gateup_fusion_all_four_bitwise, 일반
   // 입력 기준)이 깨진다. 슬롯 하나 기준으로 고르면 두 경로가 언제나 같은 타일이다.
-  const uint32_t sm = sm_count_bf16(device.device_id);
+  const uint32_t sm = prism_host::sm_count(device.device_id);
   const int64_t blocks_per_slot = div_ceil(n_cols, static_cast<int64_t>(kNCol)) * pairs;
   const int64_t avg_rows = R.unwrap() / (E1.unwrap() - 1);
   const bool wide_ny = blocks_per_slot < 2 * static_cast<int64_t>(sm) && avg_rows >= 2048;
