@@ -308,11 +308,6 @@ inline void launch_gemv_fp8(const DLDevice& device, tvm::ffi::TensorView topk,
   }
 }
 
-
-inline bool aligned16(const void* p) {
-  return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
-}
-
 // 스토어 한 슬롯의 검증. R(k 행 수)은 kidx가 정하고 codes는 그와 같은 행 수, scales는
 // 블록판이면 R/128 × N/128, PT면 [E](= row_off 길이 − 1)이어야 한다 — 오프셋 테이블과 스토어가
 // 어긋나면 조용히 남의 행을 읽는다. PT는 R % 32 == 0(청크)만 요구한다.
@@ -348,7 +343,7 @@ inline int64_t verify_f8_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView 
     RuntimeCheck(Nb.unwrap() * kBlk == N.unwrap(), what, ": scales has ", Nb.unwrap(),
                  " block cols but the store has ", N.unwrap(), " columns (must be exactly 1/", kBlk, ")");
   }
-  RuntimeCheck(aligned16(codes.data_ptr()), what, ": codes must be 16-byte aligned");
+  RuntimeCheck(prism_host::aligned16(codes.data_ptr()), what, ": codes must be 16-byte aligned");
   return R.unwrap();
 }
 
@@ -431,7 +426,7 @@ inline void gemv_fp8_impl(
   RuntimeCheck(out_col_offset >= 0 && out_col_offset % 8 == 0 && out_col_offset + n_cols <= out_row,
                "gemv_fp8: out cols [", out_col_offset, ",", out_col_offset + n_cols,
                ") must be 8-aligned and inside out width ", out_row);
-  RuntimeCheck(out_row % 8 == 0 && aligned16(out.data_ptr()),
+  RuntimeCheck(out_row % 8 == 0 && prism_host::aligned16(out.data_ptr()),
                "gemv_fp8: out must be 16-byte aligned with out_row % 8 == 0");
   RuntimeCheck(top_k <= 16, "gemv_fp8: top_k ", top_k, " exceeds the per-thread slot budget (16)");
 

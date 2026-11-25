@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "prism_host_common.cuh"
 #include "prism_fp8.cuh"
 
 namespace {
@@ -317,10 +318,6 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_fp8(
   }  // tile loop
 }
 
-inline bool aligned16(const void* p) {
-  return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
-}
-
 inline int64_t verify_f8_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
                                tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
                                host::SymbolicSize& E1, host::SymbolicSize& N,
@@ -353,7 +350,7 @@ inline int64_t verify_f8_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView 
     RuntimeCheck(Nb.unwrap() * kBlk == N.unwrap(), what, ": scales has ", Nb.unwrap(),
                  " block cols but the store has ", N.unwrap(), " columns");
   }
-  RuntimeCheck(aligned16(codes.data_ptr()), what, ": codes must be 16-byte aligned");
+  RuntimeCheck(prism_host::aligned16(codes.data_ptr()), what, ": codes must be 16-byte aligned");
   return R.unwrap();
 }
 
@@ -433,7 +430,7 @@ inline void grouped_fp8_impl(
   RuntimeCheck(out_col_offset >= 0 && out_col_offset + n_cols <= out_row,
                "grouped_fp8: out cols [", out_col_offset, ",", out_col_offset + n_cols,
                ") out of out width ", out_row);
-  RuntimeCheck(aligned16(out.data_ptr()), "grouped_fp8: out must be 16-byte aligned");
+  RuntimeCheck(prism_host::aligned16(out.data_ptr()), "grouped_fp8: out must be 16-byte aligned");
 
   F8Slot s0{static_cast<const uint8_t*>(codes.data_ptr()),
             tile ? nullptr : static_cast<const float*>(scales.data_ptr()),

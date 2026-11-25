@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "prism_host_common.cuh"
 #include "prism_mxfp4.cuh"
 
 namespace {
@@ -356,10 +357,6 @@ __global__ void __launch_bounds__(kThreads) prism_grouped_gemm_mxfp4(
   }  // tile loop
 }
 
-inline bool aligned16(const void* p) {
-  return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
-}
-
 inline int64_t verify_mx4_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
                                 tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
                                 host::SymbolicSize& E1, host::SymbolicSize& N,
@@ -382,7 +379,7 @@ inline int64_t verify_mx4_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView
                " pair rows but kidx has ", R.unwrap(), " rows (must be exactly half)");
   RuntimeCheck(Rg.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rg.unwrap(),
                " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/32)");
-  RuntimeCheck(aligned16(codes.data_ptr()) && aligned16(scales.data_ptr()),
+  RuntimeCheck(prism_host::aligned16(codes.data_ptr()) && prism_host::aligned16(scales.data_ptr()),
                what, ": codes/scales must be 16-byte aligned");
   return R.unwrap();
 }
@@ -459,7 +456,7 @@ inline void grouped_mxfp4_impl(
   RuntimeCheck(out_col_offset >= 0 && out_col_offset + n_cols <= out_row,
                "grouped_mxfp4: out cols [", out_col_offset, ",", out_col_offset + n_cols,
                ") out of out width ", out_row);
-  RuntimeCheck(aligned16(out.data_ptr()), "grouped_mxfp4: out must be 16-byte aligned");
+  RuntimeCheck(prism_host::aligned16(out.data_ptr()), "grouped_mxfp4: out must be 16-byte aligned");
 
   Mx4Slot s0{static_cast<const uint8_t*>(codes.data_ptr()),
              static_cast<const uint8_t*>(scales.data_ptr()),

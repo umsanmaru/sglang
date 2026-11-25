@@ -265,10 +265,6 @@ inline void launch_gemv_mxfp4(const DLDevice& device, tvm::ffi::TensorView topk,
   }
 }
 
-inline bool aligned16(const void* p) {
-  return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
-}
-
 // 스토어 한 슬롯의 검증. R(k 행 수)은 kidx가 정하고 codes/scales는 그 절반/32분의 1이어야
 // 한다 — 오프셋 테이블과 스토어가 어긋나면 조용히 남의 행을 읽으므로 여기서 잡는다.
 inline int64_t verify_mx4_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
@@ -293,7 +289,7 @@ inline int64_t verify_mx4_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView
                " pair rows but kidx has ", R.unwrap(), " rows (must be exactly half)");
   RuntimeCheck(Rg.unwrap() * kBlk == R.unwrap(), what, ": scales has ", Rg.unwrap(),
                " block rows but kidx has ", R.unwrap(), " rows (must be exactly 1/32)");
-  RuntimeCheck(aligned16(codes.data_ptr()) && aligned16(scales.data_ptr()),
+  RuntimeCheck(prism_host::aligned16(codes.data_ptr()) && prism_host::aligned16(scales.data_ptr()),
                what, ": codes/scales must be 16-byte aligned");
   return R.unwrap();
 }
@@ -370,7 +366,7 @@ inline void gemv_mxfp4_impl(
   RuntimeCheck(out_col_offset >= 0 && out_col_offset % 8 == 0 && out_col_offset + n_cols <= out_row,
                "gemv_mxfp4: out cols [", out_col_offset, ",", out_col_offset + n_cols,
                ") must be 8-aligned and inside out width ", out_row);
-  RuntimeCheck(out_row % 8 == 0 && aligned16(out.data_ptr()),
+  RuntimeCheck(out_row % 8 == 0 && prism_host::aligned16(out.data_ptr()),
                "gemv_mxfp4: out must be 16-byte aligned with out_row % 8 == 0");
   RuntimeCheck(top_k <= 16, "gemv_mxfp4: top_k ", top_k, " exceeds the per-thread slot budget (16)");
 

@@ -17,4 +17,8 @@ inline uint32_t sm_count(int device_id) {
   return cache[device_id];
 }
 
+inline bool aligned16(const void* p) {
+  return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
+}
+
 }  // namespace prism_host

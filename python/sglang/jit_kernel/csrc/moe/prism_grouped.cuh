@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cstdint>
 
+#include "prism_host_common.cuh"
+
 namespace {
 
 using namespace nvcuda;
@@ -580,10 +582,6 @@ void prism_wait_flag(tvm::ffi::TensorView flag, int64_t target) {
                                           static_cast<int32_t>(target));
 }
 
-inline bool aligned16(const void* p) {
-  return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
-}
-
 // 공통 검증 + launch. `w_on_device`로 W의 거처 제약만 갈린다 (hot/warm 쌍둥이).
 // 슬롯 1(gate+up 융합)은 nullptr이면 grid.z=1.
 // max_blocks: launch 블록 수 상한 (0 = 없음). PCIe 바운드 launch가 SM을 비워두게
@@ -662,7 +660,7 @@ inline void grouped_gemm_impl(
   RuntimeCheck(out_col_offset >= 0 && out_col_offset + n_cols <= out_row,
                "grouped_gemm: out cols [", out_col_offset, ",",
                out_col_offset + n_cols, ") out of out width ", out_row);
-  RuntimeCheck(aligned16(w.data_ptr()) && aligned16(out.data_ptr()),
+  RuntimeCheck(prism_host::aligned16(w.data_ptr()) && prism_host::aligned16(out.data_ptr()),
                "grouped_gemm: w and out must be 16-byte aligned");
 
   if (layout == COLD) {
@@ -701,7 +699,7 @@ inline void grouped_gemm_impl(
                  out_col_offset_up + n_cols <= out_row,
                  "grouped_gemm_gateup: up out cols [", out_col_offset_up, ",",
                  out_col_offset_up + n_cols, ") invalid for out width ", out_row);
-    RuntimeCheck(aligned16(w_up->data_ptr()), "grouped_gemm_gateup: w_up must be 16-byte aligned");
+    RuntimeCheck(prism_host::aligned16(w_up->data_ptr()), "grouped_gemm_gateup: w_up must be 16-byte aligned");
     if (layout == COLD) {
       RuntimeCheck(blk_off_up != nullptr, "grouped_gemm_cold_gateup: blk_off_up required");
       auto E = SymbolicSize{"num_experts"};
