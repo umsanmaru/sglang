@@ -34,7 +34,7 @@ class ColdBackend(Protocol):
     """executor가 보는 cold 계산 서비스의 계약 (계약 ④의 submit/sync 뒷단)."""
 
     def load_layer(self, layer_idx: int, cold: PendingColdTensors,
-                   thr=None) -> None: ...
+                   thr=None, keep_counter: Optional[torch.Tensor] = None) -> None: ...
     def submit_gateup(self, layer_idx: int, qlen_ptr: int, k: int,
                       expert_ids_ptr: int, x_ptr: int, out_ptr: int,
                       cuda_stream: Optional[int] = None,
@@ -241,7 +241,8 @@ class KtColdBackend:
 
     # ── Stage 2: 주입 (이후 PendingColdTensors는 호출자가 해제) ──────────
     def load_layer(self, layer_idx: int, cold: PendingColdTensors,
-                   thr=None) -> None:
+                   thr=None, keep_counter: Optional[torch.Tensor] = None) -> None:
+        """keep_counter: pinned int64 [3, 2] controller counter that kt adds decode masks to."""
         from kt_kernel.experts_partial import PartialMoEWrapper  # 지연 import
 
         if layer_idx in self._wrappers:
@@ -261,7 +262,8 @@ class KtColdBackend:
         wrapper = PartialMoEWrapper(cfg, self.cpuinfer, kernel_key=kernel_key)
         wrapper.load_weights_from_tensors(
             cold.gate.w_flat, cold.up.w_flat, cold.down.w_flat,
-            sparsity_tables=tables, **cold.gate.fmt.cold_load_kwargs(cold),
+            sparsity_tables=tables, keep_counter=keep_counter,
+            **cold.gate.fmt.cold_load_kwargs(cold),
         )
         self._wrappers[layer_idx] = wrapper
         if self.hybrid_masks is not None:

@@ -245,7 +245,8 @@ class PrismExecutor:
                  warm_cpu_max_m: Optional[int] = None,
                  cold_async: bool = False,
                  cold_split: bool = False,
-                 mask_stats=None):
+                 mask_stats=None,
+                 thr_ctrl=None):
         """cold_stream: eager에서도 cold submit/sync를 stream 통합으로 (opt-in).
         force_graph_path: 캡처 없이 graph-safe 경로 강제 (테스트/디버그).
         capture_mode_fn: sglang CudaGraphRunner의 capture 구간(캡처 전 워밍업
@@ -323,6 +324,8 @@ class PrismExecutor:
         self._sparse = plan.sparsity is not None
         # effective sparsity 실측기 (mask_stats.MaskStats; None = 끔). decode·eager에서만 관측.
         self._mask_stats = mask_stats
+        # Online threshold controller (thr_ctrl.ThresholdController; None = calibrated tables).
+        self._thr_ctrl = thr_ctrl
         # cold task가 나중에 읽는 qlen — 주소 고정 멤버 (계약 ④의 포인터 경유)
         self._qlen_pin = torch.zeros(1, dtype=torch.int32)
         # graph/stream 경로의 bs별 qlen 버퍼 — 격리 이유는 `_qlen_pin_for` 참조.
@@ -361,7 +364,8 @@ class PrismExecutor:
                 warm_kt_calib = {Proj.GATE: wk.gate.calib, Proj.UP: wk.up.calib, Proj.DOWN: wk.down.calib}
         self._tiers[layer_idx] = build_layer_tiers(
             prepared, self._plan, layer_idx, cold_gpu=cold_gpu,
-            warm_kt=warm_kt, warm_kt_calib=warm_kt_calib)
+            warm_kt=warm_kt, warm_kt_calib=warm_kt_calib,
+            thr_ctrl=None if self._thr_ctrl is None else self._thr_ctrl.layer(layer_idx))
         # load_warm_layer가 이 원본 텐서를 이미 C++ slab으로 pack했고, 티어 구성이
         # 그 calib을 방금 소비했다. executor가 층마다 warm full weight 사본을 하나
         # 더 들고 있으면 안 된다 — 티어 구성이 실패하면 호출자가 재시도할 수 있게 남긴다.
@@ -597,6 +601,9 @@ class PrismExecutor:
         # rejoin#2: fp32 합 → router 가중 expert합 → bf16
         with _nvtx("rejoin2.acc+wsum"):
             out = rejoin_down(down_parts + [cold_dn, warm_dn], flow.topk_w32)
+        if flow.masking and self._thr_ctrl is not None:
+            # After the rejoin both the GPU tiers and the kt job of this step have counted.
+            self._thr_ctrl.step(layer_idx)
         _nvtx_pop()                               # prism.L{layer_idx}
         return out
 

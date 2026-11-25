@@ -1,5 +1,7 @@
 #pragma once
 
+#include <sgl_kernel/tensor.h>
+
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
@@ -19,6 +21,8 @@ struct SparseArgs {
   const float* topk_w;   // [M, top_k]     = 라우터 가중
   float p, lam, pmax, grid;
   int ng, renorm_it;
+  // Threshold-controller counter {kept, total} in mask units (see count_keep); nullptr = off.
+  long long* ctr = nullptr;
 };
 
 // host 진입점이 받는 sparse 인자 묶음 (검증 전).
@@ -33,7 +37,49 @@ struct SparseIn {
   // `x²·a >= thr²`로 판정한다. `c`는 여전히 안 읽는다. per_k=false일 때는 의미가 없다
   // (페어 score는 항상 a와 c를 쓴다).
   bool use_wn = false;
+  // Keep counter tensor of the export call; nullptr or an empty tensor means off.
+  const tvm::ffi::TensorView* ctr = nullptr;
 };
+
+// Device pointer of a SparseIn's keep counter, validated as int64 [2] on the kernel's device.
+inline long long* keep_ctr_of(const SparseIn& in, host::SymbolicDevice& device) {
+  if (in.ctr == nullptr || in.ctr->numel() == 0) return nullptr;
+  host::TensorMatcher({2}).with_dtype<int64_t>().with_device(device).verify(*in.ctr);
+  return static_cast<long long*>(in.ctr->data_ptr());
+}
+
+// Block-sums per-thread (kept, total) mask-unit counts into ctr = {kept, total}. Every thread
+// of the block must call it (it synchronizes). Only the blockIdx.x == 0 column tile adds,
+// because every column tile of a (pair, slot) recomputes the same mask.
+__device__ __forceinline__ void count_keep(long long* ctr, int kept, int total) {
+  if (ctr == nullptr || blockIdx.x != 0) return;
+  __shared__ int s_cnt[2];
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+  if (tid == 0) {
+    s_cnt[0] = 0;
+    s_cnt[1] = 0;
+  }
+  __syncthreads();
+  if (kept != 0) atomicAdd(&s_cnt[0], kept);
+  if (total != 0) atomicAdd(&s_cnt[1], total);
+  __syncthreads();
+  if (tid == 0) {
+    auto* dst = reinterpret_cast<unsigned long long*>(ctr);
+    atomicAdd(dst, static_cast<unsigned long long>(s_cnt[0]));
+    atomicAdd(dst + 1, static_cast<unsigned long long>(s_cnt[1]));
+  }
+}
+
+// count_keep over a published keep[] chunk of n mask units, all of them real rows.
+// Call it right after the __syncthreads that publishes keep[].
+__device__ __forceinline__ void count_keep_chunk(long long* ctr, const uint8_t* keep, int n) {
+  if (ctr == nullptr || blockIdx.x != 0) return;
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+  const int nthreads = blockDim.x * blockDim.y;
+  int kept = 0;
+  for (int i = tid; i < n; i += nthreads) kept += keep[i];
+  count_keep(ctr, kept, tid == 0 ? n : 0);
+}
 
 // 이 (m, j)의 임계값(비제곱). 전 스레드가 중복 계산한다 — top_k(≤16)짜리 루프라
 // syncthreads 한 번보다 싸고, 공유 상태가 없어 결정적이다. host RuntimeCheck가

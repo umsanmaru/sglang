@@ -62,6 +62,9 @@ class SparseSpec:
     # score k1 (2026-09-05): 마스크가 per-k |x_k| >= thr — 커널이 a/c를 읽지 않는다. fp8 worklist
     # 커널만 per-k 진입점(sparsek1)을 갖는다 (prism_gemv_fp8.py가 이 플래그로 고른다).
     per_k: bool = False
+    # Threshold-controller counter int64 [2] = {kept, total} mask units the kernel adds to
+    # (thr_ctrl.py); with a controller, `thr` is the live device table it rewrites. None = off.
+    ctr: Optional[torch.Tensor] = None
 
 
 class GpuTier(Protocol):
@@ -546,7 +549,8 @@ class PackedWarmGateUp:
         gemv_packed_gateup(x2d, topk_ids, self.gate, self.up, out3d, 0, inter, False, stream)
 
 
-def _slab_sparse_spec(slab: ColdSlab, calib, thr, plan: Plan, layer_idx: int, proj: Proj) -> SparseSpec:
+def _slab_sparse_spec(slab: ColdSlab, calib, thr, plan: Plan, layer_idx: int, proj: Proj,
+                      ctr: Optional[torch.Tensor] = None) -> SparseSpec:
     """warm-kt slab의 sparse 재료 — 패딩된 인덱스로 gather된 calib(a=0, c=0인 패딩 행은
     energy 0이라 thr>0이면 죽고, weight도 0이라 어느 쪽이든 무해)."""
     spec = plan.sparsity
@@ -555,7 +559,7 @@ def _slab_sparse_spec(slab: ColdSlab, calib, thr, plan: Plan, layer_idx: int, pr
     return SparseSpec(
         a=calib.wn_sq.to(dev, torch.float32), c=calib.pair_dot.to(dev, torch.float32),
         thr=thr.to(dev, torch.float32), p=float(ep.sparsity_p), lam=float(ep.sparsity_lambda),
-        pmax=spec.pmax, grid=spec.grid, ng=spec.ng, renorm_it=spec.renorm_it,
+        pmax=spec.pmax, grid=spec.grid, ng=spec.ng, renorm_it=spec.renorm_it, ctr=ctr,
     )
 
 
@@ -583,7 +587,7 @@ _GATEUP_SPARSE = {Tier.HOT: SparseResidentGateUp, Tier.WARM: SparsePinnedGateUp}
 
 def _sparse_spec(
     shard: TierShard, thr: torch.Tensor, plan: Plan, layer_idx: int, proj: Proj,
-    where: str,
+    where: str, ctr: Optional[torch.Tensor] = None,
 ) -> SparseSpec:
     """티어의 점수 재료를 device로 올려 커널 인자 묶음을 만든다 (로드 타임 1회).
 
@@ -611,6 +615,7 @@ def _sparse_spec(
             a=None, c=None, thr=thr.to(dev, torch.float32),
             p=float(ep.sparsity_p), lam=float(ep.sparsity_lambda),
             pmax=spec.pmax, grid=spec.grid, ng=spec.ng, renorm_it=spec.renorm_it, per_k=True,
+            ctr=ctr,
         )
     calib = shard.calib
     if calib is None:
@@ -623,7 +628,7 @@ def _sparse_spec(
         c=calib.pair_dot.to(dev, torch.float32),
         thr=thr.to(dev, torch.float32),
         p=float(ep.sparsity_p), lam=float(ep.sparsity_lambda),
-        pmax=spec.pmax, grid=spec.grid, ng=spec.ng, renorm_it=spec.renorm_it,
+        pmax=spec.pmax, grid=spec.grid, ng=spec.ng, renorm_it=spec.renorm_it, ctr=ctr,
     )
 
 
@@ -634,6 +639,7 @@ def build_layer_tiers(
     cold_gpu: Optional[ColdGpuLayer] = None,
     warm_kt: Optional[ColdGpuLayer] = None,
     warm_kt_calib: Optional[dict] = None,
+    thr_ctrl=None,
 ) -> LayerTiers:
     """Stage 2 산출물 → phase 단위 티어. 없는 티어는 항목 자체가 없다.
 
@@ -644,6 +650,15 @@ def build_layer_tiers(
     발행하기 위해서고, 그 판단은 그 객체 안에 있다 (executor는 모른다).
     """
     sparse_on = plan.sparsity is not None
+
+    # thr_ctrl (thr_ctrl.LayerThresholdState): sparse tiers read its live device tables, which it
+    # rewrites in place, and count into its counters. Without it each tier copies the calib curve.
+    def thr_of(proj: Proj) -> torch.Tensor:
+        return prepared.thr[proj] if thr_ctrl is None else thr_ctrl.device_table(proj)
+
+    def ctr_of(proj: Proj) -> Optional[torch.Tensor]:
+        return None if thr_ctrl is None else thr_ctrl.gpu_counter(proj)
+
     shards: dict = {}
     specs: dict = {}
     for proj in Proj:
@@ -658,7 +673,7 @@ def build_layer_tiers(
             if sparse_on and tier in SPARSE_TIERS:
                 where = f"layer {layer_idx} {proj.value} {tier.value}"
                 specs[(proj, tier)] = _sparse_spec(
-                    shard, prepared.thr[proj], plan, layer_idx, proj, where)
+                    shard, thr_of(proj), plan, layer_idx, proj, where, ctr=ctr_of(proj))
 
     def single(proj: Proj, tier: Tier) -> GpuTier:
         shard = shards[(proj, tier)]
@@ -708,7 +723,8 @@ def build_layer_tiers(
         def spec(proj, slab):
             if not sparse_warm:
                 return None
-            return _slab_sparse_spec(slab, warm_kt_calib[proj], prepared.thr[proj], plan, layer_idx, proj)
+            return _slab_sparse_spec(slab, warm_kt_calib[proj], thr_of(proj), plan, layer_idx, proj,
+                                     ctr=ctr_of(proj))
         g, u, d = warm_kt.gate[0], warm_kt.up[0], warm_kt.down[0]
         gateup[Tier.WARM] = PackedWarmGateUp(g, u, spec(Proj.GATE, g), spec(Proj.UP, u))
         down[Tier.WARM] = PackedWarmTier(d, spec(Proj.DOWN, d))

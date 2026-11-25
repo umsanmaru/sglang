@@ -390,3 +390,34 @@ def test_expected_calib_shapes_axes():
     assert shapes["wn_down"][2] == DIMS["intermediate_size"]
     assert shapes["pair_dot_gate"][2] == DIMS["hidden_size"] // 2
     assert shapes["pair_dot_down"][2] == DIMS["intermediate_size"] // 2
+
+
+# ---------------------------------------------------------------------------
+# sparsity.controller - online threshold controller (thr_ctrl.py)
+# ---------------------------------------------------------------------------
+
+
+def test_threshold_controller_block_defaults():
+    """No block keeps the controller off; an empty block turns it on with the defaults."""
+    assert parse_plan(make_raw_sparse_plan()).sparsity.controller is None
+    raw = make_raw_sparse_plan()
+    raw["sparsity"]["controller"] = {}
+    check(raw)
+    ctrl = parse_plan(raw).sparsity.controller
+    assert (ctrl.window, ctrl.mu, ctrl.alpha_min, ctrl.alpha_max) == (4096, 1.0, 0.25, 4.0)
+
+
+@pytest.mark.parametrize("block, match", [
+    ({"window": 0}, "window"),
+    ({"mu": 0.0}, "mu"),
+    ({"alpha_min": 1.5}, "alpha_min <= 1 <= alpha_max"),
+    ({"alpha_max": 0.5}, "alpha_min <= 1 <= alpha_max"),
+    ({"windows": 4096}, "unknown keys"),
+])
+def test_threshold_controller_block_rejected(block, match):
+    """alpha starts at 1 (the calibrated table), so the clamp range must contain it; a misspelled
+    key must not silently fall back to a default."""
+    raw = make_raw_sparse_plan()
+    raw["sparsity"]["controller"] = block
+    with pytest.raises(PlanError, match=match):
+        check(raw)

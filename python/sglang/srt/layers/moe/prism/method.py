@@ -54,6 +54,7 @@ from sglang.srt.layers.moe.prism.runtime.config import (
     _ENV_MASK_STATS as _ENV_MASK_STATS,
     _ENV_MASK_STATS_EVERY as _ENV_MASK_STATS_EVERY,
     _ENV_MASK_STATS_NANPROBE as _ENV_MASK_STATS_NANPROBE,
+    _ENV_THR_CTRL_LOG as _ENV_THR_CTRL_LOG,
 )
 
 from sglang.srt.layers.moe.prism.runtime.context import PrismRuntime, RuntimeBindings
@@ -336,9 +337,16 @@ class PrismMoEMethod(FusedMoEMethodBase):
         )
         del full
         _t2 = _time.perf_counter()
+        keep_counter = None
+        if runtime.thr_ctrl is not None:
+            # From here on every consumer reads the controller's live tables, not the calib curves.
+            ctrl_state = runtime.thr_ctrl.register_layer(self.layer_id, prepared.thr, device)
+            prepared.thr = ctrl_state.host_tables()
+            keep_counter = ctrl_state.cpu_ctr
         ep = runtime.plan.expert(self.layer_id, 0)
         if any(ep.proj(p).has_tier(Tier.COLD) for p in Proj):
-            runtime.cold().load_layer(self.layer_id, prepared.cold, prepared.thr)
+            runtime.cold().load_layer(self.layer_id, prepared.cold, prepared.thr,
+                                      keep_counter=keep_counter)
             prepared.cold = None  # 주입 완료 — 소유권은 C++ (계약 ③)
         _t3 = _time.perf_counter()
         if prepared.warm_kt is not None:

@@ -28,6 +28,7 @@ def test_warm_source_released_after_tier_construction(monkeypatch, build_fails):
     executor._layer_cold_gpu = {}
     executor._layer_warm_kt = {}
     executor._mask_stats = None
+    executor._thr_ctrl = None
 
     def build(*args, warm_kt, warm_kt_calib, **kwargs):
         assert all(ref() is not None for ref in refs)

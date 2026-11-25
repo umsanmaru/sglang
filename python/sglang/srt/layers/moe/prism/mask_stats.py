@@ -58,14 +58,14 @@ def slot_sparsity(w: torch.Tensor, p: float, lam: float, pmax: float,
 class _ProjTables:
     """한 (layer, proj)의 점수 재료 — 전부 CPU fp32, full-K."""
 
-    def __init__(self, plan: Plan, calib, layer: int, proj: Proj):
+    def __init__(self, plan: Plan, calib, layer: int, proj: Proj, thr: torch.Tensor):
         dims = plan.dims
         K = dims.k_of(proj)
         E = dims.num_experts
         band = calib.slice_band(layer, proj, 0, K, where=f"mask_stats L{layer} {proj.value}")
         self.wn_sq = band.wn_sq                   # [E, K]
         self.pair_dot = band.pair_dot             # [E, K/2]
-        self.thr = calib.thr(layer, proj)         # [E, ng]
+        self.thr = thr                            # [E, ng]; the controller's live table if any
         ep0 = plan.expert(layer, 0).proj(proj)
         self.p = float(ep0.sparsity_p)
         self.lam = float(ep0.sparsity_lambda)
@@ -82,10 +82,12 @@ class MaskStats:
     """decode 마스크의 실현 keep 누적기. executor가 층 등록·관측을 호출한다."""
 
     def __init__(self, plan: Plan, calib, out_path: str, *, every: int = 16,
-                 nan_probe: bool = False):
+                 nan_probe: bool = False, thr_ctrl=None):
         if plan.sparsity is None or calib is None:
             raise ValueError("mask_stats requires a sparse plan with calib tables")
         self.plan, self.calib = plan, calib
+        # thr_ctrl.ThresholdController: recompute masks from its live tables, as the kernels do.
+        self.thr_ctrl = thr_ctrl
         self.spec = plan.sparsity
         self.out_path = out_path
         self.every = max(1, int(every))
@@ -112,8 +114,10 @@ class MaskStats:
 
     # ── 등록 ────────────────────────────────────────────────────────────
     def register_layer(self, layer: int) -> None:
+        live = None if self.thr_ctrl is None else self.thr_ctrl.layer(layer).host_tables()
         for proj in Proj:
-            self._tables[(layer, proj)] = _ProjTables(self.plan, self.calib, layer, proj)
+            thr = self.calib.thr(layer, proj) if live is None else live[proj]
+            self._tables[(layer, proj)] = _ProjTables(self.plan, self.calib, layer, proj, thr)
         if self._first_layer is None or layer < self._first_layer:
             self._first_layer = layer
 

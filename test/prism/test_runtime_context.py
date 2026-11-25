@@ -11,7 +11,8 @@ from sglang.srt.layers.moe.prism.runtime.context import PrismRuntime
 def make_runtime(monkeypatch):
     fmt = SimpleNamespace()
     monkeypatch.setattr(kernels, 'gpu_store_format', lambda key: fmt)
-    plan = SimpleNamespace(kernels=SimpleNamespace(gpu_warm='test'), experts=[])
+    plan = SimpleNamespace(kernels=SimpleNamespace(gpu_warm='test'), experts=[],
+                           sparsity=None)
     return M._PrismRuntime(plan), fmt
 
 

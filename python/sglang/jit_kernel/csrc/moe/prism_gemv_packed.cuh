@@ -9,6 +9,8 @@
 
 #include <cstdint>
 
+#include "prism_sparse_common.cuh"
+
 namespace {
 
 // Prism worklist GEMV — **kt packed(AMX) 레이아웃** 판 (2026-08-27).
@@ -51,6 +53,7 @@ struct PackedSparse {
   const float* topk_w;  // [M, top_k]
   float p, lam, pmax, grid;
   int ng, renorm_it;
+  long long* ctr = nullptr;  // threshold-controller {kept, total} pairs; nullptr = off
 };
 
 __device__ __forceinline__ long long packed_tile_base(
@@ -136,6 +139,7 @@ __global__ void __launch_bounds__(kPackedThreads) prism_gemv_packed(
     __syncthreads();
     if constexpr (SPARSE) {
       const int np = cnt >> 1;
+      int ctr_kept = 0, ctr_total = 0;
       for (int i = tid; i < np; i += kPackedThreads) {
         const float x0 = __bfloat162float(xs[2 * i]);
         const float x1 = __bfloat162float(xs[2 * i + 1]);
@@ -143,8 +147,15 @@ __global__ void __launch_bounds__(kPackedThreads) prism_gemv_packed(
         float en = sp.a[ar] * x0 * x0 + sp.a[ar + 1] * x1 * x1 + 2.0f * sp.c[ar >> 1] * x0 * x1;
         if (en < 0.f) en = 0.f;
         keep[i] = (en >= thr2) ? uint8_t{1} : uint8_t{0};
+        if (sp.ctr != nullptr) {
+          // Padding pairs (k_pad > k) carry a = c = 0 and always die; they are not real rows.
+          const bool real = sp.a[ar] != 0.f || sp.a[ar + 1] != 0.f;
+          ctr_kept += (keep[i] != 0 && real) ? 1 : 0;
+          ctr_total += real ? 1 : 0;
+        }
       }
       __syncthreads();
+      prism_sparse::count_keep(sp.ctr, ctr_kept, ctr_total);
     }
     if (active && nt < s.n_cols) {
       // 이 스테이지의 K 타일들: ks = base/32 .. ; 각 타일에서 페어 kp를 맡는다.
@@ -193,6 +204,7 @@ struct PackedSparseIn {
   tvm::ffi::TensorView a, c, thr, topk_w;
   double p, lam, pmax, grid;
   int64_t ng, renorm_it;
+  const tvm::ffi::TensorView* ctr = nullptr;  // keep counter; nullptr or empty = off
 };
 
 inline PackedSlot make_slot(const PackedIn& in, const DLDevice& dev, int64_t E1) {
@@ -259,6 +271,10 @@ inline void gemv_packed_impl(
     d.p = static_cast<float>(in.p); d.lam = static_cast<float>(in.lam);
     d.pmax = static_cast<float>(in.pmax); d.grid = static_cast<float>(in.grid);
     d.ng = static_cast<int>(in.ng); d.renorm_it = static_cast<int>(in.renorm_it);
+    if (in.ctr != nullptr && in.ctr->numel() != 0) {
+      TensorMatcher({2}).with_dtype<int64_t>().with_device(cuda_device).verify(*in.ctr);
+      d.ctr = static_cast<long long*>(in.ctr->data_ptr());
+    }
   };
   if (sp0) fill_sparse(*sp0, sa);
   if (sp1) fill_sparse(*sp1, sb); else sb = sa;
@@ -305,12 +321,12 @@ void gemv_packed_sparse(
     tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView out,
     tvm::ffi::TensorView w, tvm::ffi::TensorView blk_off, tvm::ffi::TensorView row_off,
     tvm::ffi::TensorView kidx, tvm::ffi::TensorView a, tvm::ffi::TensorView c,
-    tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,
+    tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
     int64_t out_col_offset, int64_t n_cols, int64_t n_block, int64_t k_block,
     int64_t x_row_is_pair, double p, double lam, double pmax, double grid,
     int64_t ng, int64_t renorm_it, int64_t n_contiguous) {
   const PackedIn s0{w, blk_off, row_off, kidx, out_col_offset, n_cols, n_block, k_block, n_contiguous != 0};
-  const PackedSparseIn sp{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
+  const PackedSparseIn sp{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, &ctr};
   gemv_packed_impl(x, topk, out, x_row_is_pair, s0, nullptr, &sp, nullptr);
 }
 
@@ -321,14 +337,14 @@ void gemv_packed_sparse_gateup(
     tvm::ffi::TensorView w_u, tvm::ffi::TensorView blk_u, tvm::ffi::TensorView ro_u, tvm::ffi::TensorView ki_u,
     tvm::ffi::TensorView a_g, tvm::ffi::TensorView c_g, tvm::ffi::TensorView thr_g,
     tvm::ffi::TensorView a_u, tvm::ffi::TensorView c_u, tvm::ffi::TensorView thr_u,
-    tvm::ffi::TensorView topk_w,
+    tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_g, tvm::ffi::TensorView ctr_u,
     int64_t out_col_g, int64_t out_col_u, int64_t n_cols, int64_t n_block, int64_t k_block,
     int64_t x_row_is_pair, double p_g, double lam_g, double p_u, double lam_u,
     double pmax, double grid, int64_t ng, int64_t renorm_it, int64_t n_contiguous) {
   const PackedIn s0{w_g, blk_g, ro_g, ki_g, out_col_g, n_cols, n_block, k_block, n_contiguous != 0};
   const PackedIn s1{w_u, blk_u, ro_u, ki_u, out_col_u, n_cols, n_block, k_block, n_contiguous != 0};
-  const PackedSparseIn sp0{a_g, c_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it};
-  const PackedSparseIn sp1{a_u, c_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it};
+  const PackedSparseIn sp0{a_g, c_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it, &ctr_g};
+  const PackedSparseIn sp1{a_u, c_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it, &ctr_u};
   gemv_packed_impl(x, topk, out, x_row_is_pair, s0, &s1, &sp0, &sp1);
 }
 

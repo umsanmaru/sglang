@@ -35,6 +35,10 @@ Plan 파일(JSON) 형식::
       ]
     }
 
+Optional ``"sparsity": {..., "controller": {"window": 4096, "mu": 1.0,
+"alpha_min": 0.25, "alpha_max": 4.0}}`` turns on the online threshold
+controller (ThresholdControlSpec); missing keys take those defaults.
+
 "sparsity"는 model-global이고 생략 가능하다 (없으면 dense = 현행 동작).
 있으면 모든 proj가 예산 (p, lambda)를 가져야 한다 — threshold **값**은
 Plan에 없다. calib 자산의 곡선에서 step마다 조회된다:
@@ -118,6 +122,21 @@ class CalibRef:
 
 
 @dataclass(frozen=True)
+class ThresholdControlSpec:
+    """Online threshold controller (thr_ctrl.py), keyed by layer and proj.
+
+    Every `window` masked decode steps: alpha <- clamp(alpha * (1 - mu * (d - p)),
+    alpha_min, alpha_max), where d is the window's realized full-K sparsity (hot rows
+    count as kept) and p the plan budget; the live threshold table is calib * alpha.
+    """
+
+    window: int = 4096
+    mu: float = 1.0
+    alpha_min: float = 0.25
+    alpha_max: float = 4.0
+
+
+@dataclass(frozen=True)
 class SparsitySpec:
     """model-global sparsity 설정 (계약 ①의 kernels와 같은 급).
 
@@ -134,6 +153,8 @@ class SparsitySpec:
     grid: float
     ng: int
     renorm_it: int
+    # None keeps the calibrated tables fixed (no online control).
+    controller: Optional[ThresholdControlSpec] = None
 
     def expected_calib_shapes(self, dims: ModelDims) -> Mapping[str, tuple[int, ...]]:
         """calib 자산이 가져야 하는 논리 테이블 -> shape.
@@ -243,9 +264,26 @@ def _parse_sparsity(obj: Optional[dict]) -> Optional[SparsitySpec]:
             grid=float(obj["grid"]),
             ng=int(obj["ng"]),
             renorm_it=int(obj["renorm_it"]),
+            controller=_parse_threshold_control(obj.get("controller")),
         )
     except (KeyError, TypeError, ValueError) as err:
         raise PlanError(f"malformed sparsity block: {err}") from err
+
+
+def _parse_threshold_control(obj: Optional[dict]) -> Optional[ThresholdControlSpec]:
+    """`sparsity.controller`; absent means off, and missing keys take the defaults."""
+    if obj is None:
+        return None
+    unknown = sorted(set(obj) - {"window", "mu", "alpha_min", "alpha_max"})
+    if unknown:
+        raise PlanError(f"sparsity.controller: unknown keys {unknown}")
+    d = ThresholdControlSpec()
+    return ThresholdControlSpec(
+        window=int(obj.get("window", d.window)),
+        mu=float(obj.get("mu", d.mu)),
+        alpha_min=float(obj.get("alpha_min", d.alpha_min)),
+        alpha_max=float(obj.get("alpha_max", d.alpha_max)),
+    )
 
 
 def _parse_expert(obj: dict, where: str) -> ExpertPlan:
@@ -394,6 +432,18 @@ def _validate_shards(
         raise PlanError(f"{where}: shards cover [0, {cursor}) but N={N}")
 
 
+def _validate_threshold_control(ctrl: ThresholdControlSpec) -> None:
+    if ctrl.window < 1:
+        raise PlanError(f"sparsity.controller.window must be >= 1, got {ctrl.window}")
+    if not ctrl.mu > 0.0:
+        raise PlanError(f"sparsity.controller.mu must be positive, got {ctrl.mu}")
+    # alpha starts at 1 (the calibrated table), so the clamp range must contain it.
+    if not 0.0 < ctrl.alpha_min <= 1.0 <= ctrl.alpha_max:
+        raise PlanError(
+            f"sparsity.controller needs 0 < alpha_min <= 1 <= alpha_max, "
+            f"got [{ctrl.alpha_min}, {ctrl.alpha_max}]")
+
+
 def _validate_sparsity_spec(
     spec: SparsitySpec,
     dims: ModelDims,
@@ -433,6 +483,8 @@ def _validate_sparsity_spec(
                 f"K of {proj.value} ({dims.k_of(proj)}) not divisible by "
                 f"PAIR_GROUP={PAIR_GROUP}"
             )
+    if spec.controller is not None:
+        _validate_threshold_control(spec.controller)
 
     if calib_probe is None:
         return

@@ -53,6 +53,8 @@ _ENV_MASK_STATS = "SGLANG_PRISM_MASK_STATS"
 _ENV_MASK_STATS_EVERY = "SGLANG_PRISM_MASK_STATS_EVERY"
 # NaN 진단: 층 입력/act의 유한성을 prefill 포함해 검사 (층당 GPU 리덕션 + 동기).
 _ENV_MASK_STATS_NANPROBE = "SGLANG_PRISM_MASK_STATS_NANPROBE"
+# JSON path for the threshold controller's per-window (alpha, sparsity) report, written at exit.
+_ENV_THR_CTRL_LOG = "SGLANG_PRISM_THR_CTRL_LOG"
 
 
 
@@ -176,3 +178,7 @@ class PrismEnvConfig:
     @property
     def mask_stats_nan_probe(self) -> bool:
         return self.env.get(_ENV_MASK_STATS_NANPROBE) == "1"
+
+    @property
+    def thr_ctrl_log_path(self) -> str | None:
+        return self.env.get(_ENV_THR_CTRL_LOG)

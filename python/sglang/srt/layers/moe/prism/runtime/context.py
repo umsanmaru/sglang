@@ -75,6 +75,13 @@ class PrismRuntime:
         # sparsity 점수·threshold 테이블 (dense plan이면 None). 프로세스에 1벌 —
         # 레이어마다 다시 열면 382MB 자산을 40번 읽게 된다.
         self.calib = calib
+        # Online threshold controller (thr_ctrl.py); None keeps the calibrated tables fixed.
+        self.thr_ctrl = None
+        if plan.sparsity is not None and plan.sparsity.controller is not None:
+            from sglang.srt.layers.moe.prism.thr_ctrl import ThresholdController
+
+            self.thr_ctrl = ThresholdController(
+                plan, log_path=self._bindings.config().thr_ctrl_log_path)
         self.max_tokens = self._bindings.config().max_tokens
         self._resources = None
         self._cold = None
@@ -111,7 +118,8 @@ class PrismRuntime:
 
                 mask_stats = MaskStats(self.plan, self.calib, self._bindings.config().mask_stats_path,
                                        every=self._bindings.config().mask_stats_every,
-                                       nan_probe=self._bindings.config().mask_stats_nan_probe)
+                                       nan_probe=self._bindings.config().mask_stats_nan_probe,
+                                       thr_ctrl=self.thr_ctrl)
             self._executor = PrismExecutor(
                 self.plan, self._resources,
                 self.cold() if (self.has_cold or
@@ -130,6 +138,7 @@ class PrismRuntime:
                 cold_async=self._bindings.config().cold_async,
                 cold_split=self._bindings.config().cold_split,
                 mask_stats=mask_stats,
+                thr_ctrl=self.thr_ctrl,
             )
         return self._executor
 

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.jit_kernel.prism_gemv import keep_ctr_arg
 from sglang.jit_kernel.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
@@ -68,7 +69,7 @@ def gemv_packed_sparse(x2d, topk_ids, topk_weights, slab, sp, out3d, out_col_off
     with torch.cuda.stream(stream):
         module.gemv_packed_sparse(
             x2d, topk_ids, out3d, slab.slab, slab.blk_off, slab.row_off, slab.k_index,
-            sp.a, sp.c, sp.thr, topk_weights,
+            sp.a, sp.c, sp.thr, topk_weights, keep_ctr_arg(sp),
             int(out_col_offset) + int(slab.n_start), int(slab.n), int(slab.n_block), int(slab.k_block),
             int(bool(x_row_is_pair)), float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid),
             int(sp.ng), int(sp.renorm_it), int(slab.layout == "kt_bf16_nc"))
@@ -86,6 +87,7 @@ def gemv_packed_sparse_gateup(x2d, topk_ids, topk_weights, gate, up, sp_gate, sp
             gate.slab, gate.blk_off, gate.row_off, gate.k_index,
             up.slab, up.blk_off, up.row_off, up.k_index,
             sp_gate.a, sp_gate.c, sp_gate.thr, sp_up.a, sp_up.c, sp_up.thr, topk_weights,
+            keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up),
             int(out_col_gate) + int(gate.n_start), int(out_col_up) + int(up.n_start),
             int(gate.n), int(gate.n_block), int(gate.k_block), int(bool(x_row_is_pair)),
             float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
