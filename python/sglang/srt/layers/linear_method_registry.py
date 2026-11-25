@@ -129,10 +129,14 @@ def maybe_wrap_linear_quant_method(
         return linear_method
 
     if server_args is None:
-        from sglang.srt.server_args import get_global_server_args
+        # The operator's ServerArgs record, as `FusedMoE` passes to the MoE
+        # registry. `get_global_server_args()` is retired upstream and raises
+        # RuntimeError unconditionally; `get_server_args()` raises ValueError
+        # until a server has published its config.
+        from sglang.srt.runtime_context import get_server_args
 
         try:
-            server_args = get_global_server_args()
+            server_args = get_server_args()
         except ValueError:
             server_args = None  # no server in this process; predicates handle it
 

@@ -106,6 +106,42 @@ def test_passthrough_returns_same_object():
     assert maybe_wrap_linear_quant_method(object(), inner, "p") is inner
 
 
+def test_registered_wrapper_without_server_gets_none(registry):
+    """래퍼가 등록된 상태에서 서버 없이 훅을 부른다 — server_args 조회 경로 자체.
+
+    `get_global_server_args()`가 upstream에서 retire되어 무조건 RuntimeError를
+    던지게 된 뒤, 이 경로가 `ValueError`만 잡고 있어서 dense-linear Prism 모델이
+    전부 init에서 죽었다 (PRI-31). LinearBase 생성자 시그니처와 무관하게 잡도록
+    훅을 직접 부른다.
+    """
+    seen = []
+    registry("probe", _seen_predicate(seen), lambda l, i, c: _Probe(i, c))
+
+    inner = UnquantizedLinearMethod()
+    out = maybe_wrap_linear_quant_method(torch.nn.Linear(4, 4), inner, "x")
+
+    assert seen == [("x", None)]
+    assert isinstance(out, _Probe) and out.inner is inner
+
+
+def test_registered_wrapper_sees_published_server_args(registry):
+    """서버가 config를 publish한 뒤에는 predicate가 그 ServerArgs 레코드를 받는다."""
+    from sglang.srt import runtime_context as rc
+    from sglang.srt.server_args import ServerArgs
+
+    seen = []
+    registry("probe", _seen_predicate(seen), lambda l, i, c: _Probe(i, c))
+
+    args = ServerArgs(model_path="dummy", device="cpu", tp_size=1)
+    ctx = rc.create_context(args, role="test", ranks=rc.SpawnRanks(world_rank=0))
+    with rc.use_context(ctx):
+        maybe_wrap_linear_quant_method(
+            torch.nn.Linear(4, 4), UnquantizedLinearMethod(), "x"
+        )
+
+    assert len(seen) == 1 and seen[0][1] is args
+
+
 # ── 2. 붙는다 / 안 붙는다 ───────────────────────────────────────────────────
 
 
