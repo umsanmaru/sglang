@@ -9,10 +9,10 @@ MoE 쪽 `maybe_wrap_moe_quant_method`에 대응하는 `LinearBase`용 슬롯이 
      파라미터를 CPU에 할당하고 K-슬라이스한 뒤 원본을 놓는데, create_weights가
      이미 돈 뒤에 붙는 래퍼는 그 결정을 못 한다. 붙는 시점에 `weight`가 아직
      없다는 것을 단언한다.
-  3. **tp_size는 predicate에서 안 보이고 create_weights에서는 보인다.**
-     서브클래스가 `super().__init__()` 반환 *후에* 대입하기 때문이다. 이 순서를
-     모르고 predicate에서 TP를 보려 하면 조용히 AttributeError가 아니라 조용히
-     "TP=1인 척"이 된다 — 그래서 양쪽을 다 못박는다.
+  3. **create_weights 시점에 TP 분할 크기가 보인다.** upstream #42426 이후
+     linear는 `tp_rank`/`tp_size` 인자·속성 대신 `parallel_group`을 받아
+     `layer.tp_group`에 묶고, 크기는 `get_group_rank_size(layer.tp_group)`로
+     읽는다. 그 값을 create_weights 시점에 못박는다.
 
 standalone 실행(서버 없음)이라 `get_global_server_args()`가 죽는 환경이기도
 하다. 그 경로도 여기서 같이 커버된다 (predicate가 server_args=None을 받는다).
@@ -21,6 +21,7 @@ standalone 실행(서버 없음)이라 `get_global_server_args()`가 죽는 환�
 import pytest
 import torch
 
+from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -36,7 +37,9 @@ from sglang.srt.layers.linear_method_registry import (
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
 H, N = 32, 64
-TP = {"tp_rank": 0, "tp_size": 1}  # dist 초기화 회피
+# dist 초기화 회피: 분할 없는 레이아웃 (tp_group=None → rank 0, size 1).
+# upstream #42426이 `tp_rank`/`tp_size` 인자를 `parallel_group`으로 바꿨다.
+TP = {"parallel_group": "replicated"}
 
 
 class _Probe:
@@ -58,8 +61,12 @@ class _Probe:
             {
                 # 훅 시점이 create_weights **직전**인가 (불변식 2)
                 "weight_exists": hasattr(layer, "weight"),
-                # 이때는 서브클래스가 tp를 이미 대입했는가 (불변식 3)
-                "tp_size": getattr(layer, "tp_size", None),
+                # 이때 TP 분할 크기를 읽을 수 있는가 (불변식 3)
+                "tp_size": (
+                    get_group_rank_size(layer.tp_group)[1]
+                    if hasattr(layer, "tp_group")
+                    else None
+                ),
             }
         )
         return self.inner.create_weights(layer, *args, **kwargs)
