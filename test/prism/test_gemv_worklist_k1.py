@@ -114,7 +114,8 @@ def test_sparsek1_masks_what_it_says(pinned):
 
 
 @cuda_required
-def test_sparsek1_gateup_fusion_matches_two_launches():
+@pytest.mark.parametrize("weighted", [False, True], ids=["k1", "k1w"])
+def test_sparsek1_gateup_fusion_matches_two_launches(weighted):
     """warm의 실제 경로(gate|up 융합)가 per-k 2회 launch와 비트일치. thr은 서로 다르게."""
     from sglang.jit_kernel.prism_gemv import (
         gemv_worklist_indexed_pinned_sparse, gemv_worklist_indexed_pinned_sparse_gateup,
@@ -124,7 +125,13 @@ def test_sparsek1_gateup_fusion_matches_two_launches():
     xg, wg, rog, kig, ids, wts = _store(seed=31)
     _, wu, rou, kiu, _, _ = _store(seed=32)
     s = torch.cuda.current_stream()
-    spg, spu = _spec(1.5), _spec(3.5)
+    ag = au = None
+    if weighted:
+        # k1w gate|up have their own sparsek1w_gateup entries; distinct wn2 per proj.
+        g = torch.Generator().manual_seed(33)
+        ag = (torch.rand(int(rog[-1]), generator=g) * 3.0 + 0.25).cuda()
+        au = (torch.rand(int(rou[-1]), generator=g) * 3.0 + 0.25).cuda()
+    spg, spu = _spec(1.5, a=ag), _spec(3.5, a=au)
     for single, fused, pin in ((gemv_worklist_indexed_sparse,
                                 gemv_worklist_indexed_sparse_gateup, False),
                                (gemv_worklist_indexed_pinned_sparse,

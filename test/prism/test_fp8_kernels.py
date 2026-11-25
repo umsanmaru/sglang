@@ -362,10 +362,10 @@ def test_grouped_fp8_cold_tile_matches_gemv(exact, layout):
 # ── score k1 (per-k |x| >= thr) — fp8 warm worklist 커널의 per-k 마스크 (2026-09-05) ──────────
 
 
-def _sparse_spec_k1(E_, thr_val):
+def _sparse_spec_k1(E_, thr_val, a=None):
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
-    return SparseSpec(a=None, c=None, thr=torch.full((E_, 4), thr_val, device="cuda"),
+    return SparseSpec(a=a, c=None, thr=torch.full((E_, 4), thr_val, device="cuda"),
                       p=0.5, lam=0.0, pmax=0.9, grid=0.1, ng=4, renorm_it=1, per_k=True)
 
 
@@ -386,8 +386,9 @@ def _zero_below(x, kidx_c, ro_c, ids, k_rows, thr):
 
 
 @cuda_required
+@pytest.mark.parametrize("weighted", [False, True], ids=["k1", "k1w"])
 @pytest.mark.parametrize("pinned", [False, True])
-def test_gemv_fp8_sparsek1_thr0_bitwise_and_masked(pinned):
+def test_gemv_fp8_sparsek1_thr0_bitwise_and_masked(pinned, weighted):
     """per-k: thr=0 ↔ dense 비트일치; thr>0 ↔ dense(|x|<thr 인 k를 0으로 둔 x) **비트일치**
     (죽은 행을 x=0·w=0으로 두므로 항과 순서가 같다)."""
     from sglang.jit_kernel.prism_gemv_fp8 import (
@@ -404,18 +405,21 @@ def test_gemv_fp8_sparsek1_thr0_bitwise_and_masked(pinned):
     x, ids = _inputs(M, K, False, False, seed=62)
     stream = torch.cuda.current_stream()
     w = torch.rand(M, TOPK, generator=torch.Generator().manual_seed(63)).cuda()
+    # k1w with wn2 == 1 keeps exactly the k that k1 keeps (x*x*1 >= thr*thr is exact for
+    # bf16 x), so the same references hold and the sparsek1w entries get covered.
+    a = torch.ones(int(row_off[-1]), device="cuda") if weighted else None
 
     dense = torch.zeros(M, TOPK, N, dtype=torch.bfloat16, device="cuda")
     dense_fn(x.cuda(), ids.cuda(), codes, scales, row_off, kidx, dense, 0, False, stream)
     sp0 = torch.zeros_like(dense)
-    sparse_fn(x.cuda(), ids.cuda(), w, codes, scales, row_off, kidx, sp0, _sparse_spec_k1(E, 0.0),
+    sparse_fn(x.cuda(), ids.cuda(), w, codes, scales, row_off, kidx, sp0, _sparse_spec_k1(E, 0.0, a),
               0, False, stream)
     torch.cuda.synchronize()
     assert torch.equal(dense, sp0)
 
     thr = 0.5
     masked = torch.zeros_like(dense)
-    sparse_fn(x.cuda(), ids.cuda(), w, codes, scales, row_off, kidx, masked, _sparse_spec_k1(E, thr),
+    sparse_fn(x.cuda(), ids.cuda(), w, codes, scales, row_off, kidx, masked, _sparse_spec_k1(E, thr, a),
               0, False, stream)
     torch.cuda.synchronize()
     # 참조: (m, j)마다 마스킹된 x로 dense를 다시 돈다 — 그 슬롯 행만 취한다.

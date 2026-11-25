@@ -209,6 +209,47 @@ def test_gemv_mxfp4_sparse_thr0_bitwise_and_masked():
 
 
 @cuda_required
+def test_gemv_mxfp4_sparse_gateup_fused_bitwise():
+    """sparse gate|up fusion matches two single sparse launches, device and pinned."""
+    from sglang.jit_kernel.prism_gemv_mxfp4 import (
+        gemv_mxfp4_indexed_pinned_sparse, gemv_mxfp4_indexed_pinned_sparse_gateup,
+        gemv_mxfp4_indexed_sparse, gemv_mxfp4_indexed_sparse_gateup,
+    )
+    from sglang.srt.layers.moe.prism.tiers import SparseSpec
+
+    N, K, k_rows, M = 128, 256, 128, 2
+    c1, s1, ro1, ki1, _ = _store(N, K, k_rows, False, seed=31)
+    c2, s2, ro2, ki2, _ = _store(N, K, k_rows, False, seed=32)
+    x, ids = _inputs(M, K, False, False, seed=33)
+    g = torch.Generator().manual_seed(34)
+    w = torch.rand(M, TOPK, generator=g).cuda()
+    total = E * k_rows
+
+    def spec(thr_val):
+        return SparseSpec(a=torch.rand(total, generator=g).cuda(),
+                          c=(torch.rand(total // 2, generator=g) * 0.1).cuda(),
+                          thr=torch.full((E, 4), thr_val, device="cuda"),
+                          p=0.5, lam=0.0, pmax=0.9, grid=0.1, ng=4, renorm_it=1)
+
+    spg, spu = spec(0.4), spec(0.6)
+    stream = torch.cuda.current_stream()
+    for single, fused, pin in ((gemv_mxfp4_indexed_sparse, gemv_mxfp4_indexed_sparse_gateup, False),
+                               (gemv_mxfp4_indexed_pinned_sparse,
+                                gemv_mxfp4_indexed_pinned_sparse_gateup, True)):
+        cg, sg, cu, su = (tuple(t.cpu().pin_memory() for t in (c1, s1, c2, s2)) if pin
+                          else (c1, s1, c2, s2))
+        ref = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
+        single(x.cuda(), ids.cuda(), w, cg, sg, ro1, ki1, ref, spg, 0, False, stream)
+        single(x.cuda(), ids.cuda(), w, cu, su, ro2, ki2, ref, spu, N, False, stream)
+        out = torch.zeros_like(ref)
+        fused(x.cuda(), ids.cuda(), w, cg, sg, ro1, ki1, cu, su, ro2, ki2, out, spg, spu,
+              0, N, False, stream)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref), f"pinned={pin}"
+        assert torch.count_nonzero(out) > 0
+
+
+@cuda_required
 @pytest.mark.parametrize("pair", [False, True])
 @pytest.mark.parametrize("exact", [False, True])
 @pytest.mark.parametrize("m", [8, 300])
