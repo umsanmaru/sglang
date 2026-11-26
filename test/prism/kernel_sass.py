@@ -11,6 +11,10 @@ such fingerprints.
 
 Function names are demangled and stripped of anonymous-namespace and `sglang::`
 qualifiers, so a function keeps its key when its file or namespace changes.
+
+Both JIT caches are read: the vendored loader's `TVM_FFI_CACHE_DIR/<module>_<hash>/` and
+upstream sglang.kernels.jit's `SGLANG_JIT_CACHE_DIR/<target>/<module>/build-*/deps-*/`.
+Set both variables to the same fresh directory before `build`.
 """
 
 from __future__ import annotations
@@ -28,18 +32,17 @@ import sys
 from kernel_golden import WRAPPER_MODULES
 
 _CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
-_MODULE_GLOB = "sgl_kernel_jit_prism_*"
+_SO_PREFIX = "sgl_kernel_jit_prism_"
 _ADDR = re.compile(r"/\*[0-9a-f]{4,}\*/")
 _ENCODING = re.compile(r"/\* 0x[0-9a-f]{16} \*/")
 _QUALIFIERS = re.compile(r"\(anonymous namespace\)::|\bsglang::")
 
 
 def build(cache_dir: str) -> None:
-    """Compile every Prism module into `cache_dir` (TVM_FFI_CACHE_DIR must point there)."""
-    if os.path.abspath(os.environ.get("TVM_FFI_CACHE_DIR", "")) != os.path.abspath(
-        cache_dir
-    ):
-        sys.exit(f"set TVM_FFI_CACHE_DIR={cache_dir} before importing sglang")
+    """Compile every Prism module into `cache_dir` (both JIT cache variables must point there)."""
+    for var in ("TVM_FFI_CACHE_DIR", "SGLANG_JIT_CACHE_DIR"):
+        if os.path.abspath(os.environ.get(var, "")) != os.path.abspath(cache_dir):
+            sys.exit(f"set {var}={cache_dir} before importing sglang")
     for modname in WRAPPER_MODULES:
         m = importlib.import_module(modname)
         getters = [
@@ -96,14 +99,12 @@ def _functions(so_path: str) -> dict:
 
 def dump(cache_dir: str, out_json: str) -> None:
     fp = {}
-    for d in sorted(glob.glob(os.path.join(cache_dir, _MODULE_GLOB))):
-        sos = glob.glob(os.path.join(d, "*.so"))
-        if len(sos) != 1:
-            sys.exit(f"{d}: expected one .so, found {len(sos)}")
-        module = re.sub(r"_[0-9a-f]{16}$", "", os.path.basename(d))
+    pattern = os.path.join(cache_dir, "**", _SO_PREFIX + "*.so")
+    for so in sorted(glob.glob(pattern, recursive=True)):
+        module = os.path.basename(so)[: -len(".so")]
         if module in fp:
             sys.exit(f"{cache_dir}: two builds of {module}; use a fresh cache dir")
-        fp[module] = _functions(sos[0])
+        fp[module] = _functions(so)
     with open(out_json, "w") as f:
         json.dump(fp, f, indent=1, sort_keys=True)
     n = sum(len(v) for v in fp.values())
