@@ -6,6 +6,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 // k2wl2 sparsity의 커널 측 공용 부품 — bf16 worklist(prism_gemv.cuh)와 mxfp4
 // worklist(prism_gemv_mxfp4.cuh)가 **같은 임계값·같은 페어 에너지 식**을 쓴다는 것을
 // 코드로 강제한다. 식과 반올림은 kt의 slot_sparsity/thr_of/build_pair_mask를 그대로
@@ -193,3 +195,5 @@ __device__ __forceinline__ float pair_energy(const SparseArgs& sp, long long ar,
 }
 
 }  // namespace prism_sparse
+
+}  // namespace sglang

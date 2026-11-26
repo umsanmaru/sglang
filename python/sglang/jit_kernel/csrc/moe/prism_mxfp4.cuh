@@ -10,6 +10,8 @@
 
 #include "prism_host_common.cuh"
 
+namespace sglang {
+
 // MXFP4 (e2m1 코드 + E8M0 32-블록 배율) 디코드 — GEMV·grouped 두 커널의 공용 device 헬퍼.
 //
 // 체크포인트 규약 (DeepSeek-V4-Flash, `inference/convert.py`): 바이트 하나 = k 짝수(하위
@@ -81,3 +83,5 @@ inline int64_t verify_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView sca
 }
 
 }  // namespace prism_mxfp4
+
+}  // namespace sglang

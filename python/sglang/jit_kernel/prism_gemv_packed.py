@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.jit_kernel.prism_gemv import keep_ctr_arg
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 def _jit_prism_gemv_packed_module() -> Module:
     return load_jit(
         "prism_gemv_packed",
-        cuda_files=["moe/prism_gemv_packed.cuh"],
+        cuda_files=["../../../jit_kernel/csrc/moe/prism_gemv_packed.cuh"],
         cuda_wrappers=[
             ("gemv_packed", "gemv_packed"),
             ("gemv_packed_gateup", "gemv_packed_gateup"),

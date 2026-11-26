@@ -15,6 +15,8 @@
 #include "prism_host_common.cuh"
 #include "prism_sparse_common.cuh"
 
+namespace sglang {
+
 namespace {
 
 using prism_sparse::SparseArgs;
@@ -555,3 +557,5 @@ PRISM_F8_ENTRY_SPARSEK1W(gemv_fp8pt_indexed_pinned_sparsek1w, false, true)
 #undef PRISM_F8_ENTRY_SPARSEK1_GATEUP
 
 }  // namespace
+
+}  // namespace sglang

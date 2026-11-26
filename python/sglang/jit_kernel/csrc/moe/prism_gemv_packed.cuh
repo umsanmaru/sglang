@@ -12,6 +12,8 @@
 #include "prism_host_common.cuh"
 #include "prism_sparse_common.cuh"
 
+namespace sglang {
+
 namespace {
 
 // Prism worklist GEMV — **kt packed(AMX) 레이아웃** 판 (2026-08-27).
@@ -346,3 +348,5 @@ void gemv_packed_sparse_gateup(
 }
 
 }  // namespace
+
+}  // namespace sglang

@@ -8,6 +8,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 namespace {
 
 // Prism warm-band gather: dst[g] = pinned_src[sel[g]].
@@ -167,3 +169,5 @@ void gather_bands_from_device(
 }
 
 }  // namespace
+
+}  // namespace sglang

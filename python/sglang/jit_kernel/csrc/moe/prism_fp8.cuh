@@ -10,6 +10,8 @@
 
 #include "prism_host_common.cuh"
 
+namespace sglang {
+
 // FP8 e4m3 (128×128 블록 fp32 배율) 디코드 — GEMV·grouped 두 커널의 공용 device 헬퍼.
 //
 // 체크포인트 규약 (DeepSeek blockwise fp8, kt `fp8-moe.hpp`와 같은 것): 원소 하나 = e4m3
@@ -97,3 +99,5 @@ inline int64_t verify_store(tvm::ffi::TensorView codes, tvm::ffi::TensorView sca
 }
 
 }  // namespace prism_fp8
+
+}  // namespace sglang

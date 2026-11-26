@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.jit_kernel.prism_gemv import keep_ctr_arg
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -36,7 +36,7 @@ _WRAPPERS = (
 def _jit_prism_gemv_mxfp4_module() -> Module:
     return load_jit(
         "prism_gemv_mxfp4",
-        cuda_files=["moe/prism_gemv_mxfp4.cuh"],
+        cuda_files=["../../../jit_kernel/csrc/moe/prism_gemv_mxfp4.cuh"],
         cuda_wrappers=[(n, n) for n in _WRAPPERS],
     )
 

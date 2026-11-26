@@ -13,6 +13,8 @@
 
 #include "prism_host_common.cuh"
 
+namespace sglang {
+
 namespace {
 
 using namespace nvcuda;
@@ -870,3 +872,5 @@ void grouped_gemm_indexed_pinned_gateup(
 }
 
 }  // namespace
+
+}  // namespace sglang

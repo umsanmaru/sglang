@@ -14,6 +14,8 @@
 #include "prism_host_common.cuh"
 #include "prism_mxfp4.cuh"
 
+namespace sglang {
+
 namespace {
 
 using namespace nvcuda;
@@ -573,3 +575,5 @@ void grouped_mxfp4_indexed_pinned_gateup(
 }
 
 }  // namespace
+
+}  // namespace sglang

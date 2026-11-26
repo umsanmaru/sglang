@@ -14,6 +14,8 @@
 #include "prism_host_common.cuh"
 #include "prism_fp8.cuh"
 
+namespace sglang {
+
 namespace {
 
 using namespace nvcuda;
@@ -597,3 +599,5 @@ void grouped_fp8pt_indexed_pinned_gateup(
 }
 
 }  // namespace
+
+}  // namespace sglang

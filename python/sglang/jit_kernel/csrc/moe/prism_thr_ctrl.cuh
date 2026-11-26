@@ -8,6 +8,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 namespace {
 
 // Online threshold controller step for one layer (driver: srt/layers/moe/prism/thr_ctrl.py).
@@ -131,3 +133,5 @@ void thr_ctrl_step(
 }
 
 }  // namespace
+
+}  // namespace sglang

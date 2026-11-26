@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -73,7 +73,7 @@ def _scratch_impl(out3d, wres_k_max):
 def _jit_prism_grouped_module() -> Module:
     return load_jit(
         "prism_grouped",
-        cuda_files=["moe/prism_grouped.cuh"],
+        cuda_files=["../../../jit_kernel/csrc/moe/prism_grouped.cuh"],
         cuda_wrappers=[
             ("grouped_gemm_indexed", "grouped_gemm_indexed"),
             ("grouped_gemm_indexed_pinned", "grouped_gemm_indexed_pinned"),

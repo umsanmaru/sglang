@@ -10,6 +10,8 @@
 
 #include <cstdint>
 
+namespace sglang {
+
 namespace prism_host {
 
 // Cached per device: querying on every launch costs host time, also during graph capture.
@@ -50,3 +52,5 @@ inline GemvIo verify_gemv_io(tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
 }
 
 }  // namespace prism_host
+
+}  // namespace sglang

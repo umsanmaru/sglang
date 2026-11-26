@@ -13,6 +13,8 @@
 #include "prism_host_common.cuh"
 #include "prism_sparse_common.cuh"
 
+namespace sglang {
+
 namespace {
 
 using prism_sparse::SparseArgs;
@@ -926,3 +928,5 @@ void gemv_worklist_indexed_pinned_sparsek1w_gateup(
 }
 
 }  // namespace
+
+}  // namespace sglang

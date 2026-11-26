@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 def _jit_prism_gather_module() -> Module:
     return load_jit(
         "prism_gather",
-        cuda_files=["moe/prism_gather.cuh"],
+        cuda_files=["../../../jit_kernel/csrc/moe/prism_gather.cuh"],
         cuda_wrappers=[
             ("gather_bands_from_pinned", "gather_bands_from_pinned"),
             ("gather_bands_from_device", "gather_bands_from_device"),

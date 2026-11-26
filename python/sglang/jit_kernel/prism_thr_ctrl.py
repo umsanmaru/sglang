@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Sequence
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 def _jit_prism_thr_ctrl_module() -> Module:
     return load_jit(
         "prism_thr_ctrl",
-        cuda_files=["moe/prism_thr_ctrl.cuh"],
+        cuda_files=["../../../jit_kernel/csrc/moe/prism_thr_ctrl.cuh"],
         cuda_wrappers=[("thr_ctrl_step", "thr_ctrl_step")],
     )
 

@@ -14,6 +14,8 @@
 #include "prism_host_common.cuh"
 #include "prism_sparse_common.cuh"
 
+namespace sglang {
+
 namespace {
 
 using prism_sparse::SparseArgs;
@@ -475,3 +477,5 @@ void gemv_mxfp4_indexed_pinned_sparse_gateup(
 }
 
 }  // namespace
+
+}  // namespace sglang

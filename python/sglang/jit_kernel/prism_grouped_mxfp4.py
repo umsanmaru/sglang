@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.jit_kernel.prism_grouped import TILE_M  # noqa: F401  (그룹핑 타일 크기 공유)
-from sglang.jit_kernel.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -35,7 +35,7 @@ _WRAPPERS = (
 def _jit_prism_grouped_mxfp4_module() -> Module:
     return load_jit(
         "prism_grouped_mxfp4",
-        cuda_files=["moe/prism_grouped_mxfp4.cuh"],
+        cuda_files=["../../../jit_kernel/csrc/moe/prism_grouped_mxfp4.cuh"],
         cuda_wrappers=[(n, n) for n in _WRAPPERS],
     )
 
