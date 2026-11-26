@@ -383,8 +383,6 @@ inline void gemv_worklist_impl(
     int64_t x_row_is_pair, bool w_on_device) {
   using namespace host;
 
-  auto Rx = SymbolicSize{"x_rows"};
-  auto Kx = SymbolicSize{"x_cols"};
   auto M = SymbolicSize{"num_tokens"};
   auto K = SymbolicSize{"top_k"};
   auto E = SymbolicSize{"num_experts"};
@@ -393,24 +391,18 @@ inline void gemv_worklist_impl(
   auto W_row = SymbolicSize{"out_row"};
   auto cuda_device = SymbolicDevice{};
 
-  TensorMatcher({M, K}).with_dtype<int32_t, int64_t>()
-      .with_device<kDLCUDA>(cuda_device).verify(topk);
-  TensorMatcher({Rx, Kx}).with_dtype<bf16_t>().with_device(cuda_device).verify(x);
-  TensorMatcher({M, K, W_row}).with_dtype<bf16_t>().with_device(cuda_device).verify(out);
+  const auto io = prism_host::verify_gemv_io(x, topk, out, M, K, W_row, cuda_device,
+                                             x_row_is_pair, "gemv_worklist");
   if (w_on_device) {
     TensorMatcher({E, R, N}).with_dtype<bf16_t>().with_device(cuda_device).verify(w);
   } else {
     TensorMatcher({E, R, N}).with_dtype<bf16_t>().with_device<kDLCPU, kDLCUDAHost>().verify(w);
   }
 
-  const int64_t m = M.unwrap(), top_k = K.unwrap();
+  const int64_t m = io.m, top_k = io.top_k;
   const int64_t k_rows = R.unwrap(), n_cols = N.unwrap();
-  const int64_t x_rows = Rx.unwrap(), x_kx = Kx.unwrap();
-  const int64_t out_row = W_row.unwrap();
+  const int64_t x_kx = io.x_cols, out_row = io.out_row;
 
-  RuntimeCheck(x_row_is_pair ? (x_rows == m * top_k) : (x_rows == m),
-               "gemv_worklist: x rows (", x_rows, ") must be ",
-               x_row_is_pair ? "M*top_k" : "M");
   RuntimeCheck(k_offset >= 0 && k_offset + k_rows <= x_kx,
                "gemv_worklist: band [", k_offset, ",", k_offset + k_rows,
                ") out of x width ", x_kx);
@@ -456,8 +448,6 @@ inline void gemv_worklist_indexed_impl(
     const SparseIn* sin_up = nullptr) {
   using namespace host;
 
-  auto Rx = SymbolicSize{"x_rows"};
-  auto Kx = SymbolicSize{"x_cols"};
   auto M = SymbolicSize{"num_tokens"};
   auto K = SymbolicSize{"top_k"};
   auto R = SymbolicSize{"total_rows"};
@@ -467,10 +457,8 @@ inline void gemv_worklist_indexed_impl(
   auto W_row = SymbolicSize{"out_row"};
   auto cuda_device = SymbolicDevice{};
 
-  TensorMatcher({M, K}).with_dtype<int32_t, int64_t>()
-      .with_device<kDLCUDA>(cuda_device).verify(topk);
-  TensorMatcher({Rx, Kx}).with_dtype<bf16_t>().with_device(cuda_device).verify(x);
-  TensorMatcher({M, K, W_row}).with_dtype<bf16_t>().with_device(cuda_device).verify(out);
+  const auto io = prism_host::verify_gemv_io(x, topk, out, M, K, W_row, cuda_device,
+                                             x_row_is_pair, "gemv_worklist_indexed");
   // R을 w와 kidx가 공유한다 — 길이 불일치가 여기서 잡힌다 (오프셋 테이블과
   // 스토어가 어긋나면 조용히 남의 행을 읽는다).
   TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(row_off);
@@ -481,13 +469,10 @@ inline void gemv_worklist_indexed_impl(
     TensorMatcher({R, N}).with_dtype<bf16_t>().with_device<kDLCPU, kDLCUDAHost>().verify(w);
   }
 
-  const int64_t m = M.unwrap(), top_k = K.unwrap();
-  const int64_t n_cols = N.unwrap(), out_row = W_row.unwrap();
-  const int64_t x_rows = Rx.unwrap(), x_kx = Kx.unwrap();
+  const int64_t m = io.m, top_k = io.top_k;
+  const int64_t n_cols = N.unwrap(), out_row = io.out_row;
+  const int64_t x_kx = io.x_cols;
 
-  RuntimeCheck(x_row_is_pair ? (x_rows == m * top_k) : (x_rows == m),
-               "gemv_worklist_indexed: x rows (", x_rows, ") must be ",
-               x_row_is_pair ? "M*top_k" : "M");
   RuntimeCheck(E1.unwrap() >= 2,
                "gemv_worklist_indexed: row_off must have E+1 >= 2 entries, got ",
                E1.unwrap());

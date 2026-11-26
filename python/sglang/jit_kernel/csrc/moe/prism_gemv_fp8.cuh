@@ -322,8 +322,6 @@ inline void gemv_fp8_impl(
     int64_t out_col_offset_up = 0, const SparseIn* sin_up = nullptr) {
   using namespace host;
 
-  auto Rx = SymbolicSize{"x_rows"};
-  auto Kx = SymbolicSize{"x_cols"};
   auto M = SymbolicSize{"num_tokens"};
   auto K = SymbolicSize{"top_k"};
   auto E1 = SymbolicSize{"num_experts_plus_one"};
@@ -331,18 +329,15 @@ inline void gemv_fp8_impl(
   auto W_row = SymbolicSize{"out_row"};
   auto cuda_device = SymbolicDevice{};
 
-  TensorMatcher({M, K}).with_dtype<int32_t, int64_t>().with_device<kDLCUDA>(cuda_device).verify(topk);
-  TensorMatcher({Rx, Kx}).with_dtype<bf16_t>().with_device(cuda_device).verify(x);
-  TensorMatcher({M, K, W_row}).with_dtype<bf16_t>().with_device(cuda_device).verify(out);
+  const auto io = prism_host::verify_gemv_io(x, topk, out, M, K, W_row, cuda_device,
+                                             x_row_is_pair, "gemv_fp8");
   const int64_t rows0 = prism_fp8::verify_store(codes, scales, row_off, kidx, E1, N, cuda_device,
                                                 w_on_device, pt, "gemv_fp8");
 
-  const int64_t m = M.unwrap(), top_k = K.unwrap();
-  const int64_t n_cols = N.unwrap(), out_row = W_row.unwrap();
-  const int64_t x_rows = Rx.unwrap(), x_kx = Kx.unwrap();
+  const int64_t m = io.m, top_k = io.top_k;
+  const int64_t n_cols = N.unwrap(), out_row = io.out_row;
+  const int64_t x_kx = io.x_cols;
 
-  RuntimeCheck(x_row_is_pair ? (x_rows == m * top_k) : (x_rows == m),
-               "gemv_fp8: x rows (", x_rows, ") must be ", x_row_is_pair ? "M*top_k" : "M");
   RuntimeCheck(E1.unwrap() >= 2, "gemv_fp8: row_off must have E+1 >= 2 entries");
   RuntimeCheck(x_kx <= 65536, "gemv_fp8: x width ", x_kx, " exceeds the uint16 index range");
   RuntimeCheck(n_cols % kBlk == 0, "gemv_fp8: n_cols ", n_cols,

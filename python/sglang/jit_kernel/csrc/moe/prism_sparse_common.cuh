@@ -56,7 +56,7 @@ inline SparseArgs fill_sparse(const SparseIn& sin, host::SymbolicSize& E, host::
   using namespace host;
   auto Ra = SymbolicSize{"a_rows"};
   auto Rc = SymbolicSize{"c_pairs"};
-  if (sin.per_k && sin.use_wn) {  // score k1w: reads a (wn²), not c
+  if (sin.per_k && sin.use_wn) {  // score k1w: reads a (wn^2), not c
     TensorMatcher({Ra}).with_dtype<float>().with_device(cuda_device).verify(sin.a);
     RuntimeCheck(Ra.unwrap() == rows, what, ": wn² has ", Ra.unwrap(), " rows but the store has ", rows);
   }

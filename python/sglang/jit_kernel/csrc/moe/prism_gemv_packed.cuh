@@ -9,6 +9,7 @@
 
 #include <cstdint>
 
+#include "prism_host_common.cuh"
 #include "prism_sparse_common.cuh"
 
 namespace {
@@ -234,21 +235,17 @@ inline void gemv_packed_impl(
     int64_t x_row_is_pair, const PackedIn& s0, const PackedIn* s1,
     const PackedSparseIn* sp0, const PackedSparseIn* sp1) {
   using namespace host;
-  auto Rx = SymbolicSize{"x_rows"};
-  auto Kx = SymbolicSize{"x_cols"};
   auto M = SymbolicSize{"num_tokens"};
   auto K = SymbolicSize{"top_k"};
   auto W_row = SymbolicSize{"out_row"};
   auto E1 = SymbolicSize{"num_experts_plus_one"};
   auto cuda_device = SymbolicDevice{};
-  TensorMatcher({M, K}).with_dtype<int32_t, int64_t>().with_device<kDLCUDA>(cuda_device).verify(topk);
-  TensorMatcher({Rx, Kx}).with_dtype<bf16_t>().with_device(cuda_device).verify(x);
-  TensorMatcher({M, K, W_row}).with_dtype<bf16_t>().with_device(cuda_device).verify(out);
+  const auto io = prism_host::verify_gemv_io(x, topk, out, M, K, W_row, cuda_device,
+                                             x_row_is_pair, "gemv_packed");
   TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(s0.row_off);
   if (s1) TensorMatcher({E1}).with_dtype<int32_t>().with_device(cuda_device).verify(s1->row_off);
-  const int64_t m = M.unwrap(), top_k = K.unwrap(), out_row = W_row.unwrap();
-  const int64_t x_rows = Rx.unwrap(), x_kx = Kx.unwrap();
-  RuntimeCheck(x_row_is_pair ? (x_rows == m * top_k) : (x_rows == m), "gemv_packed: x rows mismatch");
+  const int64_t m = io.m, top_k = io.top_k, out_row = io.out_row;
+  const int64_t x_kx = io.x_cols;
   RuntimeCheck(x_kx <= 65536, "gemv_packed: x width exceeds uint16 index range");
   const DLDevice device = cuda_device.unwrap();
   PackedSlot a = make_slot(s0, device, E1.unwrap());
