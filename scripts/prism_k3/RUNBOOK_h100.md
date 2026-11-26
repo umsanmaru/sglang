@@ -149,7 +149,7 @@ grep "gen throughput" k3_smoke.log | tail -3
 
 nutella3(RTX 5090, TP=1) 기준선은 **decode 24 tok/s @ 11 MoE 층**, 로딩 175 s, GPU 26.7 GB였다.
 
-**실패하면 대부분 sm_90 커널이다.** `python/sglang/jit_kernel/csrc/moe/prism_*.cuh`는 소프트웨어 fp4
+**실패하면 대부분 sm_90 커널이다.** `python/sglang/kernels/jit/csrc/moe/prism/prism_*.cuh`는 소프트웨어 fp4
 디코드 + `mma.h` bf16이라 컴파일은 되어야 하지만 타일/smem 튜닝이 전부 sm_120 기준이다
 (`prism_grouped.cuh`에 H100 227 KB 주석은 있다). 로그 전문과 함께 보고할 것.
 

@@ -60,7 +60,7 @@ class LinearSparseSpec:
     """GPU 커널이 threshold를 스스로 계산하는 데 필요한 전부 — 전부 device 상주.
 
     필드 이름이 MoE `moe/prism/tiers.SparseSpec`과 같은 것은 우연이 아니다: GEMV
-    래퍼(`jit_kernel/prism_gemv*.py`)가 이 객체를 **덕 타이핑**으로 읽으므로 두
+    래퍼(`kernels/ops/moe/prism/gemv*.py`)가 이 객체를 **덕 타이핑**으로 읽으므로 두
     레인이 같은 커널을 부르려면 이름이 같아야 한다. 타입을 따로 두는 이유는
     dense의 사실(E=1, `lam` 무효)을 타입이 말하게 하기 위해서다.
 

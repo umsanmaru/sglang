@@ -100,7 +100,7 @@ class Fp8PtGpu:
     """per-tensor fp8의 GPU 진입점 묶음 — `formats.StoreFormat` 중 프로파일이 쓰는 부분만
     (`gemv`, `gemv_gateup`, `warmup`, `cold_kernels`). MoE에는 per-tensor fp8 체크포인트가
     없어 `moe/prism/formats.py`에 포맷을 두지 않는다; 커널은 dense 레인(Mistral)용으로
-    `jit_kernel/prism_gemv_fp8.py`에 있고(`gemv_fp8pt_*` 8개) 인자 순서는 블록판과 같다
+    `kernels/ops/moe/prism/gemv_fp8.py`에 있고(`gemv_fp8pt_*` 8개) 인자 순서는 블록판과 같다
     (배율만 슬롯당 스칼라 `[E]`).
     """
 

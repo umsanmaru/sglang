@@ -1,6 +1,6 @@
 """Prism grouped GEMM — MXFP4 pair-row 스토어 판 (`prism_grouped_mxfp4.cuh`).
 
-호출 규약은 bf16 `prism_grouped.py`와 같고 스토어 인자만 `(codes, scales)`다. 토큰
+호출 규약은 bf16 `grouped.py`와 같고 스토어 인자만 `(codes, scales)`다. 토큰
 타일 크기는 bf16과 같은 `TILE_M`(grouping.py가 tile_off를 만들 때 쓰는 값)이어야 한다.
 W-resident 변형은 없다 (fp4는 expert K 슬라이스가 smem 예산을 넘고, DSV4 치수에서는
 expert당 pair가 타일 하나에 대개 들어가 재읽기가 드물다) — `wres_k_max` 인자는 받되 무시.

@@ -1,6 +1,6 @@
 """Prism grouped GEMM — FP8 e4m3(128×128 블록 배율) 스토어 판 (`prism_grouped_fp8.cuh`).
 
-호출 규약은 mxfp4 `prism_grouped_mxfp4.py`와 같다 (스토어 인자 `(codes, scales)`). 토큰
+호출 규약은 mxfp4 `grouped_mxfp4.py`와 같다 (스토어 인자 `(codes, scales)`). 토큰
 타일 크기는 bf16과 같은 `TILE_M`이어야 한다. W-resident 변형은 없다 — `wres_k_max`는 받되 무시.
 
 수치: tensor core에 `bf16(code · scale)`을 넣는다 (= 같은 가중치를 dequant해 bf16 스토어로

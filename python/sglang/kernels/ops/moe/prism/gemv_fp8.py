@@ -1,6 +1,6 @@
 """Prism worklist GEMV — FP8 e4m3 스토어 판 (`prism_gemv_fp8.cuh`), 배율 두 가지.
 
-호출 규약은 mxfp4 `prism_gemv_mxfp4.py`와 **같다** (스토어 인자가 `(codes, scales)` 둘):
+호출 규약은 mxfp4 `gemv_mxfp4.py`와 **같다** (스토어 인자가 `(codes, scales)` 둘):
   codes  u8   [Σₑ k[e], N]         — 행 = k (원소 1 B)
   scales fp32 [Σₑ k[e]/128, N/128] — 블록판 (`gemv_fp8_*`): 행 = 128-k 블록, 열 = 128-n 블록
          fp32 [E]                  — per-tensor판 (`gemv_fp8pt_*`): 슬롯당 스칼라 1개

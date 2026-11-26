@@ -1,6 +1,6 @@
 # BF16 prefill in the Qwen runtime
 
-Implementation: `sglang.jit_kernel.prism_prefill`, dispatched by
+Implementation: `sglang.kernels.ops.moe.prism.prefill`, dispatched by
 `prism_grouped`. This change is in **sglang-qwen**, the tree used by the measured
 Qwen lane. No checkpoint loading is needed for its microbenchmarks.
 
@@ -102,7 +102,7 @@ would retain Wres. Full measurements and rejected tuning variants are in
 
 ## Legacy module: `prism_buffered` (2026-09-09, from the fork tree)
 
-`sglang.jit_kernel.prism_buffered.grouped_packed_buffered` is the earlier bounded
+`sglang.kernels.ops.moe.prism.buffered.grouped_packed_buffered` is the earlier bounded
 arena + packed grouped-GEMM staging that the fork tree (`prism-orchestration`)
 carried. It is **not dispatched** by `prism_grouped` any more; the Qwen-lane
 `prism_prefill` path above replaced it (2026-10-30 consolidation). The module and

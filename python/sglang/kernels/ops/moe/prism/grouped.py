@@ -1,6 +1,6 @@
 """Prism grouped GEMM (prefill 형태) — `prism_grouped.cuh`의 Python 진입점.
 
-worklist GEMV(`prism_gemv.py`)가 pair마다 W를 다시 읽는 decode 형태라면, 이
+worklist GEMV(`gemv.py`)가 pair마다 W를 다시 읽는 decode 형태라면, 이
 커널은 pair를 expert로 묶어 W 타일을 한 번 읽고 그 expert의 모든 토큰에 곱한다.
 호출 규약은 worklist와 같다 (current stream에 launch만, 출력은 호출자 소유,
 rejoin 레이아웃 out[m, j, off:off+N]). 다른 것은 `topk_ids` 대신 **그룹핑

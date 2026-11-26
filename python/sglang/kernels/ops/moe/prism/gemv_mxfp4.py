@@ -1,6 +1,6 @@
 """Prism worklist GEMV — MXFP4 pair-row 스토어 판 (`prism_gemv_mxfp4.cuh`).
 
-호출 규약은 bf16 `prism_gemv.py`와 같고, 스토어 인자만 `w_flat` 하나 대신
+호출 규약은 bf16 `gemv.py`와 같고, 스토어 인자만 `w_flat` 하나 대신
 `(codes, scales)` 둘이다:
   codes  u8 [Σₑ k[e]/2, N]   — 행 = k-페어 (하위 nibble = 짝수 k)
   scales u8 [Σₑ k[e]/32, N]  — 행 = 32-k 블록의 E8M0 배율

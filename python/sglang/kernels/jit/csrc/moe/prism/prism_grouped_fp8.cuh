@@ -83,7 +83,7 @@ struct F8Slot {
 
 enum Layout : int { ROWMAJOR = 0, KT_TILE8 = 1, ROWMAJOR_PT = 2, KT_TILE8_PT = 3, KT_TILE8_K1 = 4 };
 // 타일(kt slab) 레이아웃: KT_TILE8(b128 페어 타일) · KT_TILE8_PT(per-tensor 배율) · KT_TILE8_K1(k=1 순열).
-// 값은 python COLD_LAYOUTS(prism_grouped_fp8.py)와 맞춘다 — 비트 트릭 없이 명시 판정.
+// 값은 python COLD_LAYOUTS(ops/moe/prism/grouped_fp8.py)와 맞춘다 — 비트 트릭 없이 명시 판정.
 __host__ __device__ constexpr bool layout_is_tile(int l) {
   return l == KT_TILE8 || l == KT_TILE8_PT || l == KT_TILE8_K1;
 }

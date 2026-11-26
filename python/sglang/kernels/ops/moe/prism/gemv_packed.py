@@ -1,7 +1,7 @@
 """kt packed(AMX) 레이아웃을 읽는 worklist GEMV — `prism_gemv_packed.cuh`의 진입점.
 
 warm을 kt 포맷 slab 한 벌(pinned)로 두기 위한 decode 커널이다. 호출 규약은
-`prism_gemv.py`의 indexed worklist와 같고(현재 stream에 launch만, out[m, j, off:off+N]),
+`gemv.py`의 indexed worklist와 같고(현재 stream에 launch만, out[m, j, off:off+N]),
 스토어 인자만 `ColdSlab`(cold_gpu.py) 하나로 받는다 — slab/blk_off/row_off/k_index/n/
 n_start/n_block/k_block.
 """

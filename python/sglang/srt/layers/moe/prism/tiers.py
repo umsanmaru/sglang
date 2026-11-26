@@ -60,7 +60,7 @@ class SparseSpec:
     ng: int
     renorm_it: int
     # score k1 (2026-09-05): 마스크가 per-k |x_k| >= thr — 커널이 a/c를 읽지 않는다. fp8 worklist
-    # 커널만 per-k 진입점(sparsek1)을 갖는다 (prism_gemv_fp8.py가 이 플래그로 고른다).
+    # 커널만 per-k 진입점(sparsek1)을 갖는다 (kernels/ops/moe/prism/gemv_fp8.py가 이 플래그로 고른다).
     per_k: bool = False
     # Threshold-controller counter int64 [2] = {kept, total} mask units the kernel adds to
     # (thr_ctrl.py); with a controller, `thr` is the live device table it rewrites. None = off.
