@@ -585,6 +585,24 @@ _GATEUP_DENSE = {Tier.HOT: ResidentGateUp, Tier.WARM: PinnedGateUp}
 _GATEUP_SPARSE = {Tier.HOT: SparseResidentGateUp, Tier.WARM: SparsePinnedGateUp}
 
 
+
+# MoE per-k sparse tiers are validated end to end only on FP8 stores. BF16 also has per-k
+# entry points (kernel-tested, used by dense linear), but no MoE executor test covers them.
+_MOE_PER_K_FORMATS = ("fp8",)
+
+
+def _check_moe_per_k(fmt: str, score: str, where: str) -> None:
+    from sglang.kernels.ops.moe.prism.key import PrismKernelKey, unsupported_reason
+
+    reason = unsupported_reason(PrismKernelKey(op="gemv", fmt=fmt, mode="k1"))
+    if reason is not None:
+        raise NotImplementedError(f"{where}: sparsity score '{score}' (per-k): {reason}")
+    if fmt not in _MOE_PER_K_FORMATS:
+        raise NotImplementedError(
+            f"{where}: sparsity score '{score}' (per-k) is validated for MoE only on "
+            f"{list(_MOE_PER_K_FORMATS)} stores, not {fmt}"
+        )
+
 def _sparse_spec(
     shard: TierShard, thr: torch.Tensor, plan: Plan, layer_idx: int, proj: Proj,
     where: str, ctr: Optional[torch.Tensor] = None,
@@ -606,11 +624,8 @@ def _sparse_spec(
     ep = plan.expert(layer_idx, 0).proj(proj)
     dev = shard.row_off.device
     if not spec.uses_weight_stats:
-        # score k1: 재료는 thr 곡선만. per-k 진입점은 fp8 worklist 커널에만 있다.
-        if shard.fmt.name != "fp8":
-            raise NotImplementedError(
-                f"{where}: sparsity score '{spec.score}' (per-k) has a GPU kernel only for the fp8 "
-                f"store, not {shard.fmt.name}")
+        # score k1: 재료는 thr 곡선만.
+        _check_moe_per_k(shard.fmt.name, spec.score, where)
         return SparseSpec(
             a=None, c=None, thr=thr.to(dev, torch.float32),
             p=float(ep.sparsity_p), lam=float(ep.sparsity_lambda),
