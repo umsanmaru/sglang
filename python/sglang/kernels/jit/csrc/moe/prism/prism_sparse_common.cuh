@@ -16,6 +16,10 @@ namespace sglang {
 
 namespace prism_sparse {
 
+// Sparse score an entry point applies: none, pair (k2wl2), per-k (k1), or per-k scaled by the
+// column norm (k1w). Entry points take it as a template argument; kernels keep their own flags.
+enum class Mode : int { kDense, kPair, kK1, kK1W };
+
 struct SparseArgs {
   const float* a;        // [Σₑ k[e]]      = wn² (weight와 같은 오프셋)
   const float* c;        // [Σₑ k[e]/2]    = 인접열 내적

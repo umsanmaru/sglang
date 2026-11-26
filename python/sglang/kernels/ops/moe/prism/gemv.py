@@ -10,44 +10,44 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+# Export name -> C++ entry. The name encodes placement (`_pinned` = warm) and the sparse
+# score; the entry struct takes both as template arguments (prism_gemv.cuh).
+_SCORE_SUFFIX = {
+    "kDense": "",
+    "kPair": "_sparse",
+    "kK1": "_sparsek1",
+    "kK1W": "_sparsek1w",
+}
+
+
+def _entries() -> list[tuple[str, str]]:
+    out = [
+        ("gemv_worklist", "PrismGemvBand<true>::run"),
+        ("gemv_worklist_pinned", "PrismGemvBand<false>::run"),
+    ]
+    for mode, suffix in _SCORE_SUFFIX.items():
+        for fused in (False, True):
+            for on_device in (True, False):
+                name = (
+                    "gemv_worklist_indexed"
+                    + ("" if on_device else "_pinned")
+                    + suffix
+                    + ("_gateup" if fused else "")
+                )
+                args = f"Mode::{mode}, {str(fused).lower()}, {str(on_device).lower()}"
+                out.append((name, f"PrismGemvBf16<{args}>::run"))
+    return out
+
+
+_ENTRIES = _entries()
+
+
 @cache_once
 def _jit_prism_gemv_module() -> Module:
     return load_jit(
         "prism_gemv",
         cuda_files=["moe/prism/prism_gemv.cuh"],
-        cuda_wrappers=[
-            ("gemv_worklist", "gemv_worklist"),
-            ("gemv_worklist_pinned", "gemv_worklist_pinned"),
-            ("gemv_worklist_indexed", "gemv_worklist_indexed"),
-            ("gemv_worklist_indexed_gateup", "gemv_worklist_indexed_gateup"),
-            ("gemv_worklist_indexed_pinned_gateup",
-             "gemv_worklist_indexed_pinned_gateup"),
-            ("gemv_worklist_indexed_sparse_gateup",
-             "gemv_worklist_indexed_sparse_gateup"),
-            ("gemv_worklist_indexed_pinned_sparse_gateup",
-             "gemv_worklist_indexed_pinned_sparse_gateup"),
-            ("gemv_worklist_indexed_pinned", "gemv_worklist_indexed_pinned"),
-            ("gemv_worklist_indexed_sparse", "gemv_worklist_indexed_sparse"),
-            ("gemv_worklist_indexed_pinned_sparse",
-             "gemv_worklist_indexed_pinned_sparse"),
-            # score k1 (per-k |x| >= thr) — a/c를 받지 않는다. `SparseSpec.per_k`가
-            # 참이면 `_sparse_call`이 이쪽으로 보낸다 (fp8 판과 같은 규약).
-            ("gemv_worklist_indexed_sparsek1", "gemv_worklist_indexed_sparsek1"),
-            ("gemv_worklist_indexed_pinned_sparsek1",
-             "gemv_worklist_indexed_pinned_sparsek1"),
-            ("gemv_worklist_indexed_sparsek1_gateup",
-             "gemv_worklist_indexed_sparsek1_gateup"),
-            ("gemv_worklist_indexed_pinned_sparsek1_gateup",
-             "gemv_worklist_indexed_pinned_sparsek1_gateup"),
-            # score k1w1 (per-k × 열 노름: x²·a >= thr²) — a를 받는다.
-            ("gemv_worklist_indexed_sparsek1w", "gemv_worklist_indexed_sparsek1w"),
-            ("gemv_worklist_indexed_pinned_sparsek1w",
-             "gemv_worklist_indexed_pinned_sparsek1w"),
-            ("gemv_worklist_indexed_sparsek1w_gateup",
-             "gemv_worklist_indexed_sparsek1w_gateup"),
-            ("gemv_worklist_indexed_pinned_sparsek1w_gateup",
-             "gemv_worklist_indexed_pinned_sparsek1w_gateup"),
-        ],
+        cuda_wrappers=_ENTRIES,
     )
 
 

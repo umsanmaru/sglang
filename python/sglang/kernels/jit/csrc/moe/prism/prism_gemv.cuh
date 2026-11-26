@@ -17,6 +17,7 @@ namespace sglang {
 
 namespace {
 
+using prism_sparse::Mode;
 using prism_sparse::SparseArgs;
 using prism_sparse::SparseIn;
 
@@ -604,328 +605,152 @@ inline void gemv_worklist_indexed_impl(
 #undef PRISM_LAUNCH_INDEXED_NY
 }
 
-void gemv_worklist(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
-    tvm::ffi::TensorView out, int64_t k_offset, int64_t out_col_offset,
-    int64_t x_row_is_pair) {
-  gemv_worklist_impl(x, topk, w, out, k_offset, out_col_offset, x_row_is_pair, true);
-}
+// ===== Export entry points =====
+// One struct per (sparse score, gate+up fusion). ON_DEVICE is the weight placement the store is
+// verified against (true: hot, device memory; false: warm, pinned host memory); the kernels do
+// not depend on it, so hot and warm results are bit-identical. gemv.py maps export names here.
 
-void gemv_worklist_pinned(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
-    tvm::ffi::TensorView out, int64_t k_offset, int64_t out_col_offset,
-    int64_t x_row_is_pair) {
-  gemv_worklist_impl(x, topk, w, out, k_offset, out_col_offset, x_row_is_pair, false);
-}
+template <bool ON_DEVICE>
+struct PrismGemvBand {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w, tvm::ffi::TensorView out, int64_t k_offset,
+                  int64_t out_col_offset, int64_t x_row_is_pair) {
+    gemv_worklist_impl(x, topk, w, out, k_offset, out_col_offset, x_row_is_pair, ON_DEVICE);
+  }
+};
 
-void gemv_worklist_indexed(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
-    int64_t vec) {
-  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                             x_row_is_pair, vec, true, nullptr);
-}
+template <Mode M, bool FUSED, bool ON_DEVICE>
+struct PrismGemvBf16;
 
-// gate+up 융합 (device 상주 W, dense). 두 proj를 한 커널로 발행해 grid.z로
-// 블록을 2배로 만든다 — bs=1에서 이 커널이 블록에 굶는 것이 실측된 병목이다
-// (2026-08-26: 96블록에서 hot gate 17.8 µs, 192블록 프록시 19.7 µs로 2 launch
-// 35.5 µs 대비 1.8배). 출력 원소당 누산 순서는 불변이라 두 번 launch한 것과
-// **비트일치**한다.
-void gemv_worklist_indexed_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
-    tvm::ffi::TensorView kidx_gate,
-    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
-    tvm::ffi::TensorView kidx_up,
-    tvm::ffi::TensorView out, int64_t out_col_offset_gate,
-    int64_t out_col_offset_up, int64_t x_row_is_pair, int64_t vec) {
-  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                             out_col_offset_gate, x_row_is_pair, vec, true,
-                             nullptr, &w_up, &row_off_up, &kidx_up,
-                             out_col_offset_up);
-}
+template <bool ON_DEVICE>
+struct PrismGemvBf16<Mode::kDense, false, ON_DEVICE> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, tvm::ffi::TensorView out,
+                  int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec) {
+    gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
+                               x_row_is_pair, vec, ON_DEVICE, nullptr);
+  }
+};
 
-void gemv_worklist_indexed_pinned(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
-    int64_t vec) {
-  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                             x_row_is_pair, vec, false, nullptr);
-}
+// Gate+up in one launch (grid.z = 2 slots), bit-identical to two single launches; measured
+// 1.8x faster than two launches at bs=1, where this kernel is starved for blocks.
+template <bool ON_DEVICE>
+struct PrismGemvBf16<Mode::kDense, true, ON_DEVICE> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate, tvm::ffi::TensorView kidx_gate,
+                  tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up, tvm::ffi::TensorView kidx_up, tvm::ffi::TensorView out,
+                  int64_t out_col_offset_gate, int64_t out_col_offset_up,
+                  int64_t x_row_is_pair, int64_t vec) {
+    gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                               out_col_offset_gate, x_row_is_pair, vec, ON_DEVICE, nullptr,
+                               &w_up, &row_off_up, &kidx_up, out_col_offset_up);
+  }
+};
 
-// warm의 dense 융합 (pinned W). masking이 꺼진 스텝(prefill 소배치, dense plan)에서
-// warm 티어가 타는 경로다 — 이것이 없으면 같은 스텝이 2회 launch로 떨어진다.
-void gemv_worklist_indexed_pinned_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
-    tvm::ffi::TensorView kidx_gate,
-    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
-    tvm::ffi::TensorView kidx_up,
-    tvm::ffi::TensorView out, int64_t out_col_offset_gate,
-    int64_t out_col_offset_up, int64_t x_row_is_pair, int64_t vec) {
-  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                             out_col_offset_gate, x_row_is_pair, vec, false,
-                             nullptr, &w_up, &row_off_up, &kidx_up,
-                             out_col_offset_up);
-}
+// Pair score: reads a (wn^2), c (adjacent-column dot) and thr.
+template <bool ON_DEVICE>
+struct PrismGemvBf16<Mode::kPair, false, ON_DEVICE> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, tvm::ffi::TensorView out,
+                  tvm::ffi::TensorView a, tvm::ffi::TensorView c, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
+                  int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
+                  double p, double lam, double pmax, double grid, int64_t ng,
+                  int64_t renorm_it) {
+    SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
+    sin.ctr = &ctr;
+    gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
+                               x_row_is_pair, vec, ON_DEVICE, &sin);
+  }
+};
 
-// sparse 쌍둥이. 인자가 넷 늘고(a, c, thr, topk_weights) 예산 스칼라가 붙는
-// 것 외에 dense와 같다. 별도 진입점으로 둔 이유: optional 텐서로 하나에
-// 합치면 dense 경로가 매 호출 nullable 검사를 지나고, 무엇보다 "sparse인지"가
-// 호출부에서 안 보이게 된다.
-void gemv_worklist_indexed_sparse(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView c,
-    tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
-    int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
-    double p, double lam, double pmax, double grid,
-    int64_t ng, int64_t renorm_it) {
-  SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
-  sin.ctr = &ctr;
-  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                             x_row_is_pair, vec, true, &sin);
-}
+template <bool ON_DEVICE>
+struct PrismGemvBf16<Mode::kPair, true, ON_DEVICE> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate, tvm::ffi::TensorView kidx_gate,
+                  tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up, tvm::ffi::TensorView kidx_up, tvm::ffi::TensorView out,
+                  tvm::ffi::TensorView a_gate, tvm::ffi::TensorView c_gate, tvm::ffi::TensorView thr_gate, tvm::ffi::TensorView a_up, tvm::ffi::TensorView c_up, tvm::ffi::TensorView thr_up,
+                  tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
+                  int64_t out_col_offset_gate, int64_t out_col_offset_up,
+                  int64_t x_row_is_pair, int64_t vec,
+                  double p_gate, double lam_gate, double p_up, double lam_up,
+                  double pmax, double grid, int64_t ng, int64_t renorm_it) {
+    SparseIn sin{a_gate, c_gate, thr_gate, topk_w, p_gate, lam_gate, pmax, grid, ng, renorm_it};
+    sin.ctr = &ctr_gate;
+    SparseIn sin_up{a_up, c_up, thr_up, topk_w, p_up, lam_up, pmax, grid, ng, renorm_it};
+    sin_up.ctr = &ctr_up;
+    gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                               out_col_offset_gate, x_row_is_pair, vec, ON_DEVICE, &sin,
+                               &w_up, &row_off_up, &kidx_up, out_col_offset_up, &sin_up);
+  }
+};
 
-// gate+up 융합의 warm 짝 (pinned W, sparse).
-void gemv_worklist_indexed_pinned_sparse_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
-    tvm::ffi::TensorView kidx_gate,
-    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
-    tvm::ffi::TensorView kidx_up,
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView a_gate, tvm::ffi::TensorView c_gate,
-    tvm::ffi::TensorView thr_gate,
-    tvm::ffi::TensorView a_up, tvm::ffi::TensorView c_up,
-    tvm::ffi::TensorView thr_up, tvm::ffi::TensorView topk_w,
-    tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
-    int64_t out_col_offset_gate, int64_t out_col_offset_up,
-    int64_t x_row_is_pair, int64_t vec,
-    double p_gate, double lam_gate, double p_up, double lam_up,
-    double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  SparseIn sin{a_gate, c_gate, thr_gate, topk_w, p_gate, lam_gate,
-                     pmax, grid, ng, renorm_it};
-  sin.ctr = &ctr_gate;
-  SparseIn sin_up{a_up, c_up, thr_up, topk_w, p_up, lam_up,
-                        pmax, grid, ng, renorm_it};
-  sin_up.ctr = &ctr_up;
-  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                             out_col_offset_gate, x_row_is_pair, vec, false,
-                             &sin, &w_up, &row_off_up, &kidx_up,
-                             out_col_offset_up, &sin_up);
-}
+// Per-k score (k1): |x_k| >= thr. Reads neither a nor c; thr fills their SparseIn slots.
+template <bool ON_DEVICE>
+struct PrismGemvBf16<Mode::kK1, false, ON_DEVICE> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, tvm::ffi::TensorView out,
+                  tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
+                  int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
+                  double p, double lam, double pmax, double grid, int64_t ng,
+                  int64_t renorm_it) {
+    SparseIn sin{thr, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true};
+    sin.ctr = &ctr;
+    gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
+                               x_row_is_pair, vec, ON_DEVICE, &sin);
+  }
+};
 
-// hot의 sparse 융합 (device 상주 W). `SPARSE_TIERS`에 HOT을 더하는 순간 warm과
-// 같은 융합 경로가 필요하다 — 커널은 이미 양쪽을 지원하므로 진입점만 채운다.
-void gemv_worklist_indexed_sparse_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
-    tvm::ffi::TensorView kidx_gate,
-    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
-    tvm::ffi::TensorView kidx_up,
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView a_gate, tvm::ffi::TensorView c_gate,
-    tvm::ffi::TensorView thr_gate,
-    tvm::ffi::TensorView a_up, tvm::ffi::TensorView c_up,
-    tvm::ffi::TensorView thr_up, tvm::ffi::TensorView topk_w,
-    tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
-    int64_t out_col_offset_gate, int64_t out_col_offset_up,
-    int64_t x_row_is_pair, int64_t vec,
-    double p_gate, double lam_gate, double p_up, double lam_up,
-    double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  SparseIn sin{a_gate, c_gate, thr_gate, topk_w, p_gate, lam_gate,
-                     pmax, grid, ng, renorm_it};
-  sin.ctr = &ctr_gate;
-  SparseIn sin_up{a_up, c_up, thr_up, topk_w, p_up, lam_up,
-                        pmax, grid, ng, renorm_it};
-  sin_up.ctr = &ctr_up;
-  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                             out_col_offset_gate, x_row_is_pair, vec, true,
-                             &sin, &w_up, &row_off_up, &kidx_up,
-                             out_col_offset_up, &sin_up);
-}
+template <bool ON_DEVICE>
+struct PrismGemvBf16<Mode::kK1, true, ON_DEVICE> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate, tvm::ffi::TensorView kidx_gate,
+                  tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up, tvm::ffi::TensorView kidx_up, tvm::ffi::TensorView out,
+                  tvm::ffi::TensorView thr_gate, tvm::ffi::TensorView thr_up, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
+                  int64_t out_col_offset_gate, int64_t out_col_offset_up,
+                  int64_t x_row_is_pair, int64_t vec,
+                  double p_gate, double lam_gate, double p_up, double lam_up,
+                  double pmax, double grid, int64_t ng, int64_t renorm_it) {
+    SparseIn sin{thr_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate, pmax, grid, ng,
+                 renorm_it, true};
+    sin.ctr = &ctr_gate;
+    SparseIn sin_up{thr_up, thr_up, thr_up, topk_w, p_up, lam_up, pmax, grid, ng, renorm_it,
+                    true};
+    sin_up.ctr = &ctr_up;
+    gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                               out_col_offset_gate, x_row_is_pair, vec, ON_DEVICE, &sin,
+                               &w_up, &row_off_up, &kidx_up, out_col_offset_up, &sin_up);
+  }
+};
 
-void gemv_worklist_indexed_pinned_sparse(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView c,
-    tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
-    int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
-    double p, double lam, double pmax, double grid,
-    int64_t ng, int64_t renorm_it) {
-  SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
-  sin.ctr = &ctr;
-  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                             x_row_is_pair, vec, false, &sin);
-}
+// Per-k score scaled by the column norm (k1w): x^2 * a >= thr^2. Reads a, not c.
+template <bool ON_DEVICE>
+struct PrismGemvBf16<Mode::kK1W, false, ON_DEVICE> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, tvm::ffi::TensorView out,
+                  tvm::ffi::TensorView a, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
+                  int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
+                  double p, double lam, double pmax, double grid, int64_t ng,
+                  int64_t renorm_it) {
+    SparseIn sin{a, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true, true};
+    sin.ctr = &ctr;
+    gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
+                               x_row_is_pair, vec, ON_DEVICE, &sin);
+  }
+};
 
-// ── score k1 (per-k) 쌍둥이 ────────────────────────────────────────────────
-// 인자에서 **a/c가 빠진다** — 마스크가 `|x_k| >= thr` 하나라 가중치 통계를 읽지
-// 않는다 (`SparseIn::per_k`; fp8 형제 `gemv_fp8_indexed_sparsek1`과 같은 규약으로
-// 내부에서는 a/c 자리에 thr을 넣는다). 진입점을 따로 둔 이유는 페어/per-k가
-// 호출부에서 보여야 하기 때문이다: 같은 진입점에 플래그로 넣으면 어느 마스크로
-// 쟀는지가 로그와 코드에서 사라진다.
-void gemv_worklist_indexed_sparsek1(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,
-    tvm::ffi::TensorView ctr,
-    int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
-    double p, double lam, double pmax, double grid,
-    int64_t ng, int64_t renorm_it) {
-  SparseIn sin{thr, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true};
-  sin.ctr = &ctr;
-  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                             x_row_is_pair, vec, true, &sin);
-}
-
-void gemv_worklist_indexed_pinned_sparsek1(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,
-    tvm::ffi::TensorView ctr,
-    int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
-    double p, double lam, double pmax, double grid,
-    int64_t ng, int64_t renorm_it) {
-  SparseIn sin{thr, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true};
-  sin.ctr = &ctr;
-  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                             x_row_is_pair, vec, false, &sin);
-}
-
-void gemv_worklist_indexed_sparsek1_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
-    tvm::ffi::TensorView kidx_gate,
-    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
-    tvm::ffi::TensorView kidx_up,
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView thr_gate, tvm::ffi::TensorView thr_up,
-    tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
-    int64_t out_col_offset_gate, int64_t out_col_offset_up,
-    int64_t x_row_is_pair, int64_t vec,
-    double p_gate, double lam_gate, double p_up, double lam_up,
-    double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  SparseIn sin{thr_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate,
-                     pmax, grid, ng, renorm_it, true};
-  sin.ctr = &ctr_gate;
-  SparseIn sin_up{thr_up, thr_up, thr_up, topk_w, p_up, lam_up,
-                        pmax, grid, ng, renorm_it, true};
-  sin_up.ctr = &ctr_up;
-  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                             out_col_offset_gate, x_row_is_pair, vec, true,
-                             &sin, &w_up, &row_off_up, &kidx_up,
-                             out_col_offset_up, &sin_up);
-}
-
-void gemv_worklist_indexed_pinned_sparsek1_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
-    tvm::ffi::TensorView kidx_gate,
-    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
-    tvm::ffi::TensorView kidx_up,
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView thr_gate, tvm::ffi::TensorView thr_up,
-    tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
-    int64_t out_col_offset_gate, int64_t out_col_offset_up,
-    int64_t x_row_is_pair, int64_t vec,
-    double p_gate, double lam_gate, double p_up, double lam_up,
-    double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  SparseIn sin{thr_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate,
-                     pmax, grid, ng, renorm_it, true};
-  sin.ctr = &ctr_gate;
-  SparseIn sin_up{thr_up, thr_up, thr_up, topk_w, p_up, lam_up,
-                        pmax, grid, ng, renorm_it, true};
-  sin_up.ctr = &ctr_up;
-  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                             out_col_offset_gate, x_row_is_pair, vec, false,
-                             &sin, &w_up, &row_off_up, &kidx_up,
-                             out_col_offset_up, &sin_up);
-}
-
-// ── score k1w1 진입점 4개: per-k × 열 노름 (a = wn², c 없음) ────────────────
-void gemv_worklist_indexed_sparsek1w(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView thr,
-    tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
-    int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
-    double p, double lam, double pmax, double grid,
-    int64_t ng, int64_t renorm_it) {
-  SparseIn sin{a, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true, true};
-  sin.ctr = &ctr;
-  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                             x_row_is_pair, vec, true, &sin);
-}
-
-void gemv_worklist_indexed_pinned_sparsek1w(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView thr,
-    tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
-    int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
-    double p, double lam, double pmax, double grid,
-    int64_t ng, int64_t renorm_it) {
-  SparseIn sin{a, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true, true};
-  sin.ctr = &ctr;
-  gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                             x_row_is_pair, vec, false, &sin);
-}
-
-void gemv_worklist_indexed_sparsek1w_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
-    tvm::ffi::TensorView kidx_gate,
-    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
-    tvm::ffi::TensorView kidx_up,
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView a_gate, tvm::ffi::TensorView thr_gate,
-    tvm::ffi::TensorView a_up, tvm::ffi::TensorView thr_up,
-    tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
-    int64_t out_col_offset_gate, int64_t out_col_offset_up,
-    int64_t x_row_is_pair, int64_t vec,
-    double p_gate, double lam_gate, double p_up, double lam_up,
-    double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  SparseIn sin{a_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate,
-                     pmax, grid, ng, renorm_it, true, true};
-  sin.ctr = &ctr_gate;
-  SparseIn sin_up{a_up, thr_up, thr_up, topk_w, p_up, lam_up,
-                        pmax, grid, ng, renorm_it, true, true};
-  sin_up.ctr = &ctr_up;
-  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                             out_col_offset_gate, x_row_is_pair, vec, true,
-                             &sin, &w_up, &row_off_up, &kidx_up,
-                             out_col_offset_up, &sin_up);
-}
-
-void gemv_worklist_indexed_pinned_sparsek1w_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
-    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
-    tvm::ffi::TensorView kidx_gate,
-    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
-    tvm::ffi::TensorView kidx_up,
-    tvm::ffi::TensorView out,
-    tvm::ffi::TensorView a_gate, tvm::ffi::TensorView thr_gate,
-    tvm::ffi::TensorView a_up, tvm::ffi::TensorView thr_up,
-    tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
-    int64_t out_col_offset_gate, int64_t out_col_offset_up,
-    int64_t x_row_is_pair, int64_t vec,
-    double p_gate, double lam_gate, double p_up, double lam_up,
-    double pmax, double grid, int64_t ng, int64_t renorm_it) {
-  SparseIn sin{a_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate,
-                     pmax, grid, ng, renorm_it, true, true};
-  sin.ctr = &ctr_gate;
-  SparseIn sin_up{a_up, thr_up, thr_up, topk_w, p_up, lam_up,
-                        pmax, grid, ng, renorm_it, true, true};
-  sin_up.ctr = &ctr_up;
-  gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                             out_col_offset_gate, x_row_is_pair, vec, false,
-                             &sin, &w_up, &row_off_up, &kidx_up,
-                             out_col_offset_up, &sin_up);
-}
+template <bool ON_DEVICE>
+struct PrismGemvBf16<Mode::kK1W, true, ON_DEVICE> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate, tvm::ffi::TensorView kidx_gate,
+                  tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up, tvm::ffi::TensorView kidx_up, tvm::ffi::TensorView out,
+                  tvm::ffi::TensorView a_gate, tvm::ffi::TensorView thr_gate, tvm::ffi::TensorView a_up, tvm::ffi::TensorView thr_up,
+                  tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
+                  int64_t out_col_offset_gate, int64_t out_col_offset_up,
+                  int64_t x_row_is_pair, int64_t vec,
+                  double p_gate, double lam_gate, double p_up, double lam_up,
+                  double pmax, double grid, int64_t ng, int64_t renorm_it) {
+    SparseIn sin{a_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate, pmax, grid, ng,
+                 renorm_it, true, true};
+    sin.ctr = &ctr_gate;
+    SparseIn sin_up{a_up, thr_up, thr_up, topk_w, p_up, lam_up, pmax, grid, ng, renorm_it,
+                    true, true};
+    sin_up.ctr = &ctr_up;
+    gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
+                               out_col_offset_gate, x_row_is_pair, vec, ON_DEVICE, &sin,
+                               &w_up, &row_off_up, &kidx_up, out_col_offset_up, &sin_up);
+  }
+};
 
 }  // namespace
 
