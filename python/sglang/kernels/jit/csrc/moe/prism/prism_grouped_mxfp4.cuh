@@ -526,53 +526,43 @@ void grouped_mxfp4_cold_gateup(
                      static_cast<int>(layout), &blk_off_g, &blk_off_u, n_cols);
 }
 
-void grouped_mxfp4_indexed(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
-    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
-    tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair, int64_t max_blocks) {
-  grouped_mxfp4_impl(x, pair_sorted, pair_off, tile_off, codes, scales, row_off, kidx, out,
-                     out_col_offset, x_row_is_pair, true, max_blocks);
-}
+// ===== Export entry points (indexed stores) =====
+// One struct per gate+up fusion.
+// ON_DEVICE is the store placement checked: true for hot (device), false for warm (pinned host).
+// Cold-slab entries stay plain functions because they have a single placement.
 
-void grouped_mxfp4_indexed_pinned(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
-    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
-    tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
-    tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair, int64_t max_blocks) {
-  grouped_mxfp4_impl(x, pair_sorted, pair_off, tile_off, codes, scales, row_off, kidx, out,
-                     out_col_offset, x_row_is_pair, false, max_blocks);
-}
+template <bool FUSED, bool ON_DEVICE>
+struct PrismGroupedMxfp4;
 
-void grouped_mxfp4_indexed_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
-    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
-    tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g,
-    tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
-    tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u,
-    tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
-    tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
-    int64_t x_row_is_pair, int64_t max_blocks) {
-  grouped_mxfp4_impl(x, pair_sorted, pair_off, tile_off, codes_g, scales_g, row_off_g, kidx_g, out,
-                     out_col_offset_g, x_row_is_pair, true, max_blocks,
-                     &codes_u, &scales_u, &row_off_u, &kidx_u, out_col_offset_u);
-}
+template <bool ON_DEVICE>
+struct PrismGroupedMxfp4<false, ON_DEVICE> {
+  static void run(
+      tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
+      tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
+      tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
+      tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+      tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair, int64_t max_blocks) {
+    grouped_mxfp4_impl(x, pair_sorted, pair_off, tile_off, codes, scales, row_off, kidx, out,
+                       out_col_offset, x_row_is_pair, ON_DEVICE, max_blocks);
+  }
+};
 
-void grouped_mxfp4_indexed_pinned_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
-    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
-    tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g,
-    tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
-    tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u,
-    tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
-    tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
-    int64_t x_row_is_pair, int64_t max_blocks) {
-  grouped_mxfp4_impl(x, pair_sorted, pair_off, tile_off, codes_g, scales_g, row_off_g, kidx_g, out,
-                     out_col_offset_g, x_row_is_pair, false, max_blocks,
-                     &codes_u, &scales_u, &row_off_u, &kidx_u, out_col_offset_u);
-}
+template <bool ON_DEVICE>
+struct PrismGroupedMxfp4<true, ON_DEVICE> {
+  static void run(
+      tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
+      tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
+      tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g,
+      tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
+      tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u,
+      tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
+      tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
+      int64_t x_row_is_pair, int64_t max_blocks) {
+    grouped_mxfp4_impl(x, pair_sorted, pair_off, tile_off, codes_g, scales_g, row_off_g, kidx_g, out,
+                       out_col_offset_g, x_row_is_pair, ON_DEVICE, max_blocks,
+                       &codes_u, &scales_u, &row_off_u, &kidx_u, out_col_offset_u);
+  }
+};
 
 }  // namespace
 

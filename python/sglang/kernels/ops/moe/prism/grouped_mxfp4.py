@@ -31,12 +31,20 @@ _WRAPPERS = (
 )
 
 
+def _target(name: str) -> str:
+    """Indexed exports are entry structs (prism_grouped_mxfp4.cuh); cold exports are functions."""
+    if "_indexed" not in name:
+        return name
+    flags = (name.endswith("_gateup"), "_pinned" not in name)
+    return f"PrismGroupedMxfp4<{', '.join(str(b).lower() for b in flags)}>::run"
+
+
 @cache_once
 def _jit_prism_grouped_mxfp4_module() -> Module:
     return load_jit(
         "prism_grouped_mxfp4",
         cuda_files=["moe/prism/prism_grouped_mxfp4.cuh"],
-        cuda_wrappers=[(n, n) for n in _WRAPPERS],
+        cuda_wrappers=[(n, _target(n)) for n in _WRAPPERS],
     )
 
 

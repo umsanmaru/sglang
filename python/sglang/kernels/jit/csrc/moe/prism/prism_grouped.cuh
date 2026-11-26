@@ -777,30 +777,6 @@ inline void grouped_gemm_impl(
   else launch(prism_grouped_gemm<ROWMAJOR>);
 }
 
-void grouped_gemm_indexed(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
-    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
-    tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
-    int64_t max_blocks, int64_t wres_k_max, tvm::ffi::TensorView scratch) {
-  const tvm::ffi::TensorView* sc = scratch.numel() > 0 ? &scratch : nullptr;
-  grouped_gemm_impl(x, pair_sorted, pair_off, tile_off, w, row_off, kidx, out,
-                    out_col_offset, x_row_is_pair, true, max_blocks,
-                    nullptr, nullptr, nullptr, 0, ROWMAJOR, nullptr, nullptr, 0, 0, 0, wres_k_max, sc);
-}
-
-void grouped_gemm_indexed_pinned(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
-    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
-    tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-    tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
-    int64_t max_blocks, int64_t wres_k_max, tvm::ffi::TensorView scratch) {
-  const tvm::ffi::TensorView* sc = scratch.numel() > 0 ? &scratch : nullptr;
-  grouped_gemm_impl(x, pair_sorted, pair_off, tile_off, w, row_off, kidx, out,
-                    out_col_offset, x_row_is_pair, false, max_blocks,
-                    nullptr, nullptr, nullptr, 0, ROWMAJOR, nullptr, nullptr, 0, 0, 0, wres_k_max, sc);
-}
-
 // COLD 레이아웃 — kt packed slab을 host 메모리(cudaHostRegister됨)에서 제자리 읽기.
 // row_off는 타일 올림된 k_pad 누적, kidx는 패딩 포함, blk_off는 expert 블록의
 // slab 내 원소 오프셋. out_col_offset에는 노드 N shard 시작이 더해져 온다.
@@ -837,39 +813,48 @@ void grouped_gemm_cold_gateup(
                     COLD, &blk_off_gate, &blk_off_up, n_block, k_block, n_cols, wres_k_max, sc, n_contiguous != 0);
 }
 
-void grouped_gemm_indexed_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
-    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
-    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
-    tvm::ffi::TensorView kidx_gate,
-    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
-    tvm::ffi::TensorView kidx_up,
-    tvm::ffi::TensorView out, int64_t out_col_offset_gate,
-    int64_t out_col_offset_up, int64_t x_row_is_pair, int64_t max_blocks, int64_t wres_k_max,
-    tvm::ffi::TensorView scratch) {
-  const tvm::ffi::TensorView* sc = scratch.numel() > 0 ? &scratch : nullptr;
-  grouped_gemm_impl(x, pair_sorted, pair_off, tile_off, w_gate, row_off_gate,
-                    kidx_gate, out, out_col_offset_gate, x_row_is_pair, true,
-                    max_blocks, &w_up, &row_off_up, &kidx_up, out_col_offset_up,
-                    ROWMAJOR, nullptr, nullptr, 0, 0, 0, wres_k_max, sc);
-}
+// ===== Export entry points (indexed stores) =====
+// One struct per gate+up fusion.
+// ON_DEVICE is the store placement checked: true for hot (device), false for warm (pinned host).
+// Cold-slab entries stay plain functions because they have a single placement.
 
-void grouped_gemm_indexed_pinned_gateup(
-    tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
-    tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
-    tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
-    tvm::ffi::TensorView kidx_gate,
-    tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
-    tvm::ffi::TensorView kidx_up,
-    tvm::ffi::TensorView out, int64_t out_col_offset_gate,
-    int64_t out_col_offset_up, int64_t x_row_is_pair, int64_t max_blocks, int64_t wres_k_max,
-    tvm::ffi::TensorView scratch) {
-  const tvm::ffi::TensorView* sc = scratch.numel() > 0 ? &scratch : nullptr;
-  grouped_gemm_impl(x, pair_sorted, pair_off, tile_off, w_gate, row_off_gate,
-                    kidx_gate, out, out_col_offset_gate, x_row_is_pair, false,
-                    max_blocks, &w_up, &row_off_up, &kidx_up, out_col_offset_up,
-                    ROWMAJOR, nullptr, nullptr, 0, 0, 0, wres_k_max, sc);
-}
+template <bool FUSED, bool ON_DEVICE>
+struct PrismGroupedBf16;
+
+template <bool ON_DEVICE>
+struct PrismGroupedBf16<false, ON_DEVICE> {
+  static void run(
+      tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
+      tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
+      tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+      tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
+      int64_t max_blocks, int64_t wres_k_max, tvm::ffi::TensorView scratch) {
+    const tvm::ffi::TensorView* sc = scratch.numel() > 0 ? &scratch : nullptr;
+    grouped_gemm_impl(x, pair_sorted, pair_off, tile_off, w, row_off, kidx, out,
+                      out_col_offset, x_row_is_pair, ON_DEVICE, max_blocks,
+                      nullptr, nullptr, nullptr, 0, ROWMAJOR, nullptr, nullptr, 0, 0, 0, wres_k_max, sc);
+  }
+};
+
+template <bool ON_DEVICE>
+struct PrismGroupedBf16<true, ON_DEVICE> {
+  static void run(
+      tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
+      tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
+      tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate,
+      tvm::ffi::TensorView kidx_gate,
+      tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up,
+      tvm::ffi::TensorView kidx_up,
+      tvm::ffi::TensorView out, int64_t out_col_offset_gate,
+      int64_t out_col_offset_up, int64_t x_row_is_pair, int64_t max_blocks, int64_t wres_k_max,
+      tvm::ffi::TensorView scratch) {
+    const tvm::ffi::TensorView* sc = scratch.numel() > 0 ? &scratch : nullptr;
+    grouped_gemm_impl(x, pair_sorted, pair_off, tile_off, w_gate, row_off_gate,
+                      kidx_gate, out, out_col_offset_gate, x_row_is_pair, ON_DEVICE,
+                      max_blocks, &w_up, &row_off_up, &kidx_up, out_col_offset_up,
+                      ROWMAJOR, nullptr, nullptr, 0, 0, 0, wres_k_max, sc);
+  }
+};
 
 }  // namespace
 

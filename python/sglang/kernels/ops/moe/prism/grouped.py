@@ -74,12 +74,15 @@ def _jit_prism_grouped_module() -> Module:
     return load_jit(
         "prism_grouped",
         cuda_files=["moe/prism/prism_grouped.cuh"],
+        # Indexed exports are entry structs (prism_grouped.cuh); cold and wait_flag are functions.
         cuda_wrappers=[
-            ("grouped_gemm_indexed", "grouped_gemm_indexed"),
-            ("grouped_gemm_indexed_pinned", "grouped_gemm_indexed_pinned"),
-            ("grouped_gemm_indexed_gateup", "grouped_gemm_indexed_gateup"),
-            ("grouped_gemm_indexed_pinned_gateup",
-             "grouped_gemm_indexed_pinned_gateup"),
+            ("grouped_gemm_indexed", "PrismGroupedBf16<false, true>::run"),
+            ("grouped_gemm_indexed_pinned", "PrismGroupedBf16<false, false>::run"),
+            ("grouped_gemm_indexed_gateup", "PrismGroupedBf16<true, true>::run"),
+            (
+                "grouped_gemm_indexed_pinned_gateup",
+                "PrismGroupedBf16<true, false>::run",
+            ),
             ("grouped_gemm_cold", "grouped_gemm_cold"),
             ("grouped_gemm_cold_gateup", "grouped_gemm_cold_gateup"),
             ("prism_wait_flag", "prism_wait_flag"),
