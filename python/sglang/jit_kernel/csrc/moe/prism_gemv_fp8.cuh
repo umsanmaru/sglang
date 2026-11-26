@@ -308,44 +308,6 @@ inline void launch_gemv_fp8(const DLDevice& device, tvm::ffi::TensorView topk,
   }
 }
 
-
-inline SparseArgs fill_sparse(const SparseIn& sin, host::SymbolicSize& E, host::SymbolicSize& Ng,
-                              host::SymbolicSize& M, host::SymbolicSize& K,
-                              host::SymbolicDevice& cuda_device, int64_t rows, const char* what) {
-  using namespace host;
-  auto Ra = SymbolicSize{"a_rows"};
-  auto Rc = SymbolicSize{"c_pairs"};
-  if (sin.per_k && sin.use_wn) {  // score k1w1: a(wn²)만 읽는다 (c는 안 읽는다)
-    TensorMatcher({Ra}).with_dtype<float>().with_device(cuda_device).verify(sin.a);
-    RuntimeCheck(Ra.unwrap() == rows, what, ": wn² has ", Ra.unwrap(), " rows but the store has ", rows);
-  }
-  if (!sin.per_k) {  // score k1은 가중치 통계(a/c)를 쓰지 않는다
-    TensorMatcher({Ra}).with_dtype<float>().with_device(cuda_device).verify(sin.a);
-    TensorMatcher({Rc}).with_dtype<float>().with_device(cuda_device).verify(sin.c);
-    RuntimeCheck(Ra.unwrap() == rows, what, ": wn² has ", Ra.unwrap(), " rows but the store has ", rows);
-    RuntimeCheck(Rc.unwrap() * 2 == rows, what, ": pair_dot has ", Rc.unwrap(),
-                 " entries but the store has ", rows, " rows (must be exactly half)");
-  }
-  TensorMatcher({E, Ng}).with_dtype<float>().with_device(cuda_device).verify(sin.thr);
-  TensorMatcher({M, K}).with_dtype<float>().with_device(cuda_device).verify(sin.topk_w);
-  RuntimeCheck(Ng.unwrap() == sin.ng, what, ": thr grid ", Ng.unwrap(), " != ng ", sin.ng);
-  RuntimeCheck(sin.grid > 0.0, what, ": grid must be positive, got ", sin.grid);
-  SparseArgs sp{};
-  // a가 nullptr인지가 곧 "k1인가 k1w1인가"다 (커널이 그것으로 가른다).
-  sp.a = (sin.per_k && !sin.use_wn) ? nullptr : static_cast<const float*>(sin.a.data_ptr());
-  sp.c = sin.per_k ? nullptr : static_cast<const float*>(sin.c.data_ptr());
-  sp.thr_tab = static_cast<const float*>(sin.thr.data_ptr());
-  sp.topk_w = static_cast<const float*>(sin.topk_w.data_ptr());
-  sp.p = static_cast<float>(sin.p);
-  sp.lam = static_cast<float>(sin.lam);
-  sp.pmax = static_cast<float>(sin.pmax);
-  sp.grid = static_cast<float>(sin.grid);
-  sp.ng = static_cast<int>(sin.ng);
-  sp.renorm_it = static_cast<int>(sin.renorm_it);
-  sp.ctr = prism_sparse::keep_ctr_of(sin, cuda_device);
-  return sp;
-}
-
 // 공통 검증 + launch. 슬롯 1(gate+up 융합)은 nullptr이면 grid.z=1.
 inline void gemv_fp8_impl(
     tvm::ffi::TensorView x, tvm::ffi::TensorView topk,
@@ -401,7 +363,7 @@ inline void gemv_fp8_impl(
   auto E = SymbolicSize{"num_experts"};
   auto Ng = SymbolicSize{"sparsity_ng"};
   if (sin != nullptr) {
-    sp0 = fill_sparse(*sin, E, Ng, M, K, cuda_device, rows0, "gemv_fp8_sparse");
+    sp0 = prism_sparse::fill_sparse(*sin, E, Ng, M, K, cuda_device, rows0, "gemv_fp8_sparse");
     RuntimeCheck(E1.unwrap() == E.unwrap() + 1, "gemv_fp8_sparse: thr has ", E.unwrap(),
                  " experts but row_off implies ", E1.unwrap() - 1);
     sp1 = sp0;
@@ -424,8 +386,8 @@ inline void gemv_fp8_impl(
       RuntimeCheck(sin_up->per_k == sin->per_k && sin_up->use_wn == sin->use_wn,
                    "gemv_fp8_gateup: gate/up sparse modes differ");
       // proj별로 갈리는 것은 a/c/thr/p/lam 다섯 — 예산 스칼라와 topk_w는 슬롯 0과 공유.
-      SparseArgs u = fill_sparse(*sin_up, E, Ng, M, K, cuda_device, rows1,
-                                 "gemv_fp8_sparse_gateup(up)");
+      SparseArgs u = prism_sparse::fill_sparse(*sin_up, E, Ng, M, K, cuda_device, rows1,
+                                               "gemv_fp8_sparse_gateup(up)");
       sp1 = sp0;
       sp1.a = u.a; sp1.c = u.c; sp1.thr_tab = u.thr_tab; sp1.p = u.p; sp1.lam = u.lam;
       sp1.ctr = u.ctr;
