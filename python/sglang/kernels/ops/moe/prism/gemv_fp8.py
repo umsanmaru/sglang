@@ -21,40 +21,35 @@ from sglang.kernels.ops.moe.prism.gemv import keep_ctr_arg
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_WRAPPERS = (
-    "gemv_fp8_indexed",
-    "gemv_fp8_indexed_pinned",
-    "gemv_fp8_indexed_sparse",
-    "gemv_fp8_indexed_pinned_sparse",
-    "gemv_fp8_indexed_gateup",
-    "gemv_fp8_indexed_pinned_gateup",
-    "gemv_fp8_indexed_sparse_gateup",
-    "gemv_fp8_indexed_pinned_sparse_gateup",
-    # score k1 (per-k |x| >= thr, a/c 없음) — SparseSpec.per_k가 참이면 아래로 간다.
-    "gemv_fp8_indexed_sparsek1",
-    "gemv_fp8_indexed_pinned_sparsek1",
-    "gemv_fp8_indexed_sparsek1_gateup",
-    "gemv_fp8_indexed_pinned_sparsek1_gateup",
-    # per-tensor 배율 (scales [E])
-    "gemv_fp8pt_indexed",
-    "gemv_fp8pt_indexed_pinned",
-    "gemv_fp8pt_indexed_sparse",
-    "gemv_fp8pt_indexed_pinned_sparse",
-    "gemv_fp8pt_indexed_gateup",
-    "gemv_fp8pt_indexed_pinned_gateup",
-    "gemv_fp8pt_indexed_sparse_gateup",
-    "gemv_fp8pt_indexed_pinned_sparse_gateup",
-    # per-tensor × score k1 (kt 짝: tile_k1_fp8pt, 2026-09-07)
-    "gemv_fp8pt_indexed_sparsek1",
-    "gemv_fp8pt_indexed_pinned_sparsek1",
-    "gemv_fp8pt_indexed_sparsek1_gateup",
-    "gemv_fp8pt_indexed_pinned_sparsek1_gateup",
-    # score k1w1 (per-k × 열 노름) — single만 (gateup 융합은 dense 레인이 아직 안 쓴다)
-    "gemv_fp8_indexed_sparsek1w",
-    "gemv_fp8_indexed_pinned_sparsek1w",
-    "gemv_fp8pt_indexed_sparsek1w",
-    "gemv_fp8pt_indexed_pinned_sparsek1w",
-)
+# Export name -> C++ entry (prism_gemv_fp8.cuh). `pt` = per-tensor scales, `_pinned` = warm
+# placement. k1w has no fused gate+up entry.
+_SCORE_SUFFIX = {
+    "kDense": "",
+    "kPair": "_sparse",
+    "kK1": "_sparsek1",
+    "kK1W": "_sparsek1w",
+}
+
+
+def _entries() -> list[tuple[str, str]]:
+    out = []
+    for pt in (False, True):
+        for mode, suffix in _SCORE_SUFFIX.items():
+            for fused in (False, True) if mode != "kK1W" else (False,):
+                for on_device in (True, False):
+                    name = (
+                        ("gemv_fp8pt" if pt else "gemv_fp8")
+                        + "_indexed"
+                        + ("" if on_device else "_pinned")
+                        + suffix
+                        + ("_gateup" if fused else "")
+                    )
+                    flags = ", ".join(str(b).lower() for b in (fused, on_device, pt))
+                    out.append((name, f"PrismGemvFp8<Mode::{mode}, {flags}>::run"))
+    return out
+
+
+_ENTRIES = _entries()
 
 
 def _per_k(sp) -> bool:
@@ -71,7 +66,7 @@ def _jit_prism_gemv_fp8_module() -> Module:
     return load_jit(
         "prism_gemv_fp8",
         cuda_files=["moe/prism/prism_gemv_fp8.cuh"],
-        cuda_wrappers=[(n, n) for n in _WRAPPERS],
+        cuda_wrappers=_ENTRIES,
     )
 
 

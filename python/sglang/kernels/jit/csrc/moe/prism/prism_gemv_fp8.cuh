@@ -20,6 +20,7 @@ namespace sglang {
 namespace {
 
 using prism_sparse::SparseArgs;
+using prism_sparse::Mode;
 using prism_sparse::SparseIn;
 
 // Prism worklist GEMV — **FP8 e4m3 (128×128 블록 배율) 스토어** 판 (2026-08-29).
@@ -414,147 +415,111 @@ inline void gemv_fp8_impl(
   }
 }
 
-// ── 진입점 16개: {device, pinned} × {dense, sparse} × {single, gateup} × {블록 배율, PT} ──
-// 커널 코드는 하나이고 host 검증(스토어 거처·배율 모양)만 갈린다.
-#define PRISM_F8_ENTRY_DENSE(NAME, ON_DEVICE, PT)                                              \
-  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes,     \
-            tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, \
-            tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair) {          \
-    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,   \
-                  ON_DEVICE, PT, nullptr);                                                     \
-  }
-#define PRISM_F8_ENTRY_SPARSE(NAME, ON_DEVICE, PT)                                             \
-  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes,     \
-            tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, \
-            tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView c,          \
-            tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,                             \
-            tvm::ffi::TensorView ctr, int64_t out_col_offset,                                  \
-            int64_t x_row_is_pair, double p, double lam, double pmax, double grid, int64_t ng,   \
-            int64_t renorm_it) {                                                               \
-    SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};                        \
-    sin.ctr = &ctr;                                                                            \
-    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,   \
-                  ON_DEVICE, PT, &sin);                                                        \
-  }
-#define PRISM_F8_ENTRY_GATEUP(NAME, ON_DEVICE, PT)                                             \
-  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g,   \
-            tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g,                     \
-            tvm::ffi::TensorView kidx_g, tvm::ffi::TensorView codes_u,                         \
-            tvm::ffi::TensorView scales_u, tvm::ffi::TensorView row_off_u,                     \
-            tvm::ffi::TensorView kidx_u, tvm::ffi::TensorView out, int64_t out_col_offset_g,    \
-            int64_t out_col_offset_u, int64_t x_row_is_pair) {                                 \
-    gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,        \
-                  x_row_is_pair, ON_DEVICE, PT, nullptr, &codes_u, &scales_u, &row_off_u,      \
-                  &kidx_u, out_col_offset_u);                                                  \
-  }
-#define PRISM_F8_ENTRY_SPARSE_GATEUP(NAME, ON_DEVICE, PT)                                      \
-  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g,   \
-            tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g,                     \
-            tvm::ffi::TensorView kidx_g, tvm::ffi::TensorView codes_u,                         \
-            tvm::ffi::TensorView scales_u, tvm::ffi::TensorView row_off_u,                     \
-            tvm::ffi::TensorView kidx_u, tvm::ffi::TensorView out, tvm::ffi::TensorView a_g,   \
-            tvm::ffi::TensorView c_g, tvm::ffi::TensorView thr_g, tvm::ffi::TensorView a_u,    \
-            tvm::ffi::TensorView c_u, tvm::ffi::TensorView thr_u, tvm::ffi::TensorView topk_w, \
-            tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,                        \
-            int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair,         \
-            double p_g, double lam_g, double p_u, double lam_u, double pmax, double grid,       \
-            int64_t ng, int64_t renorm_it) {                                                   \
-    SparseIn sin{a_g, c_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it};              \
-    sin.ctr = &ctr_gate;                                                                       \
-    SparseIn sin_up{a_u, c_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it};           \
-    sin_up.ctr = &ctr_up;                                                                      \
-    gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,        \
-                  x_row_is_pair, ON_DEVICE, PT, &sin, &codes_u, &scales_u, &row_off_u,         \
-                  &kidx_u, out_col_offset_u, &sin_up);                                         \
-  }
+// ===== Export entry points =====
+// One struct per (sparse score, gate+up fusion). ON_DEVICE is the store placement checked
+// (true: hot, device; false: warm, pinned host); PT selects per-tensor scales ([E]) instead of
+// 128x128 block scales. k1w has no fused entry yet. gemv_fp8.py maps the export names here.
 
-// 블록 배율 (128×128) — 기존 8개
-PRISM_F8_ENTRY_DENSE(gemv_fp8_indexed, true, false)
-PRISM_F8_ENTRY_DENSE(gemv_fp8_indexed_pinned, false, false)
-PRISM_F8_ENTRY_SPARSE(gemv_fp8_indexed_sparse, true, false)
-PRISM_F8_ENTRY_SPARSE(gemv_fp8_indexed_pinned_sparse, false, false)
-PRISM_F8_ENTRY_GATEUP(gemv_fp8_indexed_gateup, true, false)
-PRISM_F8_ENTRY_GATEUP(gemv_fp8_indexed_pinned_gateup, false, false)
-PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8_indexed_sparse_gateup, true, false)
-PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8_indexed_pinned_sparse_gateup, false, false)
-// per-tensor 배율 — scales [E]
-PRISM_F8_ENTRY_DENSE(gemv_fp8pt_indexed, true, true)
-PRISM_F8_ENTRY_DENSE(gemv_fp8pt_indexed_pinned, false, true)
-PRISM_F8_ENTRY_SPARSE(gemv_fp8pt_indexed_sparse, true, true)
-PRISM_F8_ENTRY_SPARSE(gemv_fp8pt_indexed_pinned_sparse, false, true)
-PRISM_F8_ENTRY_GATEUP(gemv_fp8pt_indexed_gateup, true, true)
-PRISM_F8_ENTRY_GATEUP(gemv_fp8pt_indexed_pinned_gateup, false, true)
-PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8pt_indexed_sparse_gateup, true, true)
-PRISM_F8_ENTRY_SPARSE_GATEUP(gemv_fp8pt_indexed_pinned_sparse_gateup, false, true)
+template <Mode M, bool FUSED, bool ON_DEVICE, bool PT>
+struct PrismGemvFp8;
 
-#undef PRISM_F8_ENTRY_DENSE
-#undef PRISM_F8_ENTRY_SPARSE
-#undef PRISM_F8_ENTRY_GATEUP
-#undef PRISM_F8_ENTRY_SPARSE_GATEUP
+template <bool ON_DEVICE, bool PT>
+struct PrismGemvFp8<Mode::kDense, false, ON_DEVICE, PT> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes, tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+                  tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair) {
+    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,
+                  ON_DEVICE, PT, nullptr);
+  }
+};
 
-// ── score k1 진입점 4개: {device, pinned} × {single, gateup}, a/c 없음 (|x_k| >= thr) ─────
-// SparseIn.per_k = true; thr 텐서를 a/c 자리에도 넣지만 host 검증·커널 모두 읽지 않는다.
-#define PRISM_F8_ENTRY_SPARSEK1(NAME, ON_DEVICE, PT)                                             \
-  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes,     \
-            tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, \
-            tvm::ffi::TensorView out, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w,   \
-            tvm::ffi::TensorView ctr,                                                          \
-            int64_t out_col_offset, int64_t x_row_is_pair, double p, double lam, double pmax,  \
-            double grid, int64_t ng, int64_t renorm_it) {                                      \
-    SparseIn sin{thr, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true};              \
-    sin.ctr = &ctr;                                                                            \
-    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,   \
-                  ON_DEVICE, PT, &sin);                                                        \
+template <bool ON_DEVICE, bool PT>
+struct PrismGemvFp8<Mode::kPair, false, ON_DEVICE, PT> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes, tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+                  tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView c, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
+                  int64_t out_col_offset, int64_t x_row_is_pair, double p, double lam,
+                  double pmax, double grid, int64_t ng, int64_t renorm_it) {
+    SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
+    sin.ctr = &ctr;
+    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,
+                  ON_DEVICE, PT, &sin);
   }
-#define PRISM_F8_ENTRY_SPARSEK1_GATEUP(NAME, ON_DEVICE, PT)                                       \
-  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g,   \
-            tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g,                     \
-            tvm::ffi::TensorView kidx_g, tvm::ffi::TensorView codes_u,                         \
-            tvm::ffi::TensorView scales_u, tvm::ffi::TensorView row_off_u,                     \
-            tvm::ffi::TensorView kidx_u, tvm::ffi::TensorView out, tvm::ffi::TensorView thr_g, \
-            tvm::ffi::TensorView thr_u, tvm::ffi::TensorView topk_w,                           \
-            tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,                        \
-            int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair,         \
-            double p_g, double lam_g,                                                          \
-            double p_u, double lam_u, double pmax, double grid, int64_t ng, int64_t renorm_it) { \
-    SparseIn sin{thr_g, thr_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it, true};    \
-    sin.ctr = &ctr_gate;                                                                       \
-    SparseIn sin_up{thr_u, thr_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it, true}; \
-    sin_up.ctr = &ctr_up;                                                                      \
-    gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,        \
-                  x_row_is_pair, ON_DEVICE, PT, &sin, &codes_u, &scales_u, &row_off_u,          \
-                  &kidx_u, out_col_offset_u, &sin_up);                                         \
+};
+
+template <bool ON_DEVICE, bool PT>
+struct PrismGemvFp8<Mode::kDense, true, ON_DEVICE, PT> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
+                  tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u, tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u, tvm::ffi::TensorView out,
+                  int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair) {
+    gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,
+                  x_row_is_pair, ON_DEVICE, PT, nullptr, &codes_u, &scales_u, &row_off_u,
+                  &kidx_u, out_col_offset_u);
   }
-#define PRISM_F8_ENTRY_SPARSEK1W(NAME, ON_DEVICE, PT)                                          \
-  void NAME(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes,     \
-            tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, \
-            tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView thr,        \
-            tvm::ffi::TensorView topk_w,                                                       \
-            tvm::ffi::TensorView ctr, int64_t out_col_offset, int64_t x_row_is_pair,           \
-            double p, double lam, double pmax, double grid, int64_t ng, int64_t renorm_it) {   \
-    SparseIn sin{a, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true, true};          \
-    sin.ctr = &ctr;                                                                            \
-    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,   \
-                  ON_DEVICE, PT, &sin);                                                        \
+};
+
+template <bool ON_DEVICE, bool PT>
+struct PrismGemvFp8<Mode::kPair, true, ON_DEVICE, PT> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
+                  tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u, tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u, tvm::ffi::TensorView out,
+                  tvm::ffi::TensorView a_g, tvm::ffi::TensorView c_g, tvm::ffi::TensorView thr_g, tvm::ffi::TensorView a_u, tvm::ffi::TensorView c_u, tvm::ffi::TensorView thr_u,
+                  tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
+                  int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair,
+                  double p_g, double lam_g, double p_u, double lam_u, double pmax, double grid,
+                  int64_t ng, int64_t renorm_it) {
+    SparseIn sin{a_g, c_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it};
+    sin.ctr = &ctr_gate;
+    SparseIn sin_up{a_u, c_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it};
+    sin_up.ctr = &ctr_up;
+    gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,
+                  x_row_is_pair, ON_DEVICE, PT, &sin, &codes_u, &scales_u, &row_off_u,
+                  &kidx_u, out_col_offset_u, &sin_up);
   }
-PRISM_F8_ENTRY_SPARSEK1(gemv_fp8_indexed_sparsek1, true, false)
-PRISM_F8_ENTRY_SPARSEK1(gemv_fp8_indexed_pinned_sparsek1, false, false)
-PRISM_F8_ENTRY_SPARSEK1_GATEUP(gemv_fp8_indexed_sparsek1_gateup, true, false)
-PRISM_F8_ENTRY_SPARSEK1_GATEUP(gemv_fp8_indexed_pinned_sparsek1_gateup, false, false)
-// per-tensor 배율 판 (kt 짝: tile_k1_fp8pt, 2026-09-07)
-PRISM_F8_ENTRY_SPARSEK1(gemv_fp8pt_indexed_sparsek1, true, true)
-PRISM_F8_ENTRY_SPARSEK1(gemv_fp8pt_indexed_pinned_sparsek1, false, true)
-PRISM_F8_ENTRY_SPARSEK1_GATEUP(gemv_fp8pt_indexed_sparsek1_gateup, true, true)
-PRISM_F8_ENTRY_SPARSEK1_GATEUP(gemv_fp8pt_indexed_pinned_sparsek1_gateup, false, true)
-// score k1w1 (per-k × 열 노름) — 블록 배율·per-tensor 둘 다. gateup 융합은 dense 레인이
-// 아직 안 쓰므로 single만 채운다 (필요해지면 SPARSEK1_GATEUP과 같은 모양으로 더한다).
-PRISM_F8_ENTRY_SPARSEK1W(gemv_fp8_indexed_sparsek1w, true, false)
-PRISM_F8_ENTRY_SPARSEK1W(gemv_fp8_indexed_pinned_sparsek1w, false, false)
-PRISM_F8_ENTRY_SPARSEK1W(gemv_fp8pt_indexed_sparsek1w, true, true)
-PRISM_F8_ENTRY_SPARSEK1W(gemv_fp8pt_indexed_pinned_sparsek1w, false, true)
-#undef PRISM_F8_ENTRY_SPARSEK1
-#undef PRISM_F8_ENTRY_SPARSEK1W
-#undef PRISM_F8_ENTRY_SPARSEK1_GATEUP
+};
+
+// Per-k score (k1): |x_k| >= thr. Reads neither a nor c; thr fills their SparseIn slots.
+template <bool ON_DEVICE, bool PT>
+struct PrismGemvFp8<Mode::kK1, false, ON_DEVICE, PT> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes, tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+                  tvm::ffi::TensorView out, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
+                  int64_t out_col_offset, int64_t x_row_is_pair, double p, double lam,
+                  double pmax, double grid, int64_t ng, int64_t renorm_it) {
+    SparseIn sin{thr, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true};
+    sin.ctr = &ctr;
+    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,
+                  ON_DEVICE, PT, &sin);
+  }
+};
+
+template <bool ON_DEVICE, bool PT>
+struct PrismGemvFp8<Mode::kK1, true, ON_DEVICE, PT> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
+                  tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u, tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u, tvm::ffi::TensorView out,
+                  tvm::ffi::TensorView thr_g, tvm::ffi::TensorView thr_u, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
+                  int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair,
+                  double p_g, double lam_g, double p_u, double lam_u, double pmax, double grid,
+                  int64_t ng, int64_t renorm_it) {
+    SparseIn sin{thr_g, thr_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it, true};
+    sin.ctr = &ctr_gate;
+    SparseIn sin_up{thr_u, thr_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it, true};
+    sin_up.ctr = &ctr_up;
+    gemv_fp8_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,
+                  x_row_is_pair, ON_DEVICE, PT, &sin, &codes_u, &scales_u, &row_off_u,
+                  &kidx_u, out_col_offset_u, &sin_up);
+  }
+};
+
+// Per-k score scaled by the column norm (k1w): x^2 * a >= thr^2. Reads a, not c.
+template <bool ON_DEVICE, bool PT>
+struct PrismGemvFp8<Mode::kK1W, false, ON_DEVICE, PT> {
+  static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes, tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
+                  tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
+                  int64_t out_col_offset, int64_t x_row_is_pair, double p, double lam,
+                  double pmax, double grid, int64_t ng, int64_t renorm_it) {
+    SparseIn sin{a, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true, true};
+    sin.ctr = &ctr;
+    gemv_fp8_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,
+                  ON_DEVICE, PT, &sin);
+  }
+};
 
 }  // namespace
 
