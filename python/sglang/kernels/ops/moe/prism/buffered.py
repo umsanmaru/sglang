@@ -12,7 +12,7 @@ import torch
 
 def grouped_packed_buffered(x2d, grouping, projections, out3d,
                             x_row_is_pair, stream):
-    from sglang.jit_kernel.prism_grouped import grouped_gemm_cold
+    from sglang.kernels.ops.moe.prism.grouped import grouped_gemm_cold
     from sglang.srt.layers.moe.prism.grouping import Grouping
 
     slots = out3d.shape[1]

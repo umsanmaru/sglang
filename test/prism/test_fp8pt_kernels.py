@@ -74,7 +74,7 @@ def _ref(x, ids, wref, kidx_cpu, row_off_cpu, pair, with_mag=False):
 @pytest.mark.parametrize("exact", [False, True])
 @pytest.mark.parametrize("k_rows", [256, 96])  # 96: 128 정렬 아님
 def test_gemv_fp8pt_matches_reference(pair, exact, k_rows):
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8pt_indexed
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed
 
     N, K, M = 256, 512, 3
     codes, scales, row_off, kidx, wref = _store(N, K, k_rows, exact, seed=101)
@@ -92,7 +92,7 @@ def test_gemv_fp8pt_matches_reference(pair, exact, k_rows):
 
 @cuda_required
 def test_gemv_fp8pt_pinned_bitwise_and_offset():
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8pt_indexed, gemv_fp8pt_indexed_pinned
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed, gemv_fp8pt_indexed_pinned
 
     N, K, k_rows, M = 128, 512, 160, 2
     codes, scales, row_off, kidx, _ = _store(N, K, k_rows, False, seed=103)
@@ -111,7 +111,7 @@ def test_gemv_fp8pt_pinned_bitwise_and_offset():
 @cuda_required
 @pytest.mark.parametrize("pinned", [False, True])
 def test_gemv_fp8pt_gateup_fused_bitwise(pinned):
-    from sglang.jit_kernel.prism_gemv_fp8 import (
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import (
         gemv_fp8pt_indexed, gemv_fp8pt_indexed_gateup,
         gemv_fp8pt_indexed_pinned, gemv_fp8pt_indexed_pinned_gateup,
     )
@@ -146,7 +146,7 @@ def _sparse_spec(E_, total, seed, thr_val):
 
 @cuda_required
 def test_gemv_fp8pt_sparse_thr0_bitwise_and_masked():
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8pt_indexed, gemv_fp8pt_indexed_sparse
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed, gemv_fp8pt_indexed_sparse
 
     N, K, k_rows, M = 128, 256, 160, 2
     codes, scales, row_off, kidx, wref = _store(N, K, k_rows, False, seed=108)
@@ -208,7 +208,7 @@ def test_gemv_fp8pt_sparsek1_thr0_bitwise_and_masked(pinned, weighted):
     죽은 k는 dense에서 x=0이라 곱이 0이고 커널은 그 라인을 안 읽을 뿐이므로 항과
     순서가 같다 — tolerance 뒤에 "엉뚱한 k를 죽였다"가 숨지 못한다.
     """
-    from sglang.jit_kernel.prism_gemv_fp8 import (
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import (
         gemv_fp8pt_indexed, gemv_fp8pt_indexed_pinned,
         gemv_fp8pt_indexed_pinned_sparse, gemv_fp8pt_indexed_sparse,
     )
@@ -256,7 +256,7 @@ def test_gemv_fp8pt_sparsek1_thr0_bitwise_and_masked(pinned, weighted):
 @pytest.mark.parametrize("score", ["pair", "k1"])
 def test_gemv_fp8pt_sparse_gateup_fused_bitwise(score):
     """per-tensor sparse gate|up fusion matches two single sparse launches, device and pinned."""
-    from sglang.jit_kernel.prism_gemv_fp8 import (
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import (
         gemv_fp8pt_indexed_pinned_sparse, gemv_fp8pt_indexed_pinned_sparse_gateup,
         gemv_fp8pt_indexed_sparse, gemv_fp8pt_indexed_sparse_gateup,
     )
@@ -293,7 +293,7 @@ def test_gemv_fp8pt_equals_b128_with_uniform_scales():
     """pt 스토어 ≡ 같은 스칼라를 모든 블록에 채운 b128 스토어 (exact 픽스처 → 비트일치).
     두 판이 같은 가중치를 같은 값으로 읽는다는 교차검증이고, 배율 위치(끝 1회 vs 청크마다)가
     2^n 배율에서 결과를 바꾸지 않음을 함께 확인한다."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed, gemv_fp8pt_indexed
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8_indexed, gemv_fp8pt_indexed
 
     N, K, k_rows, M = 256, 512, 256, 3  # b128이 받는 128 정렬 기하
     g = torch.Generator().manual_seed(112)
@@ -321,7 +321,7 @@ def test_gemv_fp8pt_equals_b128_with_uniform_scales():
 @cuda_required
 def test_gemv_fp8pt_rejects_block_scale_shape():
     """배율 모양 계약: pt 진입점에 블록표를 주면 즉사 (조용히 남의 값을 읽지 않는다)."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8pt_indexed
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed
 
     N, K, k_rows, M = 128, 256, 128, 1
     codes, scales, row_off, kidx, _ = _store(N, K, k_rows, True, seed=114)
@@ -338,7 +338,7 @@ def test_gemv_fp8pt_rejects_block_scale_shape():
 def test_gemv_fp8pt_non_pow2_scale():
     """임의 fp32 배율 — GEMV는 fp32 부분합 × fp32 배율이라 가중치 반올림이 없다. fp32 참조와
     항 크기 합 대비 1e-5 안에서 일치해야 한다 (Mistral 체크포인트 배율은 2^n이 아니다)."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8pt_indexed
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed
 
     N, K, k_rows, M = 256, 512, 160, 3
     codes, scales, row_off, kidx, wref = _store(N, K, k_rows, False, seed=116, pow2_scale=False)
@@ -360,8 +360,8 @@ def test_gemv_fp8pt_non_pow2_scale():
 @pytest.mark.parametrize("m", [8, 300])
 @pytest.mark.parametrize("k_rows", [256, 160])  # 160: kr % 64 == 32 부분 K 타일
 def test_grouped_fp8pt_matches_gemv(pair, exact, m, k_rows):
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8pt_indexed
-    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8pt_indexed, grouped_fp8pt_indexed_pinned
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed
+    from sglang.kernels.ops.moe.prism.grouped_fp8 import grouped_fp8pt_indexed, grouped_fp8pt_indexed_pinned
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K = 256, 512
@@ -392,7 +392,7 @@ def test_grouped_fp8pt_matches_gemv(pair, exact, m, k_rows):
 @cuda_required
 @pytest.mark.parametrize("pinned", [False, True])
 def test_grouped_fp8pt_gateup_fused(pinned):
-    from sglang.jit_kernel.prism_grouped_fp8 import (
+    from sglang.kernels.ops.moe.prism.grouped_fp8 import (
         grouped_fp8pt_indexed, grouped_fp8pt_indexed_gateup, grouped_fp8pt_indexed_pinned,
         grouped_fp8pt_indexed_pinned_gateup,
     )
@@ -423,8 +423,8 @@ def test_grouped_fp8pt_gateup_fused(pinned):
 def test_grouped_fp8pt_cold_tile_matches_gemv(exact, k_rows):
     """KT_TILE8_PT 로더: kt `GemmKernelTileK2FP8PT::BufferB` slab(코드 타일 + 64 B 배율 슬롯)을
     제자리 읽어 GEMV와 일치. k_rows=160은 32 정렬(128 아님)."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8pt_indexed
-    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_cold
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed
+    from sglang.kernels.ops.moe.prism.grouped_fp8 import grouped_fp8_cold
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, m = 256, 512, 40
@@ -467,8 +467,8 @@ def test_grouped_fp8pt_non_pow2_scale_within_bf16_weight_rounding():
     """임의 배율에서 grouped는 `bf16(code·scale)`을 텐서코어에 넣으므로(.cuh 수치 계약) GEMV와
     가중치당 상대 2⁻⁹ 반올림만큼 다르다. 항 크기 합 × 2⁻⁸ 안이어야 하고, 그 이상이면 배율 위치가
     틀린 것이다 (틀리면 상대 오차가 배율 크기만큼 난다)."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8pt_indexed
-    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8pt_indexed
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed
+    from sglang.kernels.ops.moe.prism.grouped_fp8 import grouped_fp8pt_indexed
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows, m = 256, 512, 160, 40

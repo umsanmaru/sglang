@@ -40,8 +40,8 @@ def _packed_store(rows, n=64, seed=1):
 @pytest.mark.parametrize("m", [1536, 2048])
 @pytest.mark.parametrize("pair", [False, True])
 def test_buffered_packed_reuses_topk_slots(m, pair, monkeypatch):
-    from sglang.jit_kernel import prism_buffered
-    from sglang.jit_kernel.prism_grouped import grouped_gemm_cold_gateup, grouped_gemm_indexed
+    from sglang.kernels.ops.moe.prism import buffered as prism_buffered
+    from sglang.kernels.ops.moe.prism.grouped import grouped_gemm_cold_gateup, grouped_gemm_indexed
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     # E is not divisible by top-k; zero-row and unselected experts are included.
@@ -77,7 +77,7 @@ def test_buffered_packed_reuses_topk_slots(m, pair, monkeypatch):
 
 
 def test_buffered_packed_capture_replay():
-    from sglang.jit_kernel.prism_grouped import grouped_gemm_cold
+    from sglang.kernels.ops.moe.prism.grouped import grouped_gemm_cold
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     slab, _ = _packed_store([32, 64, 96, 32, 64])
@@ -102,7 +102,7 @@ def test_buffered_packed_capture_replay():
 
 
 def test_buffered_packed_all_zero_rows():
-    from sglang.jit_kernel.prism_grouped import grouped_gemm_cold
+    from sglang.kernels.ops.moe.prism.grouped import grouped_gemm_cold
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     slab, _ = _packed_store([0, 0, 0])

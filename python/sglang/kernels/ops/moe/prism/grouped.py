@@ -111,7 +111,11 @@ def grouped_gemm_indexed_pinned(x2d, grouping, w_flat, row_off, kidx, out3d,
                          out_col_offset, x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
     """위의 쌍둥이 — W가 pinned CPU(UVA 제자리 읽기, WARM). expert당 W를 **한 번만**
     PCIe로 읽는다 — worklist의 pair당 재읽기(중복도 M·k/E)가 사라진 자리다."""
-    from sglang.jit_kernel.prism_prefill import enabled, grouped_prefill, Projection
+    from sglang.kernels.ops.moe.prism.prefill import (
+        Projection,
+        enabled,
+        grouped_prefill,
+    )
     if enabled(out3d, grouping, stream):
         p = Projection(w_flat, row_off, kidx, w_flat.shape[1],
                        rows_host=getattr(w_flat, "_prism_prefill_rows", ()))
@@ -144,7 +148,11 @@ def grouped_gemm_indexed_pinned_gateup(x2d, grouping, w_gate, row_off_gate,
                                        out3d, out_col_gate, out_col_up,
                                        x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
     """gate+up 융합의 warm 짝 (pinned W)."""
-    from sglang.jit_kernel.prism_prefill import enabled, grouped_prefill, Projection
+    from sglang.kernels.ops.moe.prism.prefill import (
+        Projection,
+        enabled,
+        grouped_prefill,
+    )
     if enabled(out3d, grouping, stream):
         gate = Projection(w_gate, row_off_gate, kidx_gate, w_gate.shape[1],
                           rows_host=getattr(w_gate, "_prism_prefill_rows", ()))
@@ -168,7 +176,7 @@ def grouped_gemm_cold(x2d, grouping, cold, out3d, out_col_offset, x_row_is_pair,
     grouped GEMM. `cold`는 `ColdSlab`(weights.py) — slab 텐서 뷰, blk_off, 타일
     올림된 row_off/kidx, 노드 N shard 시작, n_block/k_block을 든다.
     출력 열은 `out_col_offset + cold.n_start`부터 이 노드의 n열이다."""
-    from sglang.jit_kernel.prism_prefill import enabled, grouped_prefill
+    from sglang.kernels.ops.moe.prism.prefill import enabled, grouped_prefill
     if enabled(out3d, grouping, stream):
         grouped_prefill(x2d, grouping, [(cold.prefill, out_col_offset + cold.n_start)],
                         out3d, x_row_is_pair, stream)
@@ -189,7 +197,7 @@ def grouped_gemm_cold_gateup(x2d, grouping, gate, up, out3d, out_col_gate,
     상수는 같아야 한다 — 같은 kt 인스턴스가 만든 것이므로 그렇다."""
     if (gate.n, gate.n_start, gate.n_block, gate.k_block, gate.layout) != (up.n, up.n_start, up.n_block, up.k_block, up.layout):
         raise ValueError("cold gateup fusion requires gate/up slabs of the same node instance")
-    from sglang.jit_kernel.prism_prefill import enabled, grouped_prefill
+    from sglang.kernels.ops.moe.prism.prefill import enabled, grouped_prefill
     if enabled(out3d, grouping, stream):
         grouped_prefill(x2d, grouping,
                         [(gate.prefill, out_col_gate + gate.n_start),

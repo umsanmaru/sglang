@@ -4,7 +4,7 @@ import json
 from dataclasses import replace
 import torch
 from test_buffered_prefill import _packed_store
-from sglang.jit_kernel.prism_grouped import grouped_gemm_cold
+from sglang.kernels.ops.moe.prism.grouped import grouped_gemm_cold
 from sglang.srt.layers.moe.prism.grouping import build_grouping
 
 torch.set_num_threads(4)

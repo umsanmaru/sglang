@@ -197,17 +197,17 @@ class Mxfp4Format(StoreFormat):
         return slab, torch.tensor(list(expert_off[:-1]), dtype=torch.int64, device=device)
 
     def grouped_cold(self):
-        from sglang.jit_kernel import prism_grouped_mxfp4 as k
+        from sglang.kernels.ops.moe.prism import grouped_mxfp4 as k
 
         return k.grouped_mxfp4_cold
 
     def grouped_cold_gateup(self):
-        from sglang.jit_kernel import prism_grouped_mxfp4 as k
+        from sglang.kernels.ops.moe.prism import grouped_mxfp4 as k
 
         return k.grouped_mxfp4_cold_gateup
 
     def gemv(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_mxfp4 as k
+        from sglang.kernels.ops.moe.prism import gemv_mxfp4 as k
 
         table = {
             (False, False): k.gemv_mxfp4_indexed,
@@ -218,7 +218,7 @@ class Mxfp4Format(StoreFormat):
         return table[(pinned, sparse)]
 
     def gemv_gateup(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_mxfp4 as k
+        from sglang.kernels.ops.moe.prism import gemv_mxfp4 as k
 
         table = {
             (False, False): k.gemv_mxfp4_indexed_gateup,
@@ -229,18 +229,18 @@ class Mxfp4Format(StoreFormat):
         return table[(pinned, sparse)]
 
     def grouped(self, *, pinned):
-        from sglang.jit_kernel import prism_grouped_mxfp4 as k
+        from sglang.kernels.ops.moe.prism import grouped_mxfp4 as k
 
         return k.grouped_mxfp4_indexed_pinned if pinned else k.grouped_mxfp4_indexed
 
     def grouped_gateup(self, *, pinned):
-        from sglang.jit_kernel import prism_grouped_mxfp4 as k
+        from sglang.kernels.ops.moe.prism import grouped_mxfp4 as k
 
         return k.grouped_mxfp4_indexed_pinned_gateup if pinned else k.grouped_mxfp4_indexed_gateup
 
     def warmup(self) -> None:
-        from sglang.jit_kernel.prism_gemv_mxfp4 import warmup_jit
-        from sglang.jit_kernel.prism_grouped_mxfp4 import warmup_jit as warmup_grouped
+        from sglang.kernels.ops.moe.prism.gemv_mxfp4 import warmup_jit
+        from sglang.kernels.ops.moe.prism.grouped_mxfp4 import warmup_jit as warmup_grouped
 
         warmup_jit()
         warmup_grouped()

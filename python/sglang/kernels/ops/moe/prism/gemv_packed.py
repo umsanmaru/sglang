@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.jit_kernel.prism_gemv import keep_ctr_arg
 from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.ops.moe.prism.gemv import keep_ctr_arg
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module

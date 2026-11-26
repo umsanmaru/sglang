@@ -108,7 +108,7 @@ class Fp8PtGpu:
     cold_kernels = ("kt_tile_k2_fp8pt",)
 
     def gemv(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_fp8 as k
+        from sglang.kernels.ops.moe.prism import gemv_fp8 as k
 
         return {(False, False): k.gemv_fp8pt_indexed,
                 (True, False): k.gemv_fp8pt_indexed_pinned,
@@ -116,7 +116,7 @@ class Fp8PtGpu:
                 (True, True): k.gemv_fp8pt_indexed_pinned_sparse}[(pinned, sparse)]
 
     def gemv_gateup(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_fp8 as k
+        from sglang.kernels.ops.moe.prism import gemv_fp8 as k
 
         return {(False, False): k.gemv_fp8pt_indexed_gateup,
                 (True, False): k.gemv_fp8pt_indexed_pinned_gateup,
@@ -124,7 +124,7 @@ class Fp8PtGpu:
                 (True, True): k.gemv_fp8pt_indexed_pinned_sparse_gateup}[(pinned, sparse)]
 
     def warmup(self) -> None:
-        from sglang.jit_kernel.prism_gemv_fp8 import warmup_jit
+        from sglang.kernels.ops.moe.prism.gemv_fp8 import warmup_jit
 
         warmup_jit()
 

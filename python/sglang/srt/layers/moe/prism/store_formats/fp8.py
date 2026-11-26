@@ -154,27 +154,27 @@ class Fp8Format(StoreFormat):
         return slab, torch.tensor(list(expert_off[:-1]), dtype=torch.int64, device=device)
 
     def grouped_cold(self):
-        from sglang.jit_kernel import prism_grouped_fp8 as k
+        from sglang.kernels.ops.moe.prism import grouped_fp8 as k
 
         return k.grouped_fp8_cold
 
     def grouped_cold_gateup(self):
-        from sglang.jit_kernel import prism_grouped_fp8 as k
+        from sglang.kernels.ops.moe.prism import grouped_fp8 as k
 
         return k.grouped_fp8_cold_gateup
 
     def grouped(self, *, pinned):
-        from sglang.jit_kernel import prism_grouped_fp8 as k
+        from sglang.kernels.ops.moe.prism import grouped_fp8 as k
 
         return k.grouped_fp8_indexed_pinned if pinned else k.grouped_fp8_indexed
 
     def grouped_gateup(self, *, pinned):
-        from sglang.jit_kernel import prism_grouped_fp8 as k
+        from sglang.kernels.ops.moe.prism import grouped_fp8 as k
 
         return k.grouped_fp8_indexed_pinned_gateup if pinned else k.grouped_fp8_indexed_gateup
 
     def gemv(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_fp8 as k
+        from sglang.kernels.ops.moe.prism import gemv_fp8 as k
 
         table = {
             (False, False): k.gemv_fp8_indexed,
@@ -185,7 +185,7 @@ class Fp8Format(StoreFormat):
         return table[(pinned, sparse)]
 
     def gemv_gateup(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_fp8 as k
+        from sglang.kernels.ops.moe.prism import gemv_fp8 as k
 
         table = {
             (False, False): k.gemv_fp8_indexed_gateup,
@@ -196,8 +196,8 @@ class Fp8Format(StoreFormat):
         return table[(pinned, sparse)]
 
     def warmup(self) -> None:
-        from sglang.jit_kernel.prism_gemv_fp8 import warmup_jit
-        from sglang.jit_kernel.prism_grouped_fp8 import warmup_jit as warmup_grouped
+        from sglang.kernels.ops.moe.prism.gemv_fp8 import warmup_jit
+        from sglang.kernels.ops.moe.prism.grouped_fp8 import warmup_jit as warmup_grouped
 
         warmup_jit()
         warmup_grouped()

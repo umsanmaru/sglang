@@ -838,7 +838,7 @@ class PrismExecutor:
                                  cuda_stream=sarg, weights_ptr=0)
             res.cold_seq += 1
             self._cold.submit_signal(sarg, res.cold_flag.data_ptr(), res.cold_seq)
-            from sglang.jit_kernel.prism_grouped import wait_flag
+            from sglang.kernels.ops.moe.prism.grouped import wait_flag
             wait_flag(res.cold_flag, res.cold_seq, cs)
             dev = x.device
             cold_p = port.cold_out(flow.m).to(dev, non_blocking=True) if flow.cpu_cold else None

@@ -74,17 +74,17 @@ class Bf16Format(StoreFormat):
         return slab, torch.tensor([o // 2 for o in expert_off[:-1]], dtype=torch.int64, device=device)
 
     def grouped_cold(self):
-        from sglang.jit_kernel import prism_grouped as k
+        from sglang.kernels.ops.moe.prism import grouped as k
 
         return k.grouped_gemm_cold
 
     def grouped_cold_gateup(self):
-        from sglang.jit_kernel import prism_grouped as k
+        from sglang.kernels.ops.moe.prism import grouped as k
 
         return k.grouped_gemm_cold_gateup
 
     def gemv(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv as k
+        from sglang.kernels.ops.moe.prism import gemv as k
 
         table = {
             (False, False): k.gemv_worklist_indexed,
@@ -97,7 +97,7 @@ class Bf16Format(StoreFormat):
     def gemv_gateup(self, *, pinned, sparse):
         # 네 조합 전부 (mxfp4/fp8과 같은 표). warm dense와 hot sparse는 2026-08-29에
         # 채웠다 — 그 전에는 같은 스텝이 조용히 2회 launch로 떨어졌다.
-        from sglang.jit_kernel import prism_gemv as k
+        from sglang.kernels.ops.moe.prism import gemv as k
 
         table = {
             (False, False): k.gemv_worklist_indexed_gateup,
@@ -108,17 +108,17 @@ class Bf16Format(StoreFormat):
         return table[(pinned, sparse)]
 
     def grouped(self, *, pinned):
-        from sglang.jit_kernel import prism_grouped as k
+        from sglang.kernels.ops.moe.prism import grouped as k
 
         return k.grouped_gemm_indexed_pinned if pinned else k.grouped_gemm_indexed
 
     def grouped_gateup(self, *, pinned):
-        from sglang.jit_kernel import prism_grouped as k
+        from sglang.kernels.ops.moe.prism import grouped as k
 
         return k.grouped_gemm_indexed_pinned_gateup if pinned else k.grouped_gemm_indexed_gateup
 
     def wres_k_max(self, *shards) -> int:
-        from sglang.jit_kernel import prism_grouped
+        from sglang.kernels.ops.moe.prism import grouped as prism_grouped
 
         if not prism_grouped.WRES_PCIE:
             return 0
@@ -126,8 +126,8 @@ class Bf16Format(StoreFormat):
         return (k + 31) // 32 * 32
 
     def warmup(self) -> None:
-        from sglang.jit_kernel.prism_gemv import warmup_jit
-        from sglang.jit_kernel.prism_grouped import warmup_jit as warmup_grouped
+        from sglang.kernels.ops.moe.prism.gemv import warmup_jit
+        from sglang.kernels.ops.moe.prism.grouped import warmup_jit as warmup_grouped
 
         warmup_jit()
         warmup_grouped()

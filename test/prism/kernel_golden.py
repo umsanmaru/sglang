@@ -38,15 +38,15 @@ ENV = "PRISM_KERNEL_GOLDEN"
 # Modules whose `load_jit` result is wrapped. Kept as a list so the gate survives the
 # planned move of these modules (only this list changes).
 WRAPPER_MODULES = (
-    "sglang.jit_kernel.prism_gemv",
-    "sglang.jit_kernel.prism_gemv_fp8",
-    "sglang.jit_kernel.prism_gemv_mxfp4",
-    "sglang.jit_kernel.prism_gemv_packed",
-    "sglang.jit_kernel.prism_grouped",
-    "sglang.jit_kernel.prism_grouped_fp8",
-    "sglang.jit_kernel.prism_grouped_mxfp4",
-    "sglang.jit_kernel.prism_gather",
-    "sglang.jit_kernel.prism_thr_ctrl",
+    "sglang.kernels.ops.moe.prism.gemv",
+    "sglang.kernels.ops.moe.prism.gemv_fp8",
+    "sglang.kernels.ops.moe.prism.gemv_mxfp4",
+    "sglang.kernels.ops.moe.prism.gemv_packed",
+    "sglang.kernels.ops.moe.prism.grouped",
+    "sglang.kernels.ops.moe.prism.grouped_fp8",
+    "sglang.kernels.ops.moe.prism.grouped_mxfp4",
+    "sglang.kernels.ops.moe.prism.gather",
+    "sglang.kernels.ops.moe.prism.thr_ctrl",
 )
 
 

@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from sglang.jit_kernel.prism_prefill import Projection, grouped_prefill
+from sglang.kernels.ops.moe.prism.prefill import Projection, grouped_prefill
 from sglang.srt.layers.moe.prism.grouping import build_grouping
 
 
@@ -146,7 +146,7 @@ def test_warm_cpu_boundary_and_nc_runtime(monkeypatch, tmp_path, sparse):
 
 
 def test_dispatch_keeps_small_expert_gemms_on_wres(monkeypatch):
-    from sglang.jit_kernel.prism_prefill import enabled
+    from sglang.kernels.ops.moe.prism.prefill import enabled
     monkeypatch.setenv('SGLANG_PRISM_BUFFERED_PREFILL', 'auto')
     monkeypatch.setenv('SGLANG_PRISM_BUFFERED_MIN_M', '1536')
     out = torch.empty(1536, 10, 1, device='cuda', dtype=torch.bfloat16)

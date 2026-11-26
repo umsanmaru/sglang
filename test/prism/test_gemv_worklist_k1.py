@@ -59,7 +59,7 @@ def _masked_x(x, thr):
 @cuda_required
 @pytest.mark.parametrize("pinned", [False, True])
 def test_sparsek1_thr0_is_dense_bitwise(pinned):
-    from sglang.jit_kernel.prism_gemv import (
+    from sglang.kernels.ops.moe.prism.gemv import (
         gemv_worklist_indexed, gemv_worklist_indexed_pinned,
         gemv_worklist_indexed_pinned_sparse, gemv_worklist_indexed_sparse,
     )
@@ -83,7 +83,7 @@ def test_sparsek1_thr0_is_dense_bitwise(pinned):
 @pytest.mark.parametrize("pinned", [False, True])
 def test_sparsek1_masks_what_it_says(pinned):
     """thr>0 ↔ 마스킹된 dense와 **비트일치**, 그리고 실제로 일부만 산다."""
-    from sglang.jit_kernel.prism_gemv import (
+    from sglang.kernels.ops.moe.prism.gemv import (
         gemv_worklist_indexed, gemv_worklist_indexed_pinned,
         gemv_worklist_indexed_pinned_sparse, gemv_worklist_indexed_sparse,
     )
@@ -117,7 +117,7 @@ def test_sparsek1_masks_what_it_says(pinned):
 @pytest.mark.parametrize("weighted", [False, True], ids=["k1", "k1w"])
 def test_sparsek1_gateup_fusion_matches_two_launches(weighted):
     """warm의 실제 경로(gate|up 융합)가 per-k 2회 launch와 비트일치. thr은 서로 다르게."""
-    from sglang.jit_kernel.prism_gemv import (
+    from sglang.kernels.ops.moe.prism.gemv import (
         gemv_worklist_indexed_pinned_sparse, gemv_worklist_indexed_pinned_sparse_gateup,
         gemv_worklist_indexed_sparse, gemv_worklist_indexed_sparse_gateup,
     )
@@ -150,7 +150,7 @@ def test_sparsek1_gateup_fusion_matches_two_launches(weighted):
 @cuda_required
 def test_sparsek1_and_pair_masks_differ():
     """같은 thr에서 per-k와 페어 마스크는 **다른 마스크**다 — 섞이면 조용히 틀린다."""
-    from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_sparse
+    from sglang.kernels.ops.moe.prism.gemv import gemv_worklist_indexed_sparse
 
     x, w, row_off, kidx, ids, wts = _store(seed=41)
     s = torch.cuda.current_stream()
@@ -182,7 +182,7 @@ def test_sparsek1w_matches_weighted_masked_dense(pinned):
     a(=wn²)는 weight와 같은 오프셋 표를 쓰므로, 인덱스가 어긋나면 엉뚱한 k가 죽고
     비트일치가 깨진다 — 이 테스트가 그 대응을 잡는다.
     """
-    from sglang.jit_kernel.prism_gemv import (
+    from sglang.kernels.ops.moe.prism.gemv import (
         gemv_worklist_indexed, gemv_worklist_indexed_pinned,
         gemv_worklist_indexed_pinned_sparse, gemv_worklist_indexed_sparse,
     )
@@ -229,7 +229,7 @@ def test_sparsek1w_matches_weighted_masked_dense(pinned):
 @cuda_required
 def test_sparsek1w_differs_from_plain_k1():
     """같은 thr에서 wn을 곱하면 다른 k가 죽는다 — 아니면 a가 안 읽힌 것이다."""
-    from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_sparse
+    from sglang.kernels.ops.moe.prism.gemv import gemv_worklist_indexed_sparse
 
     x, w, row_off, kidx, ids, wts = _store(seed=61)
     s = torch.cuda.current_stream()

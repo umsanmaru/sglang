@@ -100,7 +100,7 @@ class ThresholdController:
 
     def step(self, layer_idx: int) -> None:
         """One masked decode step of this layer; call it on the stream after the layer's rejoin."""
-        from sglang.jit_kernel.prism_thr_ctrl import thr_ctrl_step
+        from sglang.kernels.ops.moe.prism.thr_ctrl import thr_ctrl_step
 
         s = self._layers[layer_idx]
         thr_ctrl_step(
