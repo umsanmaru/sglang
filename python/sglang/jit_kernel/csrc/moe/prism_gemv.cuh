@@ -502,84 +502,19 @@ inline void gemv_worklist_indexed_impl(
                out_col_offset + n_cols, ") out of out width ", out_row);
 
   SparseArgs sp{}, sp_up{};
+  auto E = SymbolicSize{"num_experts"};
+  auto Ng = SymbolicSize{"sparsity_ng"};
   if (sin != nullptr) {
-    auto Ng = SymbolicSize{"sparsity_ng"};
-    auto E = SymbolicSize{"num_experts"};
-    // a/c는 weight와 **같은 오프셋 테이블**을 쓴다 — R을 공유시켜 길이 불일치를
-    // 여기서 잡는다 (어긋나면 조용히 남의 페어 점수로 마스킹한다).
-    // score k1(per-k)은 가중치 통계를 아예 읽지 않으므로 검증도 건너뛴다 — 호출자는
-    // a/c 자리에 thr을 넣는다 (SparseIn 주석). k1w1은 a까지 읽으므로 a만 검증한다.
-    if (sin->per_k && sin->use_wn) {
-      TensorMatcher({R}).with_dtype<float>().with_device(cuda_device).verify(sin->a);
-    }
-    if (!sin->per_k) {
-      TensorMatcher({R}).with_dtype<float>().with_device(cuda_device).verify(sin->a);
-      // SymbolicSize에 산술이 없으므로 페어 축은 별도 기호로 받고 R과의 관계를
-      // RuntimeCheck로 묶는다.
-      auto Rp = SymbolicSize{"total_pairs"};
-      TensorMatcher({Rp}).with_dtype<float>().with_device(cuda_device).verify(sin->c);
-      RuntimeCheck(Rp.unwrap() * 2 == R.unwrap(),
-                   "gemv_worklist_indexed_sparse: pair_dot has ", Rp.unwrap(),
-                   " entries but the store has ", R.unwrap(),
-                   " rows (must be exactly half)");
-    }
-    TensorMatcher({E, Ng}).with_dtype<float>().with_device(cuda_device).verify(sin->thr);
-    TensorMatcher({M, K}).with_dtype<float>().with_device(cuda_device).verify(sin->topk_w);
+    // a (and c for the pair score) must cover the store's rows: a mismatched offset table
+    // would silently mask with another row's score.
+    sp = prism_sparse::fill_sparse(*sin, E, Ng, M, K, cuda_device, R.unwrap(),
+                                   "gemv_worklist_indexed_sparse");
     RuntimeCheck(E1.unwrap() == E.unwrap() + 1,
                  "gemv_worklist_indexed_sparse: thr has ", E.unwrap(),
                  " experts but row_off implies ", E1.unwrap() - 1);
-    RuntimeCheck(Ng.unwrap() == sin->ng,
-                 "gemv_worklist_indexed_sparse: thr grid ", Ng.unwrap(),
-                 " != ng ", sin->ng);
     RuntimeCheck(top_k <= 16,
                  "gemv_worklist_indexed_sparse: top_k ", top_k,
                  " exceeds the per-thread slot budget (16)");
-    RuntimeCheck(sin->grid > 0.0,
-                 "gemv_worklist_indexed_sparse: grid must be positive, got ",
-                 sin->grid);
-    // a가 nullptr인지가 곧 "k1인가 k1w1인가"다 (커널이 그것으로 가른다).
-    sp.a = (sin->per_k && !sin->use_wn) ? nullptr
-                                        : static_cast<const float*>(sin->a.data_ptr());
-    sp.c = sin->per_k ? nullptr : static_cast<const float*>(sin->c.data_ptr());
-    sp.thr_tab = static_cast<const float*>(sin->thr.data_ptr());
-    sp.topk_w = static_cast<const float*>(sin->topk_w.data_ptr());
-    sp.p = static_cast<float>(sin->p);
-    sp.lam = static_cast<float>(sin->lam);
-    sp.pmax = static_cast<float>(sin->pmax);
-    sp.grid = static_cast<float>(sin->grid);
-    sp.ng = static_cast<int>(sin->ng);
-    sp.renorm_it = static_cast<int>(sin->renorm_it);
-    sp.ctr = prism_sparse::keep_ctr_of(*sin, cuda_device);
-
-    if (sin_up != nullptr) {
-      // 슬롯 1의 점수 재료. proj별로 갈리는 것은 a/c/thr/p/lam **다섯**뿐이고
-      // topk_w(라우터 가중)와 예산 스칼라(pmax/grid/ng/renorm_it)는 공유한다 —
-      // 슬롯 0에서 복사한 뒤 그 다섯만 덮어 공유를 코드로 강제한다.
-      sp_up = sp;
-      RuntimeCheck(sin_up->per_k == sin->per_k,
-                   "gemv_worklist_indexed_gateup: gate/up sparse modes differ");
-      if (!sin_up->per_k) {
-        TensorMatcher({R2}).with_dtype<float>().with_device(cuda_device).verify(sin_up->a);
-        auto Rp2 = SymbolicSize{"total_pairs_up"};
-        TensorMatcher({Rp2}).with_dtype<float>().with_device(cuda_device).verify(sin_up->c);
-        RuntimeCheck(Rp2.unwrap() * 2 == R2.unwrap(),
-                     "gemv_worklist_indexed_gateup: up pair_dot has ", Rp2.unwrap(),
-                     " entries but the up store has ", R2.unwrap(), " rows");
-      }
-      TensorMatcher({E, Ng}).with_dtype<float>().with_device(cuda_device).verify(sin_up->thr);
-      RuntimeCheck(sin_up->use_wn == sin->use_wn,
-                   "gemv_worklist_indexed_gateup: gate/up 이 다른 score를 쓴다");
-      if (sin_up->per_k && sin_up->use_wn) {
-        TensorMatcher({R2}).with_dtype<float>().with_device(cuda_device).verify(sin_up->a);
-      }
-      sp_up.a = (sin_up->per_k && !sin_up->use_wn)
-                    ? nullptr : static_cast<const float*>(sin_up->a.data_ptr());
-      sp_up.c = sin_up->per_k ? nullptr : static_cast<const float*>(sin_up->c.data_ptr());
-      sp_up.thr_tab = static_cast<const float*>(sin_up->thr.data_ptr());
-      sp_up.p = static_cast<float>(sin_up->p);
-      sp_up.lam = static_cast<float>(sin_up->lam);
-      sp_up.ctr = prism_sparse::keep_ctr_of(*sin_up, cuda_device);
-    }
   }
 
   // 슬롯 1 검증. `E1`과 `N`을 재사용해 **expert 수와 출력 폭이 같음**을 강제하고
@@ -606,6 +541,13 @@ inline void gemv_worklist_indexed_impl(
     w1p = static_cast<const __nv_bfloat16*>(w_up->data_ptr());
     row_off1p = static_cast<const int32_t*>(row_off_up->data_ptr());
     kidx1p = static_cast<const uint16_t*>(kidx_up->data_ptr());
+  }
+  if (fused && sin != nullptr && sin_up != nullptr) {
+    RuntimeCheck(sin_up->per_k == sin->per_k && sin_up->use_wn == sin->use_wn,
+                 "gemv_worklist_indexed_gateup: gate/up sparse modes differ");
+    sp_up = prism_sparse::up_slot(
+        sp, prism_sparse::fill_sparse(*sin_up, E, Ng, M, K, cuda_device, R2.unwrap(),
+                                      "gemv_worklist_indexed_sparse_gateup(up)"));
   }
 
   const DLDevice device = cuda_device.unwrap();
