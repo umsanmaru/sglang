@@ -20,16 +20,27 @@ from sglang.kernels.ops.moe.prism.gemv import keep_ctr_arg
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_WRAPPERS = (
-    "gemv_mxfp4_indexed",
-    "gemv_mxfp4_indexed_pinned",
-    "gemv_mxfp4_indexed_sparse",
-    "gemv_mxfp4_indexed_pinned_sparse",
-    "gemv_mxfp4_indexed_gateup",
-    "gemv_mxfp4_indexed_pinned_gateup",
-    "gemv_mxfp4_indexed_sparse_gateup",
-    "gemv_mxfp4_indexed_pinned_sparse_gateup",
-)
+# Export name -> C++ entry (prism_gemv_mxfp4.cuh); `_pinned` = warm placement.
+_SCORE_SUFFIX = {"kDense": "", "kPair": "_sparse"}
+
+
+def _entries() -> list[tuple[str, str]]:
+    out = []
+    for mode, suffix in _SCORE_SUFFIX.items():
+        for fused in (False, True):
+            for on_device in (True, False):
+                name = (
+                    "gemv_mxfp4_indexed"
+                    + ("" if on_device else "_pinned")
+                    + suffix
+                    + ("_gateup" if fused else "")
+                )
+                args = f"Mode::{mode}, {str(fused).lower()}, {str(on_device).lower()}"
+                out.append((name, f"PrismGemvMxfp4<{args}>::run"))
+    return out
+
+
+_ENTRIES = _entries()
 
 
 @cache_once
@@ -37,7 +48,7 @@ def _jit_prism_gemv_mxfp4_module() -> Module:
     return load_jit(
         "prism_gemv_mxfp4",
         cuda_files=["moe/prism/prism_gemv_mxfp4.cuh"],
-        cuda_wrappers=[(n, n) for n in _WRAPPERS],
+        cuda_wrappers=_ENTRIES,
     )
 
 
