@@ -87,6 +87,19 @@ inline SparseArgs fill_sparse(const SparseIn& sin, host::SymbolicSize& E, host::
   return sp;
 }
 
+// Slot 1 of a gate+up launch: the per-projection score inputs (a, c, thr, p, lam and the
+// keep counter) come from the up spec; topk_w and the budget scalars stay shared with slot 0.
+inline SparseArgs up_slot(const SparseArgs& gate, const SparseArgs& up) {
+  SparseArgs s = gate;
+  s.a = up.a;
+  s.c = up.c;
+  s.thr_tab = up.thr_tab;
+  s.p = up.p;
+  s.lam = up.lam;
+  s.ctr = up.ctr;
+  return s;
+}
+
 // Block-sums per-thread (kept, total) mask-unit counts into ctr = {kept, total}. Every thread
 // of the block must call it (it synchronizes). Only the blockIdx.x == 0 column tile adds,
 // because every column tile of a (pair, slot) recomputes the same mask.

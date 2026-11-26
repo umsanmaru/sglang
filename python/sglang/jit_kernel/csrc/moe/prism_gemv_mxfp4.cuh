@@ -340,12 +340,9 @@ inline void gemv_mxfp4_impl(
                  static_cast<const uint16_t*>(kidx_up->data_ptr()), out_col_offset_up};
     if (sin != nullptr) {
       RuntimeCheck(sin_up != nullptr, "gemv_mxfp4_gateup: sparse fusion needs the up sparse spec");
-      // proj별로 갈리는 것은 a/c/thr/p/lam 다섯 — 예산 스칼라와 topk_w는 슬롯 0과 공유.
       SparseArgs u = prism_sparse::fill_sparse(*sin_up, E, Ng, M, K, cuda_device, rows1,
                                                "gemv_mxfp4_sparse_gateup(up)");
-      sp1 = sp0;
-      sp1.a = u.a; sp1.c = u.c; sp1.thr_tab = u.thr_tab; sp1.p = u.p; sp1.lam = u.lam;
-      sp1.ctr = u.ctr;
+      sp1 = prism_sparse::up_slot(sp0, u);
     }
   }
 
