@@ -292,7 +292,7 @@ vs CPU cold, 둘 다 grouped+split): 672tok 806 vs 715 ms, 1344tok 1049 vs 1044,
 
 **누적**: prefill 2688tok TTFT 13.8 s → 1.49 s (**9.3배**), 5.14 → 0.55 ms/tok.
 측정은 전부 GPU1(H100)이 조용할 때; 08:10 이후 타 사용자 vLLM이 GPU1을 점유해
-`WARM_MAX_BLOCKS=128` 기본값의 executor 수준 확인(nocold plan)은 미완 — 커널 단독
+`LaunchTuning.warm_max_blocks=128` 기본값의 executor 수준 확인(nocold plan)은 미완 — 커널 단독
 실험 근거로 기본값을 뒀다.
 
 **kt 기본 커널 vs prism, 단일 소켓(node0) 6스레드, GPU0 Blackwell, TTFT min/3
@@ -433,7 +433,7 @@ zero-fill·H2D 절반 제거(~2 ms/층).
   ~17 ms @2688 (kt dual ≈ 31·(2688/4096) 환산과 비교 시 ~1.8배).
 
 **W-resident grouped GEMM (2026-08-27, `prism_grouped_gemm_wres`, PCIe 경로 기본 ON
-`WRES_PCIE`)**: 블록 = (expert, 열 타일)이 W 슬라이스를 smem에 1회 올리고 토큰 타일을
+`LaunchTuning.wres_pcie`)**: 블록 = (expert, 열 타일)이 W 슬라이스를 smem에 1회 올리고 토큰 타일을
 순회 → pair 수와 무관하게 W 1회 읽기. smem이 부족하면(GPU0 sm_120 99 KB) K를 조각내
 fp32 scratch로 누산을 이어간다(BN=64 유지 — BN=16 폴백은 A gather 16배로 회귀했다:
 cold gateup 15.8 → 18.7). 비트일치(row-major·cold 레이아웃, skew·pair>128 포함). 속도

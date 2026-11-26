@@ -23,16 +23,7 @@ if TYPE_CHECKING:
 # 하므로 여기서 한 번만 정의한다 — 어긋나면 블록이 남의 pair를 계산한다.
 TILE_M = 128
 
-# PCIe(pinned/UVA·cold slab) launch의 **블록 수 상한**. PCIe 바운드 커널은 SM을
-# 다 채울 이유가 없고, 비워둔 SM에 hot 커널이 동시에 올라가야 hot∥warm 스트림
-# 분리가 실제로 겹친다. 2026-08-27 H100 실측 (35B h50/w50 gateup, M=2048): 128
-# 블록으로도 PCIe 51 GB/s 포화 유지 + hot 2.64 ms가 **완전히** 겹침(합 13.1 →
-# 10.5 ms); 256블록이면 겹침 1.8, 512는 0.9, 무제한은 0. 0 = 상한 없음.
-WARM_MAX_BLOCKS = 128
-
-# W-resident 커널(pair 수와 무관하게 expert당 W를 1회만 읽음)을 PCIe 경로에 쓸 것인가.
-# wres_k_max>0 이면 그 커널로 간다 — 값은 스토어의 expert당 최대 K 행(32 배수).
-WRES_PCIE = True
+# The PCIe launch block cap and the W-resident switch are per-GPU tuning (tuning.py).
 
 
 import contextlib as _ctx

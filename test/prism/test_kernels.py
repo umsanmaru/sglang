@@ -76,3 +76,16 @@ def test_kernel_keys_cover_exactly_the_built_exports():
     no_k1 = K.unsupported_reason(K.PrismKernelKey(op="gemv", fmt="mxfp4", mode="k1"))
     assert no_k1 is not None and "gemv_mxfp4_indexed_sparsek1" in no_k1
     assert not K.supports(K.PrismKernelKey(op="gemv", fmt="fp8", mode="k1w", fused=True))
+
+
+def test_launch_tuning_configs_decode():
+    """Per-GPU tuning files must parse, and a misspelled knob must be rejected rather than
+    silently ignored (the GPU would then run with the default)."""
+    import msgspec
+
+    from sglang.kernels.ops.moe.prism import tuning
+
+    for path in sorted(tuning._CONFIG_DIR.glob("*.json")):
+        msgspec.json.decode(path.read_bytes(), type=tuning.LaunchTuning)
+    with pytest.raises(msgspec.ValidationError):
+        msgspec.json.decode(b'{"warm_max_block": 64}', type=tuning.LaunchTuning)

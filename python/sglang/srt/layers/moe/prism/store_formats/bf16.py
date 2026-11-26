@@ -74,9 +74,9 @@ class Bf16Format(StoreFormat):
         return slab, torch.tensor([o // 2 for o in expert_off[:-1]], dtype=torch.int64, device=device)
 
     def wres_k_max(self, *shards) -> int:
-        from sglang.kernels.ops.moe.prism import grouped as prism_grouped
+        from sglang.kernels.ops.moe.prism import tuning
 
-        if not prism_grouped.WRES_PCIE:
+        if not tuning.current().wres_pcie:
             return 0
         k = max(int(getattr(sh, "k_max", 0) or 0) for sh in shards)
         return (k + 31) // 32 * 32

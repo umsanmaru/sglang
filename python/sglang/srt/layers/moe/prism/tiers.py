@@ -361,20 +361,19 @@ def _wres_k_max(*shards) -> int:
     k_max는 32의 배수여야 한다 (커널 K 스텝) — 로더가 그렇게 굽지 않은 스토어(밴드
     퇴화형에서 임의 k)는 32로 올린다. (bf16 cold/packed slab용 — GPU 티어 스토어는
     `shard.fmt.wres_k_max`가 같은 규칙을 포맷별로 준다.)"""
-    from sglang.kernels.ops.moe.prism import grouped as prism_grouped
+    from sglang.kernels.ops.moe.prism import tuning
 
-    if not prism_grouped.WRES_PCIE:
+    if not tuning.current().wres_pcie:
         return 0
     k = max(int(getattr(sh, "k_max", 0) or 0) for sh in shards)
     return (k + 31) // 32 * 32
 
 
 def _warm_max_blocks() -> int:
-    """PCIe launch의 블록 수 상한 — 호출 시점에 모듈 값을 읽는다 (벤치가 스윕할 수
-    있게). 0 = 상한 없음. 근거는 prism_grouped.WARM_MAX_BLOCKS 주석."""
-    from sglang.kernels.ops.moe.prism import grouped as prism_grouped
+    """PCIe launch block cap of the current GPU (tuning.LaunchTuning). 0 = no cap."""
+    from sglang.kernels.ops.moe.prism import tuning
 
-    return int(prism_grouped.WARM_MAX_BLOCKS)
+    return int(tuning.current().warm_max_blocks)
 
 
 def _run_grouped_gateup(fn, gate: TierShard, up: TierShard, x2d, grouping,
