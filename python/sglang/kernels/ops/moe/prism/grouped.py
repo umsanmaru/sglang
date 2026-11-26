@@ -69,24 +69,28 @@ def _scratch_impl(out3d, wres_k_max):
     return torch.empty(m * k, w_row, dtype=torch.float32, device=out3d.device)
 
 
+# Export name -> C++ entry. Indexed exports are entry structs (prism_grouped.cuh); the cold
+# and wait_flag exports are plain functions.
+_ENTRIES = [
+    ("grouped_gemm_indexed", "PrismGroupedBf16<false, true>::run"),
+    ("grouped_gemm_indexed_pinned", "PrismGroupedBf16<false, false>::run"),
+    ("grouped_gemm_indexed_gateup", "PrismGroupedBf16<true, true>::run"),
+    (
+        "grouped_gemm_indexed_pinned_gateup",
+        "PrismGroupedBf16<true, false>::run",
+    ),
+    ("grouped_gemm_cold", "grouped_gemm_cold"),
+    ("grouped_gemm_cold_gateup", "grouped_gemm_cold_gateup"),
+    ("prism_wait_flag", "prism_wait_flag"),
+]
+
+
 @cache_once
 def _jit_prism_grouped_module() -> Module:
     return load_jit(
         "prism_grouped",
         cuda_files=["moe/prism/prism_grouped.cuh"],
-        # Indexed exports are entry structs (prism_grouped.cuh); cold and wait_flag are functions.
-        cuda_wrappers=[
-            ("grouped_gemm_indexed", "PrismGroupedBf16<false, true>::run"),
-            ("grouped_gemm_indexed_pinned", "PrismGroupedBf16<false, false>::run"),
-            ("grouped_gemm_indexed_gateup", "PrismGroupedBf16<true, true>::run"),
-            (
-                "grouped_gemm_indexed_pinned_gateup",
-                "PrismGroupedBf16<true, false>::run",
-            ),
-            ("grouped_gemm_cold", "grouped_gemm_cold"),
-            ("grouped_gemm_cold_gateup", "grouped_gemm_cold_gateup"),
-            ("prism_wait_flag", "prism_wait_flag"),
-        ],
+        cuda_wrappers=_ENTRIES,
     )
 
 

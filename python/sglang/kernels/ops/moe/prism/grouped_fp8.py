@@ -52,12 +52,15 @@ def _target(name: str) -> str:
     return f"PrismGroupedFp8<{', '.join(str(b).lower() for b in flags)}>::run"
 
 
+_ENTRIES = [(n, _target(n)) for n in _WRAPPERS]
+
+
 @cache_once
 def _jit_prism_grouped_fp8_module() -> Module:
     return load_jit(
         "prism_grouped_fp8",
         cuda_files=["moe/prism/prism_grouped_fp8.cuh"],
-        cuda_wrappers=[(n, _target(n)) for n in _WRAPPERS],
+        cuda_wrappers=_ENTRIES,
     )
 
 
