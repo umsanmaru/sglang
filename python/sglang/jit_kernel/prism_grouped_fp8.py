@@ -44,7 +44,7 @@ _WRAPPERS = (
 def _jit_prism_grouped_fp8_module() -> Module:
     return load_jit(
         "prism_grouped_fp8",
-        cuda_files=["../../../jit_kernel/csrc/moe/prism_grouped_fp8.cuh"],
+        cuda_files=["moe/prism/prism_grouped_fp8.cuh"],
         cuda_wrappers=[(n, n) for n in _WRAPPERS],
     )
 

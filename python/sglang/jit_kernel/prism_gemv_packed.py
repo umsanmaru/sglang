@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 def _jit_prism_gemv_packed_module() -> Module:
     return load_jit(
         "prism_gemv_packed",
-        cuda_files=["../../../jit_kernel/csrc/moe/prism_gemv_packed.cuh"],
+        cuda_files=["moe/prism/prism_gemv_packed.cuh"],
         cuda_wrappers=[
             ("gemv_packed", "gemv_packed"),
             ("gemv_packed_gateup", "gemv_packed_gateup"),

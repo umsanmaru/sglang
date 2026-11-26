@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 def _jit_prism_gather_module() -> Module:
     return load_jit(
         "prism_gather",
-        cuda_files=["../../../jit_kernel/csrc/moe/prism_gather.cuh"],
+        cuda_files=["moe/prism/prism_gather.cuh"],
         cuda_wrappers=[
             ("gather_bands_from_pinned", "gather_bands_from_pinned"),
             ("gather_bands_from_device", "gather_bands_from_device"),

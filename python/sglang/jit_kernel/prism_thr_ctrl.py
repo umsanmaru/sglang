@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 def _jit_prism_thr_ctrl_module() -> Module:
     return load_jit(
         "prism_thr_ctrl",
-        cuda_files=["../../../jit_kernel/csrc/moe/prism_thr_ctrl.cuh"],
+        cuda_files=["moe/prism/prism_thr_ctrl.cuh"],
         cuda_wrappers=[("thr_ctrl_step", "thr_ctrl_step")],
     )
 

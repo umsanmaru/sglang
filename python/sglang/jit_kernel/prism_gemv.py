@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 def _jit_prism_gemv_module() -> Module:
     return load_jit(
         "prism_gemv",
-        cuda_files=["../../../jit_kernel/csrc/moe/prism_gemv.cuh"],
+        cuda_files=["moe/prism/prism_gemv.cuh"],
         cuda_wrappers=[
             ("gemv_worklist", "gemv_worklist"),
             ("gemv_worklist_pinned", "gemv_worklist_pinned"),

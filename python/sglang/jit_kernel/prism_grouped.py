@@ -73,7 +73,7 @@ def _scratch_impl(out3d, wres_k_max):
 def _jit_prism_grouped_module() -> Module:
     return load_jit(
         "prism_grouped",
-        cuda_files=["../../../jit_kernel/csrc/moe/prism_grouped.cuh"],
+        cuda_files=["moe/prism/prism_grouped.cuh"],
         cuda_wrappers=[
             ("grouped_gemm_indexed", "grouped_gemm_indexed"),
             ("grouped_gemm_indexed_pinned", "grouped_gemm_indexed_pinned"),

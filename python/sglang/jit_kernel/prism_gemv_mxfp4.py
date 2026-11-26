@@ -36,7 +36,7 @@ _WRAPPERS = (
 def _jit_prism_gemv_mxfp4_module() -> Module:
     return load_jit(
         "prism_gemv_mxfp4",
-        cuda_files=["../../../jit_kernel/csrc/moe/prism_gemv_mxfp4.cuh"],
+        cuda_files=["moe/prism/prism_gemv_mxfp4.cuh"],
         cuda_wrappers=[(n, n) for n in _WRAPPERS],
     )
 
