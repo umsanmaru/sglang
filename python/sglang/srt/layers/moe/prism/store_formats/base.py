@@ -6,6 +6,7 @@ from typing import Optional, Sequence
 
 import torch
 
+from sglang.kernels.ops.moe.prism.key import resolve as resolve_kernel
 from sglang.srt.layers.moe.prism.index import TierIndex
 from sglang.srt.layers.moe.prism.plan import ModelDims, PlanError, Proj
 
@@ -76,10 +77,10 @@ class StoreFormat:
         raise NotImplementedError
 
     def grouped_cold(self):
-        raise NotImplementedError
+        return self._required("grouped_cold", pinned=True)
 
     def grouped_cold_gateup(self):
-        raise NotImplementedError
+        return self._required("grouped_cold", pinned=True, fused=True)
 
     # ── 로딩: 파라미터 ───────────────────────────────────────────────────
     def create_params(self, layer, num_experts: int, hidden: int, inter: int,
@@ -119,18 +120,33 @@ class StoreFormat:
         """커널 래퍼의 스토어 인자 (bf16: (w_flat,), mxfp4: (w_flat, s_flat))."""
         return (shard.w_flat,) if not self.has_scales else (shard.w_flat, shard.s_flat)
 
+    def _kernel(
+        self, op: str, *, pinned: bool, sparse: bool = False, fused: bool = False
+    ):
+        """Wrapper of this store's (op, sparse, fused) entry; None if that entry is not built."""
+        mode = "pair" if sparse else "dense"
+        return resolve_kernel(
+            op=op, fmt=self.name, mode=mode, fused=fused, on_device=not pinned
+        )
+
+    def _required(self, op: str, **kw):
+        fn = self._kernel(op, **kw)
+        if fn is None:
+            raise NotImplementedError(f"{self.name} store has no {op} kernel for {kw}")
+        return fn
+
     def gemv(self, *, pinned: bool, sparse: bool):
-        raise NotImplementedError
+        return self._required("gemv", pinned=pinned, sparse=sparse)
 
     def gemv_gateup(self, *, pinned: bool, sparse: bool):
         """gate+up 융합 진입점. 그 조합의 진입점이 없으면 None (2회 launch)."""
-        return None
+        return self._kernel("gemv", pinned=pinned, sparse=sparse, fused=True)
 
     def grouped(self, *, pinned: bool):
-        raise NotImplementedError
+        return self._required("grouped", pinned=pinned)
 
     def grouped_gateup(self, *, pinned: bool):
-        raise NotImplementedError
+        return self._required("grouped", pinned=pinned, fused=True)
 
     def wres_k_max(self, *shards) -> int:
         """PCIe grouped launch을 W-resident 커널로 보낼 때의 k_max (0 = 스트리밍 커널)."""

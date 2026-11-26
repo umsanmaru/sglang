@@ -31,6 +31,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.moe.prism.key import resolve as resolve_kernel
 from sglang.srt.layers.prism.geometry import COL_GROUP, PAIR_GROUP, PlanError
 from sglang.srt.layers.prism.kernels import cold_slab_layout, gpu_store_format_tag
 from sglang.srt.layers.prism.store import IDX_DTYPE
@@ -107,8 +108,23 @@ class LinearStoreFormat:
         """커널 래퍼의 스토어 인자 (bf16: (w_flat,), fp8: (w_flat, s_flat))."""
         return (shard.w_flat,) if not self.has_scales else (shard.w_flat, shard.s_flat)
 
+    def _kernel(
+        self, op: str, *, pinned: bool, sparse: bool = False, fused: bool = False
+    ):
+        """Wrapper of this store's (op, sparse, fused) entry; None if that entry is not built."""
+        mode = "pair" if sparse else "dense"
+        return resolve_kernel(
+            op=op, fmt=self.name, mode=mode, fused=fused, on_device=not pinned
+        )
+
+    def _required(self, op: str, **kw):
+        fn = self._kernel(op, **kw)
+        if fn is None:
+            raise NotImplementedError(f"{self.name} store has no {op} kernel for {kw}")
+        return fn
+
     def gemv(self, *, pinned: bool, sparse: bool):
-        raise NotImplementedError
+        return self._required("gemv", pinned=pinned, sparse=sparse)
 
     def grouped(self, *, pinned: bool):
         """prefill 진입점 — W를 **한 번만** 읽는다.
@@ -117,7 +133,7 @@ class LinearStoreFormat:
         (MoE는 M·k/E). warm은 그 재읽기가 전부 PCIe라 M=2048에서 층당 수 초가 된다 —
         실측 2026-09-01: Qwen3.8 전체 warm 43.8 GB × 2048 = 89.7 TB, 30분/forward.
         """
-        raise NotImplementedError
+        return self._required("grouped", pinned=pinned)
 
     def warmup(self) -> None:
         """JIT 컴파일을 startup으로 앞당긴다 (캡처 워밍업에 얽히지 않게)."""
@@ -187,21 +203,6 @@ class Bf16LinearFormat(LinearStoreFormat):
         real = int(rows.numel())
         k_pad = ((real + tile - 1) // tile) * tile
         return _pad_ckpt(weight, rows, k_pad, 0), None, _pad_index(rows, k_pad), real
-
-    def gemv(self, *, pinned, sparse):
-        from sglang.kernels.ops.moe.prism import gemv as k
-
-        return {
-            (False, False): k.gemv_worklist_indexed,
-            (True, False): k.gemv_worklist_indexed_pinned,
-            (False, True): k.gemv_worklist_indexed_sparse,
-            (True, True): k.gemv_worklist_indexed_pinned_sparse,
-        }[(pinned, sparse)]
-
-    def grouped(self, *, pinned):
-        from sglang.kernels.ops.moe.prism import grouped as k
-
-        return k.grouped_gemm_indexed_pinned if pinned else k.grouped_gemm_indexed
 
     def warmup(self) -> None:
         from sglang.kernels.ops.moe.prism.gemv import warmup_jit
@@ -287,21 +288,6 @@ class Fp8LinearFormat(LinearStoreFormat):
         # 패딩 코드가 0x00(= +0.0)이라 배율은 아무 유한값이어도 되지만 1.0을 넣는다.
         s = _pad_ckpt(scale, self._scale_rows(rows), k_pad // B, 1.0)
         return codes, s, _pad_index(rows, k_pad), real
-
-    def gemv(self, *, pinned, sparse):
-        from sglang.kernels.ops.moe.prism import gemv_fp8 as k
-
-        return {
-            (False, False): k.gemv_fp8_indexed,
-            (True, False): k.gemv_fp8_indexed_pinned,
-            (False, True): k.gemv_fp8_indexed_sparse,
-            (True, True): k.gemv_fp8_indexed_pinned_sparse,
-        }[(pinned, sparse)]
-
-    def grouped(self, *, pinned):
-        from sglang.kernels.ops.moe.prism import grouped_fp8 as k
-
-        return k.grouped_fp8_indexed_pinned if pinned else k.grouped_fp8_indexed
 
     def warmup(self) -> None:
         from sglang.kernels.ops.moe.prism.gemv_fp8 import warmup_jit
@@ -414,31 +400,6 @@ class Fp8PtLinearFormat(Fp8LinearFormat):
         codes = _pad_ckpt(self._codes(weight), rows, k_pad, 0)
         # 패딩 코드는 0x00(= +0.0)이라 배율과 무관하게 기여가 없다.
         return codes, self._one(scale), _pad_index(rows, k_pad), real
-
-    def gemv(self, *, pinned, sparse):
-        from sglang.kernels.ops.moe.prism import gemv_fp8 as k
-
-        return {
-            (False, False): k.gemv_fp8pt_indexed,
-            (True, False): k.gemv_fp8pt_indexed_pinned,
-            (False, True): k.gemv_fp8pt_indexed_sparse,
-            (True, True): k.gemv_fp8pt_indexed_pinned_sparse,
-        }[(pinned, sparse)]
-
-    def grouped(self, *, pinned):
-        from sglang.kernels.ops.moe.prism import grouped_fp8 as k
-
-        # prefill도 같은 codes 레이아웃이고 배율만 스칼라다. per-tensor 진입점이
-        # 없으면 여기서 죽는 것이 맞다 — blockwise 진입점에 스칼라를 넘기면 배율
-        # 표를 스칼라 하나로 읽어 **조용히 다른 수치**가 된다.
-        fn = "grouped_fp8pt_indexed_pinned" if pinned else "grouped_fp8pt_indexed"
-        if not hasattr(k, fn):
-            raise PlanError(
-                f"prism dense fp8pt: {fn} 진입점이 없다 — per-tensor prefill 커널이 "
-                f"붙기 전에는 이 포맷으로 prefill을 돌릴 수 없다"
-            )
-        return getattr(k, fn)
-
 
 BF16 = Bf16LinearFormat()
 FP8 = Fp8LinearFormat()

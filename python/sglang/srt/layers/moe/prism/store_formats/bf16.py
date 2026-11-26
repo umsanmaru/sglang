@@ -73,50 +73,6 @@ class Bf16Format(StoreFormat):
         slab = _tensor_view(ptr, nbytes, torch.bfloat16)
         return slab, torch.tensor([o // 2 for o in expert_off[:-1]], dtype=torch.int64, device=device)
 
-    def grouped_cold(self):
-        from sglang.kernels.ops.moe.prism import grouped as k
-
-        return k.grouped_gemm_cold
-
-    def grouped_cold_gateup(self):
-        from sglang.kernels.ops.moe.prism import grouped as k
-
-        return k.grouped_gemm_cold_gateup
-
-    def gemv(self, *, pinned, sparse):
-        from sglang.kernels.ops.moe.prism import gemv as k
-
-        table = {
-            (False, False): k.gemv_worklist_indexed,
-            (True, False): k.gemv_worklist_indexed_pinned,
-            (False, True): k.gemv_worklist_indexed_sparse,
-            (True, True): k.gemv_worklist_indexed_pinned_sparse,
-        }
-        return table[(pinned, sparse)]
-
-    def gemv_gateup(self, *, pinned, sparse):
-        # 네 조합 전부 (mxfp4/fp8과 같은 표). warm dense와 hot sparse는 2026-08-29에
-        # 채웠다 — 그 전에는 같은 스텝이 조용히 2회 launch로 떨어졌다.
-        from sglang.kernels.ops.moe.prism import gemv as k
-
-        table = {
-            (False, False): k.gemv_worklist_indexed_gateup,
-            (True, False): k.gemv_worklist_indexed_pinned_gateup,
-            (False, True): k.gemv_worklist_indexed_sparse_gateup,
-            (True, True): k.gemv_worklist_indexed_pinned_sparse_gateup,
-        }
-        return table[(pinned, sparse)]
-
-    def grouped(self, *, pinned):
-        from sglang.kernels.ops.moe.prism import grouped as k
-
-        return k.grouped_gemm_indexed_pinned if pinned else k.grouped_gemm_indexed
-
-    def grouped_gateup(self, *, pinned):
-        from sglang.kernels.ops.moe.prism import grouped as k
-
-        return k.grouped_gemm_indexed_pinned_gateup if pinned else k.grouped_gemm_indexed_gateup
-
     def wres_k_max(self, *shards) -> int:
         from sglang.kernels.ops.moe.prism import grouped as prism_grouped
 

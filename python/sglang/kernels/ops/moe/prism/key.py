@@ -8,6 +8,7 @@ supported exactly when its exports are built.
 
 from __future__ import annotations
 
+import functools
 import importlib
 from typing import Callable, Literal, Optional
 
@@ -100,3 +101,12 @@ def wrapper(key: PrismKernelKey, *, on_device: bool) -> Callable:
     return getattr(
         _module(_FAMILY[(key.op, key.fmt)][0]), named.export_name(on_device=on_device)
     )
+
+
+@functools.cache
+def resolve(
+    *, op: str, fmt: str, mode: str, fused: bool, on_device: bool
+) -> Optional[Callable]:
+    """Cached wrapper lookup for the per-step tier paths; None if the key is not built."""
+    key = PrismKernelKey(op=op, fmt=fmt, mode=mode, fused=fused)
+    return wrapper(key, on_device=on_device) if supports(key) else None

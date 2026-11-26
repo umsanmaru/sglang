@@ -196,48 +196,6 @@ class Mxfp4Format(StoreFormat):
         slab = _tensor_view(ptr, nbytes, torch.uint8)
         return slab, torch.tensor(list(expert_off[:-1]), dtype=torch.int64, device=device)
 
-    def grouped_cold(self):
-        from sglang.kernels.ops.moe.prism import grouped_mxfp4 as k
-
-        return k.grouped_mxfp4_cold
-
-    def grouped_cold_gateup(self):
-        from sglang.kernels.ops.moe.prism import grouped_mxfp4 as k
-
-        return k.grouped_mxfp4_cold_gateup
-
-    def gemv(self, *, pinned, sparse):
-        from sglang.kernels.ops.moe.prism import gemv_mxfp4 as k
-
-        table = {
-            (False, False): k.gemv_mxfp4_indexed,
-            (True, False): k.gemv_mxfp4_indexed_pinned,
-            (False, True): k.gemv_mxfp4_indexed_sparse,
-            (True, True): k.gemv_mxfp4_indexed_pinned_sparse,
-        }
-        return table[(pinned, sparse)]
-
-    def gemv_gateup(self, *, pinned, sparse):
-        from sglang.kernels.ops.moe.prism import gemv_mxfp4 as k
-
-        table = {
-            (False, False): k.gemv_mxfp4_indexed_gateup,
-            (True, False): k.gemv_mxfp4_indexed_pinned_gateup,
-            (False, True): k.gemv_mxfp4_indexed_sparse_gateup,
-            (True, True): k.gemv_mxfp4_indexed_pinned_sparse_gateup,
-        }
-        return table[(pinned, sparse)]
-
-    def grouped(self, *, pinned):
-        from sglang.kernels.ops.moe.prism import grouped_mxfp4 as k
-
-        return k.grouped_mxfp4_indexed_pinned if pinned else k.grouped_mxfp4_indexed
-
-    def grouped_gateup(self, *, pinned):
-        from sglang.kernels.ops.moe.prism import grouped_mxfp4 as k
-
-        return k.grouped_mxfp4_indexed_pinned_gateup if pinned else k.grouped_mxfp4_indexed_gateup
-
     def warmup(self) -> None:
         from sglang.kernels.ops.moe.prism.gemv_mxfp4 import warmup_jit
         from sglang.kernels.ops.moe.prism.grouped_mxfp4 import warmup_jit as warmup_grouped
