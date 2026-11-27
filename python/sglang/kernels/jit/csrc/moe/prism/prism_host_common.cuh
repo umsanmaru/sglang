@@ -9,6 +9,7 @@
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace sglang {
 
@@ -21,6 +22,34 @@ inline uint32_t sm_count(int device_id) {
   if (device_id < 0 || device_id >= kMaxDev) return host::runtime::get_sm_count(device_id);
   if (cache[device_id] == 0) cache[device_id] = host::runtime::get_sm_count(device_id);
   return cache[device_id];
+}
+
+// Runtime value -> compile-time constant for a launch body, in the style of FlashInfer's
+// DISPATCH_* macros. Only the listed values are instantiated, so each launch site states the
+// exact kernel variants it compiles.
+template <int... Vs, class F>
+inline void dispatch_int(int v, const char* what, F&& f) {
+  const bool hit = ((v == Vs && (f(std::integral_constant<int, Vs>{}), true)) || ...);
+  host::RuntimeCheck(hit, what, ": unsupported value ", v);
+}
+
+template <class F>
+inline void dispatch_bool(bool b, F&& f) {
+  if (b) {
+    f(std::true_type{});
+  } else {
+    f(std::false_type{});
+  }
+}
+
+// topk index type; the entry points have already checked it is int32 or int64.
+template <class F>
+inline void dispatch_idx(DLDataType dtype, F&& f) {
+  if (host::is_type<int32_t>(dtype)) {
+    f(std::type_identity<int32_t>{});
+  } else {
+    f(std::type_identity<int64_t>{});
+  }
 }
 
 // Whether to widen a GEMV's row slots (bf16 NY x4, fp8/mxfp4 kNY 32 -> 64): the launch has too

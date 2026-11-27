@@ -219,24 +219,6 @@ __global__ void __launch_bounds__(kNX* kNY) prism_gemv_mxfp4(
   }
 }
 
-#define PRISM_MX4_LAUNCH(V, NX, NY)                                                        \
-  do {                                                                                     \
-    const dim3 block((NX), (NY));                                                          \
-    const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>((NX) * (V)))), \
-                    static_cast<unsigned int>(pairs), static_cast<unsigned int>(slots));    \
-    if (is_type<int32_t>(topk.dtype())) {                                                   \
-      LaunchKernel(grid, block, device)(                                                    \
-          prism_gemv_mxfp4<int32_t, SPARSE, (V), (NX), (NY)>, x,                            \
-          static_cast<const int32_t*>(topk.data_ptr()), out, x_kx, n_cols, out_row, top_k,  \
-          x_row_is_pair, s0, s1, sp0, sp1);                                                 \
-    } else {                                                                                \
-      LaunchKernel(grid, block, device)(                                                    \
-          prism_gemv_mxfp4<int64_t, SPARSE, (V), (NX), (NY)>, x,                            \
-          static_cast<const int64_t*>(topk.data_ptr()), out, x_kx, n_cols, out_row, top_k,  \
-          x_row_is_pair, s0, s1, sp0, sp1);                                                 \
-    }                                                                                       \
-  } while (0)
-
 // 타일 선택 (위 주석의 실측 근거). `avg_rows`는 expert당 평균 k 행 수 = Σk/E — row_off를
 // 읽으려면 device sync가 필요하므로 텐서 모양에서 얻는 평균으로 대신한다 (heuristic이라
 // 정확할 필요가 없다; 어느 타일을 골라도 결과는 비트 동일하다).
@@ -259,13 +241,26 @@ inline void launch_gemv_mxfp4(const DLDevice& device, tvm::ffi::TensorView topk,
   const int64_t blocks = div_ceil(n_cols, static_cast<int64_t>(32)) * pairs;
   // 블록이 SM의 2배에 못 미치면서 32-k 블록이 64개 이상 있을 때만 블록당 워프를 2배로.
   const bool wide_ny = prism_host::wide_ny(blocks, avg_rows, static_cast<uint32_t>(sm));
-  if (!w_on_device) {  // warm(pinned): 행 세그먼트 128 B 유지 — kV만 갈리므로 비트는 같다
-    if (wide_ny) PRISM_MX4_LAUNCH(16, 8, 64);
-    else PRISM_MX4_LAUNCH(16, 8, 32);
-  } else {
-    if (wide_ny) PRISM_MX4_LAUNCH(4, 8, 64);
-    else PRISM_MX4_LAUNCH(4, 8, 32);
-  }
+  // Warm (pinned) keeps 128-byte row segments per request with kV = 16; only kV differs, so
+  // the result is bit-identical to the device tile.
+  const int kv = w_on_device ? 4 : 16;
+  constexpr int kNX = 8;
+  prism_host::dispatch_int<16, 4>(kv, "gemv_mxfp4 kV", [&](auto kv_c) {
+    constexpr int kV = decltype(kv_c)::value;
+    prism_host::dispatch_bool(wide_ny, [&](auto wide_c) {
+      constexpr int kNY = decltype(wide_c)::value ? 64 : 32;
+      prism_host::dispatch_idx(topk.dtype(), [&](auto idx_c) {
+        using IdxT = typename decltype(idx_c)::type;
+        const dim3 block(kNX, kNY);
+        const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(kNX * kV))),
+                        static_cast<unsigned int>(pairs), static_cast<unsigned int>(slots));
+        LaunchKernel(grid, block, device)(
+            prism_gemv_mxfp4<IdxT, SPARSE, kV, kNX, kNY>, x,
+            static_cast<const IdxT*>(topk.data_ptr()), out, x_kx, n_cols, out_row, top_k,
+            x_row_is_pair, s0, s1, sp0, sp1);
+      });
+    });
+  });
 }
 
 // 공통 검증 + launch. 슬롯 1(gate+up 융합)은 nullptr이면 grid.z=1.

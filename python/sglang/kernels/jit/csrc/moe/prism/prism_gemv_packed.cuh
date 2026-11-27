@@ -280,17 +280,16 @@ inline void gemv_packed_impl(
   const dim3 grid(static_cast<unsigned int>(div_ceil(a.n_cols, static_cast<int64_t>(kPackedCols))),
                   static_cast<unsigned int>(m * top_k), s1 ? 2u : 1u);
   const dim3 block(kPackedThreads);
-#define PRISM_PACKED_LAUNCH(IdxT, SP)                                                              \
-  LaunchKernel(grid, block, device)(                                                            \
-      prism_gemv_packed<IdxT, SP>, static_cast<const __nv_bfloat16*>(x.data_ptr()),            \
-      static_cast<const IdxT*>(topk.data_ptr()), static_cast<__nv_bfloat16*>(out.data_ptr()),  \
-      x_kx, out_row, top_k, static_cast<int>(x_row_is_pair), a, b, sa, sb)
-  if (is_type<int32_t>(topk.dtype())) {
-    if (sp0) PRISM_PACKED_LAUNCH(int32_t, true); else PRISM_PACKED_LAUNCH(int32_t, false);
-  } else {
-    if (sp0) PRISM_PACKED_LAUNCH(int64_t, true); else PRISM_PACKED_LAUNCH(int64_t, false);
-  }
-#undef PRISM_PACKED_LAUNCH
+  prism_host::dispatch_idx(topk.dtype(), [&](auto idx_c) {
+    using IdxT = typename decltype(idx_c)::type;
+    prism_host::dispatch_bool(sp0 != nullptr, [&](auto sparse_c) {
+      LaunchKernel(grid, block, device)(
+          prism_gemv_packed<IdxT, decltype(sparse_c)::value>,
+          static_cast<const __nv_bfloat16*>(x.data_ptr()),
+          static_cast<const IdxT*>(topk.data_ptr()), static_cast<__nv_bfloat16*>(out.data_ptr()),
+          x_kx, out_row, top_k, static_cast<int>(x_row_is_pair), a, b, sa, sb);
+    });
+  });
 }
 
 // dense, 슬롯 1개

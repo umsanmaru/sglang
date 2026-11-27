@@ -334,23 +334,16 @@ inline void launch_gemv_worklist(
     const SparseArgs* sp1 = nullptr) {
   using namespace host;
   const dim3 block(NCOL_ / V, 4 * V * NYMUL);  // 열 타일은 NCOL_ (커널 주석 참조)
-  if (is_type<int32_t>(topk.dtype())) {
+  prism_host::dispatch_idx(topk.dtype(), [&](auto idx_c) {
+    using IdxT = typename decltype(idx_c)::type;
     LaunchKernel(grid, block, device)(
-        prism_gemv_worklist<int32_t, INDEXED, V, SPARSE, NCOL_, NYMUL, PER_K>, x,
-        static_cast<const int32_t*>(topk.data_ptr()), w, out, row_off, kidx,
+        prism_gemv_worklist<IdxT, INDEXED, V, SPARSE, NCOL_, NYMUL, PER_K>, x,
+        static_cast<const IdxT*>(topk.data_ptr()), w, out, row_off, kidx,
         x_kx, k_offset, k_rows, n_cols, out_row, out_col_offset, top_k,
         x_row_is_pair, w1 ? w1 : w, row_off1 ? row_off1 : row_off,
         kidx1 ? kidx1 : kidx, w1 ? out_col_offset1 : out_col_offset,
         sp, sp1 ? *sp1 : sp);
-  } else {
-    LaunchKernel(grid, block, device)(
-        prism_gemv_worklist<int64_t, INDEXED, V, SPARSE, NCOL_, NYMUL, PER_K>, x,
-        static_cast<const int64_t*>(topk.data_ptr()), w, out, row_off, kidx,
-        x_kx, k_offset, k_rows, n_cols, out_row, out_col_offset, top_k,
-        x_row_is_pair, w1 ? w1 : w, row_off1 ? row_off1 : row_off,
-        kidx1 ? kidx1 : kidx, w1 ? out_col_offset1 : out_col_offset,
-        sp, sp1 ? *sp1 : sp);
-  }
+  });
 }
 
 // W 로드 폭 선택. uint2/uint4 정렬 조건은 (a) n_cols가 V의 배수, (b) 스토어
@@ -571,38 +564,31 @@ inline void gemv_worklist_indexed_impl(
   const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(kNCol))),
                   static_cast<unsigned int>(pairs), static_cast<unsigned int>(slots));
 
-#define PRISM_LAUNCH_INDEXED_NY(V, SP, NYM, PK)                              \
-  launch_gemv_worklist<true, V, SP, kNCol, NYM, PK>(                             \
-      grid, device, topk,                                                    \
-      static_cast<const __nv_bfloat16*>(x.data_ptr()),                       \
-      static_cast<const __nv_bfloat16*>(w.data_ptr()),                       \
-      static_cast<__nv_bfloat16*>(out.data_ptr()),                           \
-      static_cast<const int32_t*>(row_off.data_ptr()),                       \
-      static_cast<const uint16_t*>(kidx.data_ptr()),                         \
-      x_kx, 0, 0, n_cols, out_row, out_col_offset, top_k,                    \
-      static_cast<int>(x_row_is_pair), sp,                                   \
-      w1p, row_off1p, kidx1p, out_col_offset_up,                          \
-      (sin_up != nullptr) ? &sp_up : nullptr)
-#define PRISM_LAUNCH_INDEXED(V, SP, PK)                                      \
-  do {                                                                       \
-    if (wide_ny) PRISM_LAUNCH_INDEXED_NY(V, SP, 4, PK);                      \
-    else PRISM_LAUNCH_INDEXED_NY(V, SP, 1, PK);                              \
-  } while (0)
-#define PRISM_LAUNCH_INDEXED_V(V)                                            \
-  do {                                                                       \
-    if (sin != nullptr && sin->per_k) PRISM_LAUNCH_INDEXED(V, true, true);   \
-    else if (sin != nullptr) PRISM_LAUNCH_INDEXED(V, true, false);           \
-    else PRISM_LAUNCH_INDEXED(V, false, false);                              \
-  } while (0)
-
-  switch (choose_vec(vec, n_cols, w.data_ptr())) {
-    case 8: PRISM_LAUNCH_INDEXED_V(8); break;
-    case 4: PRISM_LAUNCH_INDEXED_V(4); break;
-    default: PRISM_LAUNCH_INDEXED_V(1); break;
-  }
-#undef PRISM_LAUNCH_INDEXED_V
-#undef PRISM_LAUNCH_INDEXED
-#undef PRISM_LAUNCH_INDEXED_NY
+  prism_host::dispatch_int<8, 4, 1>(choose_vec(vec, n_cols, w.data_ptr()), "gemv_worklist_indexed vec",
+                                    [&](auto v_c) {
+    constexpr int V = decltype(v_c)::value;
+    prism_host::dispatch_bool(wide_ny, [&](auto wide_c) {
+      constexpr int NYMUL = decltype(wide_c)::value ? 4 : 1;
+      auto launch = [&](auto sparse_c, auto per_k_c) {
+        launch_gemv_worklist<true, V, decltype(sparse_c)::value, kNCol, NYMUL,
+                             decltype(per_k_c)::value>(
+            grid, device, topk, static_cast<const __nv_bfloat16*>(x.data_ptr()),
+            static_cast<const __nv_bfloat16*>(w.data_ptr()),
+            static_cast<__nv_bfloat16*>(out.data_ptr()),
+            static_cast<const int32_t*>(row_off.data_ptr()),
+            static_cast<const uint16_t*>(kidx.data_ptr()), x_kx, 0, 0, n_cols, out_row,
+            out_col_offset, top_k, static_cast<int>(x_row_is_pair), sp, w1p, row_off1p, kidx1p,
+            out_col_offset_up, (sin_up != nullptr) ? &sp_up : nullptr);
+      };
+      if (sin != nullptr && sin->per_k) {
+        launch(std::true_type{}, std::true_type{});
+      } else if (sin != nullptr) {
+        launch(std::true_type{}, std::false_type{});
+      } else {
+        launch(std::false_type{}, std::false_type{});
+      }
+    });
+  });
 }
 
 // ===== Export entry points =====
