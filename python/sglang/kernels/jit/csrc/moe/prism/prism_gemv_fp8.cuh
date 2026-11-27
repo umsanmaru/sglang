@@ -298,7 +298,7 @@ inline void launch_gemv_fp8(const DLDevice& device, tvm::ffi::TensorView topk,
   const int64_t kv_dev = (bytes_per_sm >= (128 << 10)) ? 8 : 4;
   // 블록 수 추정도 같은 이유로 device 타일 기준 · 슬롯 무관이다 (pinned도 이 kNY를 쓴다).
   const int64_t blocks = div_ceil(n_cols, 8 * kv_dev) * pairs;
-  const bool wide_ny = blocks < 2 * sm && avg_rows >= 2048;
+  const bool wide_ny = prism_host::wide_ny(blocks, avg_rows, static_cast<uint32_t>(sm));
   if (!w_on_device) {  // warm(pinned): 행 세그먼트 128 B 유지 — kV만 갈리므로 비트는 같다
     if (wide_ny) PRISM_F8_LAUNCH(16, 8, 64);
     else PRISM_F8_LAUNCH(16, 8, 32);

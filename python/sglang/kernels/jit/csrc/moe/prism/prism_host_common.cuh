@@ -23,6 +23,14 @@ inline uint32_t sm_count(int device_id) {
   return cache[device_id];
 }
 
+// Whether to widen a GEMV's row slots (bf16 NY x4, fp8/mxfp4 kNY 32 -> 64): the launch has too
+// few blocks to fill the GPU and the experts have enough K rows to split further. NY decides
+// which partial sums a thread adds, so it is part of the numeric contract: callers count the
+// blocks of one slot with the device tile, so hot/warm and fused/single pick the same NY.
+inline bool wide_ny(int64_t blocks_per_slot, int64_t avg_rows, uint32_t sm) {
+  return blocks_per_slot < 2 * static_cast<int64_t>(sm) && avg_rows >= 2048;
+}
+
 inline bool aligned16(const void* p) {
   return reinterpret_cast<std::uintptr_t>(p) % 16 == 0;
 }

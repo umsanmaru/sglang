@@ -258,7 +258,7 @@ inline void launch_gemv_mxfp4(const DLDevice& device, tvm::ffi::TensorView topk,
   const int64_t sm = static_cast<int64_t>(prism_host::sm_count(device.device_id));
   const int64_t blocks = div_ceil(n_cols, static_cast<int64_t>(32)) * pairs;
   // 블록이 SM의 2배에 못 미치면서 32-k 블록이 64개 이상 있을 때만 블록당 워프를 2배로.
-  const bool wide_ny = blocks < 2 * sm && avg_rows >= 2048;
+  const bool wide_ny = prism_host::wide_ny(blocks, avg_rows, static_cast<uint32_t>(sm));
   if (!w_on_device) {  // warm(pinned): 행 세그먼트 128 B 유지 — kV만 갈리므로 비트는 같다
     if (wide_ny) PRISM_MX4_LAUNCH(16, 8, 64);
     else PRISM_MX4_LAUNCH(16, 8, 32);

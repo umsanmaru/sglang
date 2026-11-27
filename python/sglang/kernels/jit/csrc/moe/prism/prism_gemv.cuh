@@ -567,7 +567,7 @@ inline void gemv_worklist_indexed_impl(
   const uint32_t sm = prism_host::sm_count(device.device_id);
   const int64_t blocks_per_slot = div_ceil(n_cols, static_cast<int64_t>(kNCol)) * pairs;
   const int64_t avg_rows = R.unwrap() / (E1.unwrap() - 1);
-  const bool wide_ny = blocks_per_slot < 2 * static_cast<int64_t>(sm) && avg_rows >= 2048;
+  const bool wide_ny = prism_host::wide_ny(blocks_per_slot, avg_rows, sm);
   const dim3 grid(static_cast<unsigned int>(div_ceil(n_cols, static_cast<int64_t>(kNCol))),
                   static_cast<unsigned int>(pairs), static_cast<unsigned int>(slots));
 
