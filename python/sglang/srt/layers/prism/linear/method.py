@@ -118,6 +118,23 @@ class _LinearRuntime:
                 plan.sparsity.calib.path, plan.sparsity.score,
                 self.calib.uses_weight_stats)
 
+    def _warn_unbuilt_kernels(self, gpu_warm: str) -> None:
+        """Plan pre-check, warn only: kernel entries this plan can reach that are not built.
+        Warm rows run dense where the masking entry is missing (`gpu_warm_supports_score`)."""
+        from sglang.srt.layers.prism.kernels import unsupported_plan_kernels
+
+        sparsity = self.plan.sparsity
+        required, _ = unsupported_plan_kernels(
+            gpu_warm,
+            moe=False,
+            has_warm=True,
+            sparse_score=None if sparsity is None else sparsity.score,
+            cold_on_gpu=False,
+        )
+        for msg in required:
+            logger.warning(
+                "[prism-linear] %s can reach an unbuilt kernel entry; %s", gpu_warm, msg)
+
     def executor(self, device: torch.device):
         if self._executor is None:
             from sglang.srt.layers.prism.linear.executor import LinearExecutor
@@ -132,6 +149,7 @@ class _LinearRuntime:
             warmup_rejoin(device)
             for tag in {pp.kernels.gpu_warm for pp in self.plan.projs.values()}:
                 FORMATS[gpu_store_format_tag(tag)].warmup()
+                self._warn_unbuilt_kernels(tag)
             cold, resources = self._cold_backend()
             self._executor = LinearExecutor(max_tokens=self.max_tokens, device=device,
                                             cold=cold, resources=resources)

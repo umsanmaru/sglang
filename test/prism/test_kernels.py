@@ -77,6 +77,21 @@ def test_kernel_keys_cover_exactly_the_built_exports():
     assert not K.supports(K.PrismKernelKey(op="gemv", fmt="fp8", mode="k1w", fused=True))
 
 
+def test_plan_precheck_flags_unbuilt_entries():
+    """The load-time pre-check must flag a plan whose reachable entries are not built, and treat
+    a missing fused gate+up entry as a fallback (two launches) rather than a missing kernel."""
+    from sglang.srt.layers.prism.kernels import unsupported_plan_kernels
+
+    kw = dict(moe=True, has_warm=True, cold_on_gpu=True)
+    assert unsupported_plan_kernels("gemv_worklist", sparse_score="k2wl2", **kw) == ([], [])
+    required, _ = unsupported_plan_kernels("gemv_worklist_mxfp4", sparse_score="k1", **kw)
+    assert len(required) == 1 and "gemv_mxfp4_indexed_sparsek1" in required[0]
+    required, optional = unsupported_plan_kernels("gemv_worklist_fp8", sparse_score="k1w1", **kw)
+    assert required == [] and len(optional) == 1 and "sparsek1w_gateup" in optional[0]
+    required, _ = unsupported_plan_kernels("torch_bmm", sparse_score="k1", **kw)
+    assert len(required) == 1 and "pair score" in required[0]
+
+
 def test_launch_tuning_configs_decode():
     """Per-GPU tuning files must parse, and a misspelled knob must be rejected rather than
     silently ignored (the GPU would then run with the default)."""
