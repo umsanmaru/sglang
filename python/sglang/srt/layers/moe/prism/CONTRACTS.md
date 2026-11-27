@@ -48,7 +48,7 @@ HOT과 WARM의 **계산 계약은 완전히 동일하다**: 같은 dense 스토�
 > cold의 거처(pageable host, C++ 소유)는 그대로이고 **읽는 주체만** CPU에서 GPU로
 > 바뀐다 — weight는 여전히 한 벌이다(계약 ③). 선택은 executor의 `cold_gpu_min_m`
 > 하나이며, 한 호출에서 cold partial은 CPU 또는 GPU 정확히 한쪽만 낸다. 다른 것은 포인터가 가리키는 메모리의 종류 하나뿐이고,
-그것이 `gemv_worklist` ↔ `gemv_worklist_pinned`(`w_on_device` 플래그) 차이의
+그것이 진입점의 `on_device` 인자(C++ `w_on_device`) 하나로 표현되는 차이의
 전부다. 초판의 "step마다 선택된 expert의 밴드만 GPU로 전송되어"는 폐기한다 —
 전송하는 경로(arena staging)는 bmm이 연속 배치 축을 요구해서 존재했고, 가변
 K가 bmm 자체를 불가능하게 만들면서 함께 사라졌다 (④).
