@@ -10,6 +10,11 @@ Enable it with an environment variable (normal test runs are unaffected)::
     PRISM_KERNEL_GOLDEN=record:<dir>   pytest test/prism   # writes <dir>/golden.json
     PRISM_KERNEL_GOLDEN=check:<dir>    pytest test/prism   # compares, fails on drift
 
+``check-tensors:<dir>`` compares only the non-empty tensor arguments of each call, as
+multisets, and reports export renames instead of failing on them. Use it for a commit that
+renames exports or changes their scalar or empty-tensor arguments, where the bytes the kernels
+read and write must still match.
+
 Deselect timing tests in gate runs (``-k "not perf_smoke"``); the per-call sync and hashing
 slow every kernel call.
 
@@ -55,8 +60,10 @@ def _parse_env() -> Optional[tuple]:
     if not raw:
         return None
     mode, _, path = raw.partition(":")
-    if mode not in ("record", "check") or not path:
-        raise ValueError(f"{ENV} must be 'record:<dir>' or 'check:<dir>', got {raw!r}")
+    if mode not in ("record", "check", "check-tensors") or not path:
+        raise ValueError(
+            f"{ENV} must be 'record:<dir>', 'check:<dir>' or 'check-tensors:<dir>', got {raw!r}"
+        )
     return mode, os.path.abspath(path)
 
 
@@ -202,7 +209,20 @@ def pytest_runtest_setup(item):
         pass
 
 
-def _compare(golden: Dict[str, List[dict]], now: Dict[str, List[dict]]) -> dict:
+_EMPTY_DTYPES = (
+    torch.float32, torch.bfloat16, torch.float16, torch.int64, torch.int32, torch.int16,
+    torch.uint16, torch.uint8, torch.int8,
+)
+
+
+def _tensors(args: List[str], empty: frozenset) -> List[str]:
+    """Non-empty tensor digests of one call, order-free (check-tensors mode)."""
+    return sorted(a for a in args if a.startswith("T:") and a not in empty)
+
+
+def _compare(
+    golden: Dict[str, List[dict]], now: Dict[str, List[dict]], tensors_only: bool = False
+) -> dict:
     out = {
         "kernel_drift": [],
         "input_drift": [],
@@ -210,7 +230,9 @@ def _compare(golden: Dict[str, List[dict]], now: Dict[str, List[dict]]) -> dict:
         "new_tests": [],
         "call_count_changed": [],
         "compared_calls": 0,
+        "renamed": {},
     }
+    empty = frozenset("T:" + _digest(torch.empty(0, dtype=d)) for d in _EMPTY_DTYPES)
     for test, gcalls in golden.items():
         ncalls = now.get(test)
         if ncalls is None:
@@ -220,6 +242,17 @@ def _compare(golden: Dict[str, List[dict]], now: Dict[str, List[dict]]) -> dict:
             out["call_count_changed"].append(f"{test}: {len(gcalls)} -> {len(ncalls)}")
         for g, n in zip(gcalls, ncalls):
             where = f"{test} #{g['seq']} {g['fn']}"
+            if tensors_only:
+                if g["fn"] != n["fn"]:
+                    pair = f"{g['fn']} -> {n['fn']}"
+                    out["renamed"][pair] = out["renamed"].get(pair, 0) + 1
+                if _tensors(g["pre"], empty) != _tensors(n["pre"], empty):
+                    out["input_drift"].append(f"{where}: input tensors differ")
+                    continue
+                out["compared_calls"] += 1
+                if _tensors(g["post"], empty) != _tensors(n["post"], empty):
+                    out["kernel_drift"].append(f"{where}: output tensors differ")
+                continue
             if g["fn"] != n["fn"]:
                 out["kernel_drift"].append(f"{where}: called {n['fn']} instead")
                 continue
@@ -264,7 +297,7 @@ def pytest_sessionfinish(session, exitstatus):
     else:
         with open(os.path.join(st.path, "golden.json")) as f:
             golden = json.load(f)["calls"]
-        summary["compare"] = _compare(golden, st.calls)
+        summary["compare"] = _compare(golden, st.calls, st.mode == "check-tensors")
         with open(os.path.join(st.path, "check_now.json"), "w") as f:
             json.dump(
                 {"calls": st.calls, "exports": st.exports}, f, indent=0, sort_keys=True
@@ -290,8 +323,8 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             f"  {m}: {n - len(missing)}/{n} exports called"
             + (f"; never: {', '.join(missing)}" if missing else "")
         )
-    if st.mode == "check":
-        path = os.path.join(st.path, "check_summary.json")
+    if st.mode != "record":
+        path = os.path.join(st.path, f"{st.mode}_summary.json")
         if os.path.exists(path):
             with open(path) as f:
                 c = json.load(f)["compare"]
@@ -303,3 +336,5 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
             )
             for line in (c["kernel_drift"] + c["call_count_changed"])[:20]:
                 tr.write_line("  DRIFT " + line)
+            for pair, n in sorted(c.get("renamed", {}).items()):
+                tr.write_line(f"  RENAMED {pair} ({n} calls)")
