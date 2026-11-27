@@ -21,8 +21,8 @@ from sglang.kernels.ops.moe.prism.gemv import keep_ctr_arg
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-# Export name -> C++ entry (prism_gemv_fp8.cuh). `pt` = per-tensor scales, `_pinned` = warm
-# placement. k1w has no fused gate+up entry.
+# Export name -> C++ entry (prism_gemv_fp8.cuh). `pt` = per-tensor scales; the placement is the
+# trailing w_on_device argument (1 = hot, 0 = warm). k1w has no fused gate+up entry.
 _SCORE_SUFFIX = {
     "kDense": "",
     "kPair": "_sparse",
@@ -36,16 +36,14 @@ def _entries() -> list[tuple[str, str]]:
     for pt in (False, True):
         for mode, suffix in _SCORE_SUFFIX.items():
             for fused in (False, True) if mode != "kK1W" else (False,):
-                for on_device in (True, False):
-                    name = (
-                        ("gemv_fp8pt" if pt else "gemv_fp8")
-                        + "_indexed"
-                        + ("" if on_device else "_pinned")
-                        + suffix
-                        + ("_gateup" if fused else "")
-                    )
-                    flags = ", ".join(str(b).lower() for b in (fused, on_device, pt))
-                    out.append((name, f"PrismGemvFp8<Mode::{mode}, {flags}>::run"))
+                name = (
+                    ("gemv_fp8pt" if pt else "gemv_fp8")
+                    + "_indexed"
+                    + suffix
+                    + ("_gateup" if fused else "")
+                )
+                flags = ", ".join(str(b).lower() for b in (fused, pt))
+                out.append((name, f"PrismGemvFp8<Mode::{mode}, {flags}>::run"))
     return out
 
 
@@ -76,34 +74,39 @@ def warmup_jit() -> None:
 
 
 def _dense(name):
+    export = name.replace("_pinned", "")
+    on_device = int("_pinned" not in name)
     def fn(x2d, topk_ids, codes, scales, row_off, kidx, out3d, out_col_offset,
            x_row_is_pair, stream) -> None:
         module = _jit_prism_gemv_fp8_module()
         with torch.cuda.stream(stream):
-            getattr(module, name)(x2d, topk_ids, codes, scales, row_off, kidx, out3d,
-                                  int(out_col_offset), int(bool(x_row_is_pair)))
+            getattr(module, export)(x2d, topk_ids, codes, scales, row_off, kidx, out3d,
+                                  int(out_col_offset), int(bool(x_row_is_pair)), on_device)
     fn.__name__ = name
     return fn
 
 
 def _sparse(name):
+    export = name.replace("_pinned", "")
+    on_device = int("_pinned" not in name)
     def fn(x2d, topk_ids, topk_weights, codes, scales, row_off, kidx, out3d, sp,
            out_col_offset, x_row_is_pair, stream) -> None:
         module = _jit_prism_gemv_fp8_module()
         tail = (int(out_col_offset), int(bool(x_row_is_pair)),
-                float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid), int(sp.ng), int(sp.renorm_it))
+                float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid), int(sp.ng), int(sp.renorm_it),
+                on_device)
         with torch.cuda.stream(stream):
             if _per_k_w(sp):
-                getattr(module, name.replace("sparse", "sparsek1w"))(
+                getattr(module, export.replace("sparse", "sparsek1w"))(
                     x2d, topk_ids, codes, scales, row_off, kidx, out3d, sp.a, sp.thr,
                     topk_weights, keep_ctr_arg(sp), *tail)
                 return
             if _per_k(sp):
-                getattr(module, name.replace("sparse", "sparsek1"))(
+                getattr(module, export.replace("sparse", "sparsek1"))(
                     x2d, topk_ids, codes, scales, row_off, kidx, out3d, sp.thr, topk_weights,
                     keep_ctr_arg(sp), *tail)
             else:
-                getattr(module, name)(
+                getattr(module, export)(
                     x2d, topk_ids, codes, scales, row_off, kidx, out3d,
                     sp.a, sp.c, sp.thr, topk_weights, keep_ctr_arg(sp), *tail)
     fn.__name__ = name
@@ -111,20 +114,24 @@ def _sparse(name):
 
 
 def _dense_gateup(name):
+    export = name.replace("_pinned", "")
+    on_device = int("_pinned" not in name)
     def fn(x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
            codes_u, scales_u, row_off_u, kidx_u, out3d,
            out_col_gate, out_col_up, x_row_is_pair, stream) -> None:
         module = _jit_prism_gemv_fp8_module()
         with torch.cuda.stream(stream):
-            getattr(module, name)(
+            getattr(module, export)(
                 x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
                 codes_u, scales_u, row_off_u, kidx_u, out3d,
-                int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)))
+                int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), on_device)
     fn.__name__ = name
     return fn
 
 
 def _sparse_gateup(name):
+    export = name.replace("_pinned", "")
+    on_device = int("_pinned" not in name)
     def fn(x2d, topk_ids, topk_weights, codes_g, scales_g, row_off_g, kidx_g,
            codes_u, scales_u, row_off_u, kidx_u, out3d, sp_gate, sp_up,
            out_col_gate, out_col_up, x_row_is_pair, stream) -> None:
@@ -135,16 +142,17 @@ def _sparse_gateup(name):
         module = _jit_prism_gemv_fp8_module()
         tail = (int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
                 float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
-                float(sp_gate.pmax), float(sp_gate.grid), int(sp_gate.ng), int(sp_gate.renorm_it))
+                float(sp_gate.pmax), float(sp_gate.grid), int(sp_gate.ng), int(sp_gate.renorm_it),
+                on_device)
         with torch.cuda.stream(stream):
             if _per_k(sp_gate):
-                getattr(module, name.replace("sparse", "sparsek1"))(
+                getattr(module, export.replace("sparse", "sparsek1"))(
                     x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
                     codes_u, scales_u, row_off_u, kidx_u, out3d,
                     sp_gate.thr, sp_up.thr, topk_weights,
                     keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
             else:
-                getattr(module, name)(
+                getattr(module, export)(
                     x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
                     codes_u, scales_u, row_off_u, kidx_u, out3d,
                     sp_gate.a, sp_gate.c, sp_gate.thr, sp_up.a, sp_up.c, sp_up.thr, topk_weights,

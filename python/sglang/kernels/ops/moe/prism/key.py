@@ -1,9 +1,8 @@
 """Kernel keys for the Prism GEMV and grouped GEMM entry points.
 
-A key names one entry point up to its weight placement: (op, store format, sparse score,
-gate+up fusion). Hot and warm placements are the same kernel and differ only in the export
-name (`_pinned` = warm). Support is read from the wrappers' export tables, so a key is
-supported exactly when its exports are built.
+A key names one entry point: (op, store format, sparse score, gate+up fusion). Hot and warm
+placements share the export, which takes the placement as its last argument. Support is read
+from the wrappers' export tables, so a key is supported exactly when its export is built.
 """
 
 from __future__ import annotations
@@ -51,7 +50,12 @@ class PrismKernelKey(msgspec.Struct, frozen=True):
         """on_device values with an export: cold slabs are host-only, the rest have both."""
         return (False,) if self.op == "grouped_cold" else (True, False)
 
-    def export_name(self, *, on_device: bool) -> str:
+    def export_name(self) -> str:
+        _, prefix = _FAMILY[(self.op, self.fmt)]
+        gateup = "_gateup" if self.fused else ""
+        return f"{prefix}{_MODE_SUFFIX[self.mode]}{gateup}"
+
+    def wrapper_name(self, *, on_device: bool) -> str:
         _, prefix = _FAMILY[(self.op, self.fmt)]
         pinned = "" if on_device or self.op == "grouped_cold" else "_pinned"
         gateup = "_gateup" if self.fused else ""
@@ -68,21 +72,13 @@ def module_exports(name: str) -> frozenset[str]:
 
 
 def unsupported_reason(key: PrismKernelKey) -> Optional[str]:
-    """None if every placement of `key` has an export, else why not."""
+    """None if `key` has an export, else why not."""
     family = _FAMILY.get((key.op, key.fmt))
     if family is None:
         return f"no {key.op} kernel for {key.fmt}"
-    exports = module_exports(family[0])
-    missing = [
-        key.export_name(on_device=p)
-        for p in key.placements()
-        if key.export_name(on_device=p) not in exports
-    ]
-    if missing:
+    if key.export_name() not in module_exports(family[0]):
         fusion = " gate+up" if key.fused else ""
-        return (
-            f"{key.fmt} {key.op} has no {key.mode}{fusion} entry ({', '.join(missing)})"
-        )
+        return f"{key.fmt} {key.op} has no {key.mode}{fusion} entry ({key.export_name()})"
     return None
 
 
@@ -99,7 +95,7 @@ def wrapper(key: PrismKernelKey, *, on_device: bool) -> Callable:
     mode = "dense" if key.mode == "dense" else "pair"
     named = PrismKernelKey(op=key.op, fmt=key.fmt, mode=mode, fused=key.fused)
     return getattr(
-        _module(_FAMILY[(key.op, key.fmt)][0]), named.export_name(on_device=on_device)
+        _module(_FAMILY[(key.op, key.fmt)][0]), named.wrapper_name(on_device=on_device)
     )
 
 

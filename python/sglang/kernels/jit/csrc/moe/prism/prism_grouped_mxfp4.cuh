@@ -528,27 +528,27 @@ void grouped_mxfp4_cold_gateup(
 
 // ===== Export entry points (indexed stores) =====
 // One struct per gate+up fusion.
-// ON_DEVICE is the store placement checked: true for hot (device), false for warm (pinned host).
+// w_on_device is the store placement checked: 1 for hot (device), 0 for warm (pinned host).
 // Cold-slab entries stay plain functions because they have a single placement.
 
-template <bool FUSED, bool ON_DEVICE>
+template <bool FUSED>
 struct PrismGroupedMxfp4;
 
-template <bool ON_DEVICE>
-struct PrismGroupedMxfp4<false, ON_DEVICE> {
+template <>
+struct PrismGroupedMxfp4<false> {
   static void run(
       tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
       tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
       tvm::ffi::TensorView codes, tvm::ffi::TensorView scales,
       tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-      tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair, int64_t max_blocks) {
+      tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair, int64_t max_blocks, int64_t w_on_device) {
     grouped_mxfp4_impl(x, pair_sorted, pair_off, tile_off, codes, scales, row_off, kidx, out,
-                       out_col_offset, x_row_is_pair, ON_DEVICE, max_blocks);
+                       out_col_offset, x_row_is_pair, w_on_device != 0, max_blocks);
   }
 };
 
-template <bool ON_DEVICE>
-struct PrismGroupedMxfp4<true, ON_DEVICE> {
+template <>
+struct PrismGroupedMxfp4<true> {
   static void run(
       tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
       tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
@@ -557,9 +557,9 @@ struct PrismGroupedMxfp4<true, ON_DEVICE> {
       tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u,
       tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u,
       tvm::ffi::TensorView out, int64_t out_col_offset_g, int64_t out_col_offset_u,
-      int64_t x_row_is_pair, int64_t max_blocks) {
+      int64_t x_row_is_pair, int64_t max_blocks, int64_t w_on_device) {
     grouped_mxfp4_impl(x, pair_sorted, pair_off, tile_off, codes_g, scales_g, row_off_g, kidx_g, out,
-                       out_col_offset_g, x_row_is_pair, ON_DEVICE, max_blocks,
+                       out_col_offset_g, x_row_is_pair, w_on_device != 0, max_blocks,
                        &codes_u, &scales_u, &row_off_u, &kidx_u, out_col_offset_u);
   }
 };

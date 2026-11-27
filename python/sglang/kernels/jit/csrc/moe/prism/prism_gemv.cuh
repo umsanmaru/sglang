@@ -592,61 +592,60 @@ inline void gemv_worklist_indexed_impl(
 }
 
 // ===== Export entry points =====
-// One struct per (sparse score, gate+up fusion). ON_DEVICE is the weight placement the store is
-// verified against (true: hot, device memory; false: warm, pinned host memory); the kernels do
-// not depend on it, so hot and warm results are bit-identical. gemv.py maps export names here.
+// One struct per (sparse score, gate+up fusion). w_on_device is the weight placement the store
+// is verified against (1: hot, device memory; 0: warm, pinned host memory); the kernels do not
+// depend on it, so hot and warm results are bit-identical. gemv.py maps export names here.
 
-template <bool ON_DEVICE>
 struct PrismGemvBand {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w, tvm::ffi::TensorView out, int64_t k_offset,
-                  int64_t out_col_offset, int64_t x_row_is_pair) {
-    gemv_worklist_impl(x, topk, w, out, k_offset, out_col_offset, x_row_is_pair, ON_DEVICE);
+                  int64_t out_col_offset, int64_t x_row_is_pair, int64_t w_on_device) {
+    gemv_worklist_impl(x, topk, w, out, k_offset, out_col_offset, x_row_is_pair, w_on_device != 0);
   }
 };
 
-template <Mode M, bool FUSED, bool ON_DEVICE>
+template <Mode M, bool FUSED>
 struct PrismGemvBf16;
 
-template <bool ON_DEVICE>
-struct PrismGemvBf16<Mode::kDense, false, ON_DEVICE> {
+template <>
+struct PrismGemvBf16<Mode::kDense, false> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, tvm::ffi::TensorView out,
-                  int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec) {
+                  int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec, int64_t w_on_device) {
     gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                               x_row_is_pair, vec, ON_DEVICE, nullptr);
+                               x_row_is_pair, vec, w_on_device != 0, nullptr);
   }
 };
 
 // Gate+up in one launch (grid.z = 2 slots), bit-identical to two single launches; measured
 // 1.8x faster than two launches at bs=1, where this kernel is starved for blocks.
-template <bool ON_DEVICE>
-struct PrismGemvBf16<Mode::kDense, true, ON_DEVICE> {
+template <>
+struct PrismGemvBf16<Mode::kDense, true> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate, tvm::ffi::TensorView kidx_gate,
                   tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up, tvm::ffi::TensorView kidx_up, tvm::ffi::TensorView out,
                   int64_t out_col_offset_gate, int64_t out_col_offset_up,
-                  int64_t x_row_is_pair, int64_t vec) {
+                  int64_t x_row_is_pair, int64_t vec, int64_t w_on_device) {
     gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                               out_col_offset_gate, x_row_is_pair, vec, ON_DEVICE, nullptr,
+                               out_col_offset_gate, x_row_is_pair, vec, w_on_device != 0, nullptr,
                                &w_up, &row_off_up, &kidx_up, out_col_offset_up);
   }
 };
 
 // Pair score: reads a (wn^2), c (adjacent-column dot) and thr.
-template <bool ON_DEVICE>
-struct PrismGemvBf16<Mode::kPair, false, ON_DEVICE> {
+template <>
+struct PrismGemvBf16<Mode::kPair, false> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, tvm::ffi::TensorView out,
                   tvm::ffi::TensorView a, tvm::ffi::TensorView c, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
                   int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
                   double p, double lam, double pmax, double grid, int64_t ng,
-                  int64_t renorm_it) {
+                  int64_t renorm_it, int64_t w_on_device) {
     SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
     sin.ctr = &ctr;
     gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                               x_row_is_pair, vec, ON_DEVICE, &sin);
+                               x_row_is_pair, vec, w_on_device != 0, &sin);
   }
 };
 
-template <bool ON_DEVICE>
-struct PrismGemvBf16<Mode::kPair, true, ON_DEVICE> {
+template <>
+struct PrismGemvBf16<Mode::kPair, true> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate, tvm::ffi::TensorView kidx_gate,
                   tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up, tvm::ffi::TensorView kidx_up, tvm::ffi::TensorView out,
                   tvm::ffi::TensorView a_gate, tvm::ffi::TensorView c_gate, tvm::ffi::TensorView thr_gate, tvm::ffi::TensorView a_up, tvm::ffi::TensorView c_up, tvm::ffi::TensorView thr_up,
@@ -654,41 +653,41 @@ struct PrismGemvBf16<Mode::kPair, true, ON_DEVICE> {
                   int64_t out_col_offset_gate, int64_t out_col_offset_up,
                   int64_t x_row_is_pair, int64_t vec,
                   double p_gate, double lam_gate, double p_up, double lam_up,
-                  double pmax, double grid, int64_t ng, int64_t renorm_it) {
+                  double pmax, double grid, int64_t ng, int64_t renorm_it, int64_t w_on_device) {
     SparseIn sin{a_gate, c_gate, thr_gate, topk_w, p_gate, lam_gate, pmax, grid, ng, renorm_it};
     sin.ctr = &ctr_gate;
     SparseIn sin_up{a_up, c_up, thr_up, topk_w, p_up, lam_up, pmax, grid, ng, renorm_it};
     sin_up.ctr = &ctr_up;
     gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                               out_col_offset_gate, x_row_is_pair, vec, ON_DEVICE, &sin,
+                               out_col_offset_gate, x_row_is_pair, vec, w_on_device != 0, &sin,
                                &w_up, &row_off_up, &kidx_up, out_col_offset_up, &sin_up);
   }
 };
 
 // Per-k score (k1): |x_k| >= thr. Reads neither a nor c; thr fills their SparseIn slots.
-template <bool ON_DEVICE>
-struct PrismGemvBf16<Mode::kK1, false, ON_DEVICE> {
+template <>
+struct PrismGemvBf16<Mode::kK1, false> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, tvm::ffi::TensorView out,
                   tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
                   int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
                   double p, double lam, double pmax, double grid, int64_t ng,
-                  int64_t renorm_it) {
+                  int64_t renorm_it, int64_t w_on_device) {
     SparseIn sin{thr, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true};
     sin.ctr = &ctr;
     gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                               x_row_is_pair, vec, ON_DEVICE, &sin);
+                               x_row_is_pair, vec, w_on_device != 0, &sin);
   }
 };
 
-template <bool ON_DEVICE>
-struct PrismGemvBf16<Mode::kK1, true, ON_DEVICE> {
+template <>
+struct PrismGemvBf16<Mode::kK1, true> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate, tvm::ffi::TensorView kidx_gate,
                   tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up, tvm::ffi::TensorView kidx_up, tvm::ffi::TensorView out,
                   tvm::ffi::TensorView thr_gate, tvm::ffi::TensorView thr_up, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
                   int64_t out_col_offset_gate, int64_t out_col_offset_up,
                   int64_t x_row_is_pair, int64_t vec,
                   double p_gate, double lam_gate, double p_up, double lam_up,
-                  double pmax, double grid, int64_t ng, int64_t renorm_it) {
+                  double pmax, double grid, int64_t ng, int64_t renorm_it, int64_t w_on_device) {
     SparseIn sin{thr_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate, pmax, grid, ng,
                  renorm_it, true};
     sin.ctr = &ctr_gate;
@@ -696,28 +695,28 @@ struct PrismGemvBf16<Mode::kK1, true, ON_DEVICE> {
                     true};
     sin_up.ctr = &ctr_up;
     gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                               out_col_offset_gate, x_row_is_pair, vec, ON_DEVICE, &sin,
+                               out_col_offset_gate, x_row_is_pair, vec, w_on_device != 0, &sin,
                                &w_up, &row_off_up, &kidx_up, out_col_offset_up, &sin_up);
   }
 };
 
 // Per-k score scaled by the column norm (k1w): x^2 * a >= thr^2. Reads a, not c.
-template <bool ON_DEVICE>
-struct PrismGemvBf16<Mode::kK1W, false, ON_DEVICE> {
+template <>
+struct PrismGemvBf16<Mode::kK1W, false> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx, tvm::ffi::TensorView out,
                   tvm::ffi::TensorView a, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
                   int64_t out_col_offset, int64_t x_row_is_pair, int64_t vec,
                   double p, double lam, double pmax, double grid, int64_t ng,
-                  int64_t renorm_it) {
+                  int64_t renorm_it, int64_t w_on_device) {
     SparseIn sin{a, thr, thr, topk_w, p, lam, pmax, grid, ng, renorm_it, true, true};
     sin.ctr = &ctr;
     gemv_worklist_indexed_impl(x, topk, w, row_off, kidx, out, out_col_offset,
-                               x_row_is_pair, vec, ON_DEVICE, &sin);
+                               x_row_is_pair, vec, w_on_device != 0, &sin);
   }
 };
 
-template <bool ON_DEVICE>
-struct PrismGemvBf16<Mode::kK1W, true, ON_DEVICE> {
+template <>
+struct PrismGemvBf16<Mode::kK1W, true> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView w_gate, tvm::ffi::TensorView row_off_gate, tvm::ffi::TensorView kidx_gate,
                   tvm::ffi::TensorView w_up, tvm::ffi::TensorView row_off_up, tvm::ffi::TensorView kidx_up, tvm::ffi::TensorView out,
                   tvm::ffi::TensorView a_gate, tvm::ffi::TensorView thr_gate, tvm::ffi::TensorView a_up, tvm::ffi::TensorView thr_up,
@@ -725,7 +724,7 @@ struct PrismGemvBf16<Mode::kK1W, true, ON_DEVICE> {
                   int64_t out_col_offset_gate, int64_t out_col_offset_up,
                   int64_t x_row_is_pair, int64_t vec,
                   double p_gate, double lam_gate, double p_up, double lam_up,
-                  double pmax, double grid, int64_t ng, int64_t renorm_it) {
+                  double pmax, double grid, int64_t ng, int64_t renorm_it, int64_t w_on_device) {
     SparseIn sin{a_gate, thr_gate, thr_gate, topk_w, p_gate, lam_gate, pmax, grid, ng,
                  renorm_it, true, true};
     sin.ctr = &ctr_gate;
@@ -733,7 +732,7 @@ struct PrismGemvBf16<Mode::kK1W, true, ON_DEVICE> {
                     true, true};
     sin_up.ctr = &ctr_up;
     gemv_worklist_indexed_impl(x, topk, w_gate, row_off_gate, kidx_gate, out,
-                               out_col_offset_gate, x_row_is_pair, vec, ON_DEVICE, &sin,
+                               out_col_offset_gate, x_row_is_pair, vec, w_on_device != 0, &sin,
                                &w_up, &row_off_up, &kidx_up, out_col_offset_up, &sin_up);
   }
 };

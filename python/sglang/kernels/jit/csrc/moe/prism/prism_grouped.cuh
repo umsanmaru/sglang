@@ -815,29 +815,29 @@ void grouped_gemm_cold_gateup(
 
 // ===== Export entry points (indexed stores) =====
 // One struct per gate+up fusion.
-// ON_DEVICE is the store placement checked: true for hot (device), false for warm (pinned host).
+// w_on_device is the store placement checked: 1 for hot (device), 0 for warm (pinned host).
 // Cold-slab entries stay plain functions because they have a single placement.
 
-template <bool FUSED, bool ON_DEVICE>
+template <bool FUSED>
 struct PrismGroupedBf16;
 
-template <bool ON_DEVICE>
-struct PrismGroupedBf16<false, ON_DEVICE> {
+template <>
+struct PrismGroupedBf16<false> {
   static void run(
       tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
       tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
       tvm::ffi::TensorView w, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
       tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair,
-      int64_t max_blocks, int64_t wres_k_max, tvm::ffi::TensorView scratch) {
+      int64_t max_blocks, int64_t wres_k_max, tvm::ffi::TensorView scratch, int64_t w_on_device) {
     const tvm::ffi::TensorView* sc = scratch.numel() > 0 ? &scratch : nullptr;
     grouped_gemm_impl(x, pair_sorted, pair_off, tile_off, w, row_off, kidx, out,
-                      out_col_offset, x_row_is_pair, ON_DEVICE, max_blocks,
+                      out_col_offset, x_row_is_pair, w_on_device != 0, max_blocks,
                       nullptr, nullptr, nullptr, 0, ROWMAJOR, nullptr, nullptr, 0, 0, 0, wres_k_max, sc);
   }
 };
 
-template <bool ON_DEVICE>
-struct PrismGroupedBf16<true, ON_DEVICE> {
+template <>
+struct PrismGroupedBf16<true> {
   static void run(
       tvm::ffi::TensorView x, tvm::ffi::TensorView pair_sorted,
       tvm::ffi::TensorView pair_off, tvm::ffi::TensorView tile_off,
@@ -847,10 +847,10 @@ struct PrismGroupedBf16<true, ON_DEVICE> {
       tvm::ffi::TensorView kidx_up,
       tvm::ffi::TensorView out, int64_t out_col_offset_gate,
       int64_t out_col_offset_up, int64_t x_row_is_pair, int64_t max_blocks, int64_t wres_k_max,
-      tvm::ffi::TensorView scratch) {
+      tvm::ffi::TensorView scratch, int64_t w_on_device) {
     const tvm::ffi::TensorView* sc = scratch.numel() > 0 ? &scratch : nullptr;
     grouped_gemm_impl(x, pair_sorted, pair_off, tile_off, w_gate, row_off_gate,
-                      kidx_gate, out, out_col_offset_gate, x_row_is_pair, ON_DEVICE,
+                      kidx_gate, out, out_col_offset_gate, x_row_is_pair, w_on_device != 0,
                       max_blocks, &w_up, &row_off_up, &kidx_up, out_col_offset_up,
                       ROWMAJOR, nullptr, nullptr, 0, 0, 0, wres_k_max, sc);
   }

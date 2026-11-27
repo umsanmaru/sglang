@@ -61,14 +61,14 @@ def test_kernel_keys_cover_exactly_the_built_exports():
 
     from sglang.kernels.ops.moe.prism import key as K
 
-    unkeyed = {"gemv_worklist", "gemv_worklist_pinned", "prism_wait_flag"}
+    unkeyed = {"gemv_worklist", "prism_wait_flag"}
     modules = ("gemv", "gemv_fp8", "gemv_mxfp4", "grouped", "grouped_fp8", "grouped_mxfp4")
     built = set().union(*(K.module_exports(m) for m in modules)) - unkeyed
     keyed = set()
     for op, fmt, mode, fused in itertools.product(K.OPS, K.FMTS, K.MODES, (False, True)):
         key = K.PrismKernelKey(op=op, fmt=fmt, mode=mode, fused=fused)
         if K.supports(key):
-            keyed |= {key.export_name(on_device=p) for p in key.placements()}
+            keyed.add(key.export_name())
             for p in key.placements():
                 assert callable(K.wrapper(key, on_device=p)), key
     assert keyed == built

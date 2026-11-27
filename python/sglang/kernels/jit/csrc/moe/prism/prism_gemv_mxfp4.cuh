@@ -357,60 +357,60 @@ inline void gemv_mxfp4_impl(
 
 // ===== Export entry points =====
 // One struct per (sparse score, gate+up fusion); MXFP4 supports the dense and pair scores.
-// ON_DEVICE is the store placement checked (true: hot, device; false: warm, pinned host); it also
+// w_on_device is the store placement checked (1: hot, device; 0: warm, pinned host); it also
 // picks the column tile width kV for PCIe reads. gemv_mxfp4.py maps the export names here.
 
-template <Mode M, bool FUSED, bool ON_DEVICE>
+template <Mode M, bool FUSED>
 struct PrismGemvMxfp4;
 
-template <bool ON_DEVICE>
-struct PrismGemvMxfp4<Mode::kDense, false, ON_DEVICE> {
+template <>
+struct PrismGemvMxfp4<Mode::kDense, false> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes, tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
-                  tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair) {
+                  tvm::ffi::TensorView out, int64_t out_col_offset, int64_t x_row_is_pair, int64_t w_on_device) {
     gemv_mxfp4_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,
-                    ON_DEVICE, nullptr);
+                    w_on_device != 0, nullptr);
   }
 };
 
-template <bool ON_DEVICE>
-struct PrismGemvMxfp4<Mode::kPair, false, ON_DEVICE> {
+template <>
+struct PrismGemvMxfp4<Mode::kPair, false> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes, tvm::ffi::TensorView scales, tvm::ffi::TensorView row_off, tvm::ffi::TensorView kidx,
                   tvm::ffi::TensorView out, tvm::ffi::TensorView a, tvm::ffi::TensorView c, tvm::ffi::TensorView thr, tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr,
                   int64_t out_col_offset, int64_t x_row_is_pair,
-                  double p, double lam, double pmax, double grid, int64_t ng, int64_t renorm_it) {
+                  double p, double lam, double pmax, double grid, int64_t ng, int64_t renorm_it, int64_t w_on_device) {
     SparseIn sin{a, c, thr, topk_w, p, lam, pmax, grid, ng, renorm_it};
     sin.ctr = &ctr;
     gemv_mxfp4_impl(x, topk, codes, scales, row_off, kidx, out, out_col_offset, x_row_is_pair,
-                    ON_DEVICE, &sin);
+                    w_on_device != 0, &sin);
   }
 };
 
-template <bool ON_DEVICE>
-struct PrismGemvMxfp4<Mode::kDense, true, ON_DEVICE> {
+template <>
+struct PrismGemvMxfp4<Mode::kDense, true> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
                   tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u, tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u, tvm::ffi::TensorView out,
-                  int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair) {
+                  int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair, int64_t w_on_device) {
     gemv_mxfp4_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,
-                    x_row_is_pair, ON_DEVICE, nullptr, &codes_u, &scales_u, &row_off_u, &kidx_u,
+                    x_row_is_pair, w_on_device != 0, nullptr, &codes_u, &scales_u, &row_off_u, &kidx_u,
                     out_col_offset_u);
   }
 };
 
-template <bool ON_DEVICE>
-struct PrismGemvMxfp4<Mode::kPair, true, ON_DEVICE> {
+template <>
+struct PrismGemvMxfp4<Mode::kPair, true> {
   static void run(tvm::ffi::TensorView x, tvm::ffi::TensorView topk, tvm::ffi::TensorView codes_g, tvm::ffi::TensorView scales_g, tvm::ffi::TensorView row_off_g, tvm::ffi::TensorView kidx_g,
                   tvm::ffi::TensorView codes_u, tvm::ffi::TensorView scales_u, tvm::ffi::TensorView row_off_u, tvm::ffi::TensorView kidx_u, tvm::ffi::TensorView out,
                   tvm::ffi::TensorView a_g, tvm::ffi::TensorView c_g, tvm::ffi::TensorView thr_g, tvm::ffi::TensorView a_u, tvm::ffi::TensorView c_u, tvm::ffi::TensorView thr_u,
                   tvm::ffi::TensorView topk_w, tvm::ffi::TensorView ctr_gate, tvm::ffi::TensorView ctr_up,
                   int64_t out_col_offset_g, int64_t out_col_offset_u, int64_t x_row_is_pair,
                   double p_g, double lam_g, double p_u, double lam_u,
-                  double pmax, double grid, int64_t ng, int64_t renorm_it) {
+                  double pmax, double grid, int64_t ng, int64_t renorm_it, int64_t w_on_device) {
     SparseIn sin{a_g, c_g, thr_g, topk_w, p_g, lam_g, pmax, grid, ng, renorm_it};
     sin.ctr = &ctr_gate;
     SparseIn sin_up{a_u, c_u, thr_u, topk_w, p_u, lam_u, pmax, grid, ng, renorm_it};
     sin_up.ctr = &ctr_up;
     gemv_mxfp4_impl(x, topk, codes_g, scales_g, row_off_g, kidx_g, out, out_col_offset_g,
-                    x_row_is_pair, ON_DEVICE, &sin, &codes_u, &scales_u, &row_off_u, &kidx_u,
+                    x_row_is_pair, w_on_device != 0, &sin, &codes_u, &scales_u, &row_off_u, &kidx_u,
                     out_col_offset_u, &sin_up);
   }
 };

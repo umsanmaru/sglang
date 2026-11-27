@@ -10,8 +10,8 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-# Export name -> C++ entry. The name encodes placement (`_pinned` = warm) and the sparse
-# score; the entry struct takes both as template arguments (prism_gemv.cuh).
+# Export name -> C++ entry (prism_gemv.cuh). The name encodes the sparse score and fusion; the
+# weight placement is the trailing w_on_device argument (1 = hot device, 0 = warm pinned host).
 _SCORE_SUFFIX = {
     "kDense": "",
     "kPair": "_sparse",
@@ -21,21 +21,11 @@ _SCORE_SUFFIX = {
 
 
 def _entries() -> list[tuple[str, str]]:
-    out = [
-        ("gemv_worklist", "PrismGemvBand<true>::run"),
-        ("gemv_worklist_pinned", "PrismGemvBand<false>::run"),
-    ]
+    out = [("gemv_worklist", "PrismGemvBand::run")]
     for mode, suffix in _SCORE_SUFFIX.items():
         for fused in (False, True):
-            for on_device in (True, False):
-                name = (
-                    "gemv_worklist_indexed"
-                    + ("" if on_device else "_pinned")
-                    + suffix
-                    + ("_gateup" if fused else "")
-                )
-                args = f"Mode::{mode}, {str(fused).lower()}, {str(on_device).lower()}"
-                out.append((name, f"PrismGemvBf16<{args}>::run"))
+            name = "gemv_worklist_indexed" + suffix + ("_gateup" if fused else "")
+            out.append((name, f"PrismGemvBf16<Mode::{mode}, {str(fused).lower()}>::run"))
     return out
 
 
@@ -71,7 +61,7 @@ def gemv_worklist(x2d, topk_ids, weights, out3d, k_offset, out_col_offset,
     module = _jit_prism_gemv_module()
     with torch.cuda.stream(stream):
         module.gemv_worklist(x2d, topk_ids, weights, out3d,
-                             int(k_offset), int(out_col_offset), int(bool(x_row_is_pair)))
+                             int(k_offset), int(out_col_offset), int(bool(x_row_is_pair)), 1)
 
 
 def gemv_worklist_pinned(x2d, topk_ids, weights, out3d, k_offset, out_col_offset,
@@ -80,8 +70,8 @@ def gemv_worklist_pinned(x2d, topk_ids, weights, out3d, k_offset, out_col_offset
     중복 expert는 PCIe 재전송이다 (설계 결정 — spec §1.2)."""
     module = _jit_prism_gemv_module()
     with torch.cuda.stream(stream):
-        module.gemv_worklist_pinned(x2d, topk_ids, weights, out3d,
-                                    int(k_offset), int(out_col_offset), int(bool(x_row_is_pair)))
+        module.gemv_worklist(x2d, topk_ids, weights, out3d,
+                             int(k_offset), int(out_col_offset), int(bool(x_row_is_pair)), 0)
 
 
 def gemv_worklist_indexed(x2d, topk_ids, w_flat, row_off, kidx, out3d,
@@ -107,7 +97,7 @@ def gemv_worklist_indexed(x2d, topk_ids, w_flat, row_off, kidx, out3d,
     with torch.cuda.stream(stream):
         module.gemv_worklist_indexed(x2d, topk_ids, w_flat, row_off, kidx, out3d,
                                      int(out_col_offset), int(bool(x_row_is_pair)),
-                                     int(vec))
+                                     int(vec), 1)
 
 
 def gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx, out3d,
@@ -115,9 +105,9 @@ def gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx, out3d,
     """gemv_worklist_indexed의 쌍둥이 — W가 pinned CPU(UVA 직접 읽기, WARM)."""
     module = _jit_prism_gemv_module()
     with torch.cuda.stream(stream):
-        module.gemv_worklist_indexed_pinned(x2d, topk_ids, w_flat, row_off, kidx,
-                                            out3d, int(out_col_offset),
-                                            int(bool(x_row_is_pair)), int(vec))
+        module.gemv_worklist_indexed(x2d, topk_ids, w_flat, row_off, kidx,
+                                     out3d, int(out_col_offset),
+                                     int(bool(x_row_is_pair)), int(vec), 0)
 
 
 _NO_KEEP_CTR: dict = {}
@@ -149,7 +139,7 @@ def _per_k_w(sp) -> bool:
 
 
 def _sparse_call(fn, fn_k1, fn_k1w, x2d, topk_ids, topk_weights, w_flat, row_off, kidx, out3d,
-                 sp, out_col_offset, x_row_is_pair, stream, vec) -> None:
+                 sp, out_col_offset, x_row_is_pair, stream, vec, on_device) -> None:
     """sparse 두 래퍼의 공통 본체 — 갈리는 것은 FFI 심볼 하나뿐이다.
 
     `topk_weights`가 `sp`에 들어가지 않는 이유: sp는 로드 타임에 한 번 만들어
@@ -157,7 +147,7 @@ def _sparse_call(fn, fn_k1, fn_k1w, x2d, topk_ids, topk_weights, w_flat, row_off
     갈린다. 섞으면 스텝마다 spec을 복제하거나 공유 객체를 변조해야 한다."""
     tail = (int(out_col_offset), int(bool(x_row_is_pair)), int(vec),
             float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid),
-            int(sp.ng), int(sp.renorm_it))
+            int(sp.ng), int(sp.renorm_it), int(bool(on_device)))
     with torch.cuda.stream(stream):
         if _per_k_w(sp):
             # score k1w1: a(wn²) + thr. 커널이 x²·a >= thr²로 판정한다.
@@ -191,7 +181,7 @@ def gemv_worklist_indexed_sparse(x2d, topk_ids, topk_weights, w_flat, row_off,
                  module.gemv_worklist_indexed_sparsek1,
                  module.gemv_worklist_indexed_sparsek1w, x2d, topk_ids,
                  topk_weights, w_flat, row_off, kidx, out3d, sp,
-                 out_col_offset, x_row_is_pair, stream, vec)
+                 out_col_offset, x_row_is_pair, stream, vec, True)
 
 
 def gemv_worklist_indexed_pinned_sparse(x2d, topk_ids, topk_weights, w_flat,
@@ -200,11 +190,11 @@ def gemv_worklist_indexed_pinned_sparse(x2d, topk_ids, topk_weights, w_flat,
                                         vec=0) -> None:
     """위의 쌍둥이 — W가 pinned CPU(WARM). 건너뛴 로드가 그대로 PCIe 절약이다."""
     module = _jit_prism_gemv_module()
-    _sparse_call(module.gemv_worklist_indexed_pinned_sparse,
-                 module.gemv_worklist_indexed_pinned_sparsek1,
-                 module.gemv_worklist_indexed_pinned_sparsek1w, x2d, topk_ids,
+    _sparse_call(module.gemv_worklist_indexed_sparse,
+                 module.gemv_worklist_indexed_sparsek1,
+                 module.gemv_worklist_indexed_sparsek1w, x2d, topk_ids,
                  topk_weights, w_flat, row_off, kidx, out3d, sp,
-                 out_col_offset, x_row_is_pair, stream, vec)
+                 out_col_offset, x_row_is_pair, stream, vec, False)
 
 
 def gemv_worklist_indexed_gateup(x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
@@ -224,7 +214,7 @@ def gemv_worklist_indexed_gateup(x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
             x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
             w_up, row_off_up, kidx_up, out3d,
             int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
-            int(vec))
+            int(vec), 1)
 
 
 def gemv_worklist_indexed_pinned_gateup(x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
@@ -235,11 +225,11 @@ def gemv_worklist_indexed_pinned_gateup(x2d, topk_ids, w_gate, row_off_gate, kid
     device 쌍둥이와 같은 커널이고 host 검증만 갈린다 (계약 ①)."""
     module = _jit_prism_gemv_module()
     with torch.cuda.stream(stream):
-        module.gemv_worklist_indexed_pinned_gateup(
+        module.gemv_worklist_indexed_gateup(
             x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
             w_up, row_off_up, kidx_up, out3d,
             int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
-            int(vec))
+            int(vec), 0)
 
 
 def gemv_worklist_indexed_sparse_gateup(
@@ -257,7 +247,7 @@ def gemv_worklist_indexed_sparse_gateup(
     tail = (int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), int(vec),
             float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
             float(sp_gate.pmax), float(sp_gate.grid),
-            int(sp_gate.ng), int(sp_gate.renorm_it))
+            int(sp_gate.ng), int(sp_gate.renorm_it), 1)
     with torch.cuda.stream(stream):
         if _per_k_w(sp_gate):
             module.gemv_worklist_indexed_sparsek1w_gateup(
@@ -301,23 +291,23 @@ def gemv_worklist_indexed_pinned_sparse_gateup(
     tail = (int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), int(vec),
             float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
             float(sp_gate.pmax), float(sp_gate.grid),
-            int(sp_gate.ng), int(sp_gate.renorm_it))
+            int(sp_gate.ng), int(sp_gate.renorm_it), 0)
     with torch.cuda.stream(stream):
         if _per_k_w(sp_gate):
-            module.gemv_worklist_indexed_pinned_sparsek1w_gateup(
+            module.gemv_worklist_indexed_sparsek1w_gateup(
                 x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
                 w_up, row_off_up, kidx_up, out3d,
                 sp_gate.a, sp_gate.thr, sp_up.a, sp_up.thr, topk_weights,
                 keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
             return
         if _per_k(sp_gate):
-            module.gemv_worklist_indexed_pinned_sparsek1_gateup(
+            module.gemv_worklist_indexed_sparsek1_gateup(
                 x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
                 w_up, row_off_up, kidx_up, out3d,
                 sp_gate.thr, sp_up.thr, topk_weights,
                 keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
             return
-        module.gemv_worklist_indexed_pinned_sparse_gateup(
+        module.gemv_worklist_indexed_sparse_gateup(
             x2d, topk_ids, w_gate, row_off_gate, kidx_gate,
             w_up, row_off_up, kidx_up, out3d,
             sp_gate.a, sp_gate.c, sp_gate.thr,

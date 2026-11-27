@@ -60,16 +60,11 @@ def _scratch_impl(out3d, wres_k_max):
     return torch.empty(m * k, w_row, dtype=torch.float32, device=out3d.device)
 
 
-# Export name -> C++ entry. Indexed exports are entry structs (prism_grouped.cuh); the cold
-# and wait_flag exports are plain functions.
+# Export name -> C++ entry. Indexed exports are entry structs (prism_grouped.cuh) whose last
+# argument is the placement (1 = hot, 0 = warm); the cold and wait_flag exports are functions.
 _ENTRIES = [
-    ("grouped_gemm_indexed", "PrismGroupedBf16<false, true>::run"),
-    ("grouped_gemm_indexed_pinned", "PrismGroupedBf16<false, false>::run"),
-    ("grouped_gemm_indexed_gateup", "PrismGroupedBf16<true, true>::run"),
-    (
-        "grouped_gemm_indexed_pinned_gateup",
-        "PrismGroupedBf16<true, false>::run",
-    ),
+    ("grouped_gemm_indexed", "PrismGroupedBf16<false>::run"),
+    ("grouped_gemm_indexed_gateup", "PrismGroupedBf16<true>::run"),
     ("grouped_gemm_cold", "grouped_gemm_cold"),
     ("grouped_gemm_cold_gateup", "grouped_gemm_cold_gateup"),
     ("prism_wait_flag", "prism_wait_flag"),
@@ -102,7 +97,7 @@ def grouped_gemm_indexed(x2d, grouping, w_flat, row_off, kidx, out3d,
         module.grouped_gemm_indexed(
             x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
             w_flat, row_off, kidx, out3d, int(out_col_offset), int(bool(x_row_is_pair)),
-            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max))
+            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max), 1)
 
 
 def grouped_gemm_indexed_pinned(x2d, grouping, w_flat, row_off, kidx, out3d,
@@ -121,10 +116,10 @@ def grouped_gemm_indexed_pinned(x2d, grouping, w_flat, row_off, kidx, out3d,
         return
     module = _jit_prism_grouped_module()
     with torch.cuda.stream(stream):
-        module.grouped_gemm_indexed_pinned(
+        module.grouped_gemm_indexed(
             x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
             w_flat, row_off, kidx, out3d, int(out_col_offset), int(bool(x_row_is_pair)),
-            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max))
+            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max), 0)
 
 
 def grouped_gemm_indexed_gateup(x2d, grouping, w_gate, row_off_gate, kidx_gate,
@@ -138,7 +133,7 @@ def grouped_gemm_indexed_gateup(x2d, grouping, w_gate, row_off_gate, kidx_gate,
             x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
             w_gate, row_off_gate, kidx_gate, w_up, row_off_up, kidx_up, out3d,
             int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
-            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max))
+            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max), 1)
 
 
 def grouped_gemm_indexed_pinned_gateup(x2d, grouping, w_gate, row_off_gate,
@@ -161,11 +156,11 @@ def grouped_gemm_indexed_pinned_gateup(x2d, grouping, w_gate, row_off_gate,
         return
     module = _jit_prism_grouped_module()
     with torch.cuda.stream(stream):
-        module.grouped_gemm_indexed_pinned_gateup(
+        module.grouped_gemm_indexed_gateup(
             x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
             w_gate, row_off_gate, kidx_gate, w_up, row_off_up, kidx_up, out3d,
             int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
-            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max))
+            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max), 0)
 
 
 def grouped_gemm_cold(x2d, grouping, cold, out3d, out_col_offset, x_row_is_pair,

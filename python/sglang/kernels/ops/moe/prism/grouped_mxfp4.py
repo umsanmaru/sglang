@@ -23,9 +23,7 @@ COLD_LAYOUTS = {"kt_fp4": 1, "kt_tile4": 2}
 
 _WRAPPERS = (
     "grouped_mxfp4_indexed",
-    "grouped_mxfp4_indexed_pinned",
     "grouped_mxfp4_indexed_gateup",
-    "grouped_mxfp4_indexed_pinned_gateup",
     "grouped_mxfp4_cold",
     "grouped_mxfp4_cold_gateup",
 )
@@ -35,7 +33,7 @@ def _target(name: str) -> str:
     """Indexed exports are entry structs (prism_grouped_mxfp4.cuh); cold exports are functions."""
     if "_indexed" not in name:
         return name
-    flags = (name.endswith("_gateup"), "_pinned" not in name)
+    flags = (name.endswith("_gateup"),)
     return f"PrismGroupedMxfp4<{', '.join(str(b).lower() for b in flags)}>::run"
 
 
@@ -56,29 +54,33 @@ def warmup_jit() -> None:
 
 
 def _single(name):
+    export = name.replace("_pinned", "")
+    on_device = int("_pinned" not in name)
     def fn(x2d, grouping, codes, scales, row_off, kidx, out3d, out_col_offset,
            x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
         module = _jit_prism_grouped_mxfp4_module()
         with torch.cuda.stream(stream):
-            getattr(module, name)(
+            getattr(module, export)(
                 x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
                 codes, scales, row_off, kidx, out3d, int(out_col_offset),
-                int(bool(x_row_is_pair)), int(max_blocks))
+                int(bool(x_row_is_pair)), int(max_blocks), on_device)
     fn.__name__ = name
     return fn
 
 
 def _gateup(name):
+    export = name.replace("_pinned", "")
+    on_device = int("_pinned" not in name)
     def fn(x2d, grouping, codes_g, scales_g, row_off_g, kidx_g,
            codes_u, scales_u, row_off_u, kidx_u, out3d,
            out_col_gate, out_col_up, x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
         module = _jit_prism_grouped_mxfp4_module()
         with torch.cuda.stream(stream):
-            getattr(module, name)(
+            getattr(module, export)(
                 x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
                 codes_g, scales_g, row_off_g, kidx_g, codes_u, scales_u, row_off_u, kidx_u,
                 out3d, int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
-                int(max_blocks))
+                int(max_blocks), on_device)
     fn.__name__ = name
     return fn
 
