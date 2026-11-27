@@ -1,4 +1,6 @@
 """gemv_worklist 커널 단위 테스트 — 계약 ⑤ 이원화(tolerance + 정확표현 비트일치)."""
+import functools
+
 import pytest
 import torch
 
@@ -78,25 +80,26 @@ def test_gemv_worklist_out_col_offset_slice():
 @cuda_required
 def test_gemv_worklist_pinned_matches_device():
     """W가 pinned CPU(UVA)여도 device 변형과 비트 동일 — warm 티어 경로."""
-    from sglang.kernels.ops.moe.prism.gemv import gemv_worklist, gemv_worklist_pinned
+    from sglang.kernels.ops.moe.prism.gemv import gemv_worklist
     x, w, ids = _mk(exact=True)
     out_d = torch.zeros(2, 4, 96, dtype=torch.bfloat16, device="cuda")
     out_p = torch.zeros_like(out_d)
     s = torch.cuda.current_stream()
     gemv_worklist(x.cuda(), ids.int().cuda(), w.cuda(), out_d, 0, 0, False, s)
-    gemv_worklist_pinned(x.cuda(), ids.int().cuda(), w.pin_memory(), out_p, 0, 0, False, s)
+    gemv_worklist(x.cuda(), ids.int().cuda(), w.pin_memory(), out_p, 0, 0, False, s,
+        on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(out_d.cpu(), out_p.cpu())
 
 
 @cuda_required
 def test_gemv_worklist_pinned_rejects_device_src():
-    from sglang.kernels.ops.moe.prism.gemv import gemv_worklist_pinned
+    from sglang.kernels.ops.moe.prism.gemv import gemv_worklist
     x, w, ids = _mk()
     out = torch.zeros(2, 4, 96, dtype=torch.bfloat16, device="cuda")
     with pytest.raises(Exception):
-        gemv_worklist_pinned(x.cuda(), ids.int().cuda(), w.cuda(), out, 0, 0, False,
-                             torch.cuda.current_stream())
+        gemv_worklist(x.cuda(), ids.int().cuda(), w.cuda(), out, 0, 0, False,
+                             torch.cuda.current_stream(), on_device=False)
 
 
 @cuda_required
@@ -263,7 +266,7 @@ def test_indexed_wide_tile_bitwise():
     여기서 비트가 갈린다. 위 테스트들은 expert당 행이 작아(≤ 96) 넓은 NY 분기를 타지 않는다.
     """
     from sglang.kernels.ops.moe.prism.gemv import (
-        gemv_worklist_indexed, gemv_worklist_indexed_gateup, gemv_worklist_indexed_pinned,
+        gemv_worklist_indexed, gemv_worklist_indexed_gateup,
     )
 
     N, KR = 128, 2048  # expert당 행 >= 2048 이 넓은 NY의 조건
@@ -275,7 +278,7 @@ def test_indexed_wide_tile_bitwise():
     dev = torch.zeros(1, 4, N, dtype=torch.bfloat16, device="cuda")
     pin = torch.zeros_like(dev)
     gemv_worklist_indexed(xd, idsd, wg.cuda(), rod, kid, dev, 0, False, s)
-    gemv_worklist_indexed_pinned(xd, idsd, wg.pin_memory(), rod, kid, pin, 0, False, s)
+    gemv_worklist_indexed(xd, idsd, wg.pin_memory(), rod, kid, pin, 0, False, s, on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(dev, pin), "pinned가 device와 다른 NY를 골랐다"
 
@@ -292,9 +295,7 @@ def test_indexed_wide_tile_bitwise():
 @cuda_required
 def test_indexed_pinned_matches_device():
     """W가 pinned여도 device 변형과 비트 동일 — warm 티어의 제자리 UVA 읽기."""
-    from sglang.kernels.ops.moe.prism.gemv import (
-        gemv_worklist_indexed, gemv_worklist_indexed_pinned,
-    )
+    from sglang.kernels.ops.moe.prism.gemv import gemv_worklist_indexed
     x, w_flat, row_off, kidx, ids = _mk_indexed([32, 64, 96, 16])
     xd, idsd = x.cuda(), ids.int().cuda()
     ro, ki = row_off.cuda(), kidx.cuda()
@@ -302,7 +303,8 @@ def test_indexed_pinned_matches_device():
     out_d = torch.zeros(2, 4, 96, dtype=torch.bfloat16, device="cuda")
     out_p = torch.zeros_like(out_d)
     gemv_worklist_indexed(xd, idsd, w_flat.cuda(), ro, ki, out_d, 0, False, s)
-    gemv_worklist_indexed_pinned(xd, idsd, w_flat.pin_memory(), ro, ki, out_p, 0, False, s)
+    gemv_worklist_indexed(xd, idsd, w_flat.pin_memory(), ro, ki, out_p, 0, False, s,
+        on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(out_d.cpu(), out_p.cpu())
 
@@ -380,8 +382,8 @@ def test_gemv_gateup_fusion_all_four_bitwise(pinned, sparse):
 
     w = torch.rand(2, 4, generator=torch.Generator().manual_seed(23)).cuda()
     sg, su = spec(24), spec(25)
-    single = BF16.gemv(pinned=pinned, sparse=sparse)
-    fused = BF16.gemv_gateup(pinned=pinned, sparse=sparse)
+    single = functools.partial(BF16.gemv(sparse=sparse), on_device=not pinned)
+    fused = functools.partial(BF16.gemv_gateup(sparse=sparse), on_device=not pinned)
     assert fused is not None
     ref = torch.zeros(2, 4, 2 * I, dtype=torch.bfloat16, device="cuda")
     out = torch.zeros_like(ref)

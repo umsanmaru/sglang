@@ -69,8 +69,7 @@ def test_kernel_keys_cover_exactly_the_built_exports():
         key = K.PrismKernelKey(op=op, fmt=fmt, mode=mode, fused=fused)
         if K.supports(key):
             keyed.add(key.export_name())
-            for p in key.placements():
-                assert callable(K.wrapper(key, on_device=p)), key
+            assert callable(K.wrapper(key)), key
     assert keyed == built
 
     no_k1 = K.unsupported_reason(K.PrismKernelKey(op="gemv", fmt="mxfp4", mode="k1"))

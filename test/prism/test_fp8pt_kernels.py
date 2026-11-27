@@ -7,6 +7,7 @@
 - 블록판 ↔ pt 등가: 블록표를 스칼라로 채운 b128 스토어와 pt 스토어가 exact 픽스처에서 비트일치.
 - kt per-tensor cold slab(코드 타일 + 64 B 배율 슬롯) 로더.
 """
+import functools
 import os
 import sys
 
@@ -92,7 +93,7 @@ def test_gemv_fp8pt_matches_reference(pair, exact, k_rows):
 
 @cuda_required
 def test_gemv_fp8pt_pinned_bitwise_and_offset():
-    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed, gemv_fp8pt_indexed_pinned
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed
 
     N, K, k_rows, M = 128, 512, 160, 2
     codes, scales, row_off, kidx, _ = _store(N, K, k_rows, False, seed=103)
@@ -101,8 +102,9 @@ def test_gemv_fp8pt_pinned_bitwise_and_offset():
     out_d = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
     out_p = torch.zeros_like(out_d)
     gemv_fp8pt_indexed(x.cuda(), ids.cuda(), codes, scales, row_off, kidx, out_d, N, False, stream)
-    gemv_fp8pt_indexed_pinned(x.cuda(), ids.cuda(), codes.cpu().pin_memory(),
-                              scales.cpu().pin_memory(), row_off, kidx, out_p, N, False, stream)
+    gemv_fp8pt_indexed(x.cuda(), ids.cuda(), codes.cpu().pin_memory(),
+                              scales.cpu().pin_memory(), row_off, kidx, out_p, N, False, stream,
+                                  on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(out_d, out_p)
     assert torch.all(out_d[:, :, :N] == 0)
@@ -111,10 +113,7 @@ def test_gemv_fp8pt_pinned_bitwise_and_offset():
 @cuda_required
 @pytest.mark.parametrize("pinned", [False, True])
 def test_gemv_fp8pt_gateup_fused_bitwise(pinned):
-    from sglang.kernels.ops.moe.prism.gemv_fp8 import (
-        gemv_fp8pt_indexed, gemv_fp8pt_indexed_gateup,
-        gemv_fp8pt_indexed_pinned, gemv_fp8pt_indexed_pinned_gateup,
-    )
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed, gemv_fp8pt_indexed_gateup
 
     N, K, k_rows, M = 128, 256, 96, 1
     c1, s1, ro1, ki1, _ = _store(N, K, k_rows, False, seed=105)
@@ -122,8 +121,8 @@ def test_gemv_fp8pt_gateup_fused_bitwise(pinned):
     x, ids = _inputs(M, K, False, False, seed=107)
     if pinned:
         c1, s1, c2, s2 = (t.cpu().pin_memory() for t in (c1, s1, c2, s2))
-    single = gemv_fp8pt_indexed_pinned if pinned else gemv_fp8pt_indexed
-    fused = gemv_fp8pt_indexed_pinned_gateup if pinned else gemv_fp8pt_indexed_gateup
+    single = functools.partial(gemv_fp8pt_indexed, on_device=not pinned)
+    fused = functools.partial(gemv_fp8pt_indexed_gateup, on_device=not pinned)
     stream = torch.cuda.current_stream()
     ref = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
     single(x.cuda(), ids.cuda(), c1, s1, ro1, ki1, ref, 0, False, stream)
@@ -208,18 +207,15 @@ def test_gemv_fp8pt_sparsek1_thr0_bitwise_and_masked(pinned, weighted):
     죽은 k는 dense에서 x=0이라 곱이 0이고 커널은 그 라인을 안 읽을 뿐이므로 항과
     순서가 같다 — tolerance 뒤에 "엉뚱한 k를 죽였다"가 숨지 못한다.
     """
-    from sglang.kernels.ops.moe.prism.gemv_fp8 import (
-        gemv_fp8pt_indexed, gemv_fp8pt_indexed_pinned,
-        gemv_fp8pt_indexed_pinned_sparse, gemv_fp8pt_indexed_sparse,
-    )
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed, gemv_fp8pt_indexed_sparse
 
     N, K, k_rows, M = 128, 256, 160, 2
     codes, scales, row_off, kidx, _ = _store(N, K, k_rows, True, seed=131)
     x, ids = _inputs(M, K, True, False, seed=132)
     if pinned:
         codes, scales = codes.cpu().pin_memory(), scales.cpu().pin_memory()
-    dense_fn = gemv_fp8pt_indexed_pinned if pinned else gemv_fp8pt_indexed
-    sparse_fn = gemv_fp8pt_indexed_pinned_sparse if pinned else gemv_fp8pt_indexed_sparse
+    dense_fn = functools.partial(gemv_fp8pt_indexed, on_device=not pinned)
+    sparse_fn = functools.partial(gemv_fp8pt_indexed_sparse, on_device=not pinned)
     stream = torch.cuda.current_stream()
     w = torch.rand(M, TOPK, generator=torch.Generator().manual_seed(133)).cuda()
     xd, idd = x.cuda(), ids.cuda()
@@ -257,7 +253,6 @@ def test_gemv_fp8pt_sparsek1_thr0_bitwise_and_masked(pinned, weighted):
 def test_gemv_fp8pt_sparse_gateup_fused_bitwise(score):
     """per-tensor sparse gate|up fusion matches two single sparse launches, device and pinned."""
     from sglang.kernels.ops.moe.prism.gemv_fp8 import (
-        gemv_fp8pt_indexed_pinned_sparse, gemv_fp8pt_indexed_pinned_sparse_gateup,
         gemv_fp8pt_indexed_sparse, gemv_fp8pt_indexed_sparse_gateup,
     )
 
@@ -273,8 +268,9 @@ def test_gemv_fp8pt_sparse_gateup_fused_bitwise(score):
         spg, spu = _sparse_spec_k1(E, 0.3), _sparse_spec_k1(E, 0.6)
     stream = torch.cuda.current_stream()
     for single, fused, pin in ((gemv_fp8pt_indexed_sparse, gemv_fp8pt_indexed_sparse_gateup, False),
-                               (gemv_fp8pt_indexed_pinned_sparse,
-                                gemv_fp8pt_indexed_pinned_sparse_gateup, True)):
+                               (functools.partial(gemv_fp8pt_indexed_sparse, on_device=False),
+                                functools.partial(gemv_fp8pt_indexed_sparse_gateup, on_device=False),
+                                True)):
         cg, sg, cu, su = (tuple(t.cpu().pin_memory() for t in (c1, s1, c2, s2)) if pin
                           else (c1, s1, c2, s2))
         ref = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
@@ -361,7 +357,7 @@ def test_gemv_fp8pt_non_pow2_scale():
 @pytest.mark.parametrize("k_rows", [256, 160])  # 160: kr % 64 == 32 부분 K 타일
 def test_grouped_fp8pt_matches_gemv(pair, exact, m, k_rows):
     from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8pt_indexed
-    from sglang.kernels.ops.moe.prism.grouped_fp8 import grouped_fp8pt_indexed, grouped_fp8pt_indexed_pinned
+    from sglang.kernels.ops.moe.prism.grouped_fp8 import grouped_fp8pt_indexed
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K = 256, 512
@@ -377,8 +373,9 @@ def test_grouped_fp8pt_matches_gemv(pair, exact, m, k_rows):
     out = torch.zeros_like(ref)
     grouped_fp8pt_indexed(x.cuda(), grouping, codes, scales, row_off, kidx, out, 0, pair, stream)
     outp = torch.zeros_like(ref)
-    grouped_fp8pt_indexed_pinned(x.cuda(), grouping, codes.cpu().pin_memory(),
-                                 scales.cpu().pin_memory(), row_off, kidx, outp, 0, pair, stream, 64)
+    grouped_fp8pt_indexed(x.cuda(), grouping, codes.cpu().pin_memory(),
+                                 scales.cpu().pin_memory(), row_off, kidx, outp, 0, pair, stream, 64,
+                                     on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(out, outp)
     if exact:
@@ -393,8 +390,7 @@ def test_grouped_fp8pt_matches_gemv(pair, exact, m, k_rows):
 @pytest.mark.parametrize("pinned", [False, True])
 def test_grouped_fp8pt_gateup_fused(pinned):
     from sglang.kernels.ops.moe.prism.grouped_fp8 import (
-        grouped_fp8pt_indexed, grouped_fp8pt_indexed_gateup, grouped_fp8pt_indexed_pinned,
-        grouped_fp8pt_indexed_pinned_gateup,
+        grouped_fp8pt_indexed, grouped_fp8pt_indexed_gateup,
     )
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
@@ -404,8 +400,8 @@ def test_grouped_fp8pt_gateup_fused(pinned):
     x, ids = _inputs(m, K, True, False, seed=125)
     if pinned:
         c1, s1, c2, s2 = (t.cpu().pin_memory() for t in (c1, s1, c2, s2))
-    single = grouped_fp8pt_indexed_pinned if pinned else grouped_fp8pt_indexed
-    fused = grouped_fp8pt_indexed_pinned_gateup if pinned else grouped_fp8pt_indexed_gateup
+    single = functools.partial(grouped_fp8pt_indexed, on_device=not pinned)
+    fused = functools.partial(grouped_fp8pt_indexed_gateup, on_device=not pinned)
     stream = torch.cuda.current_stream()
     grouping = build_grouping(ids.cuda(), E)
     ref = torch.zeros(m, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")

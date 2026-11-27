@@ -2,7 +2,7 @@
 
 재는 것은 **두 티어가 실제로 부르는 그 커널들**이다:
 
-  warm — `gemv_worklist_indexed_pinned_sparse` (tiers.py `SparsePinnedDirectTier`;
+  warm — `gemv_worklist_indexed_sparse(on_device=False)` (tiers.py `SparsePinnedDirectTier`;
          W가 pinned host, GPU가 UVA로 제자리 읽고 죽은 페어의 로드를 발행하지
          않는다 → 건너뛴 만큼이 PCIe 절약)
   cold — kt `forward_{gateup,down}_partial` (기본 `kt_tile_k2_bf16` = TileK2BF16_MOE;
@@ -198,14 +198,15 @@ class WarmTier:
 
     def launch(self, x, ids, topk_w, out, col_off: int, *, masking: bool) -> None:
         stream = torch.cuda.current_stream()
-        fn = self.store.fmt.gemv(pinned=True, sparse=masking)
+        fn = self.store.fmt.gemv(sparse=masking)
         pair = self.split.proj == "down"
         if masking:
             self.store.call(fn, (x, ids, topk_w, *self.parts, self.row_off,
-                                 self.k_index, out, self.spec, col_off, pair, stream))
+                                 self.k_index, out, self.spec, col_off, pair, stream),
+                                     on_device=False)
         else:
             self.store.call(fn, (x, ids, *self.parts, self.row_off, self.k_index,
-                                 out, col_off, pair, stream))
+                                 out, col_off, pair, stream), on_device=False)
 
 
 # ─── cold (CPU, kt) ───────────────────────────────────────────────────────
@@ -641,7 +642,7 @@ class WarmColdProfiler:
         # 옛 경로를 재서 그 차이를 볼 수 있다. 융합 진입점이 (pinned, sparse)
         # 조합에만 있으므로 dense(prefill) 경로는 자동으로 2 launch다.
         fuse_now = fused and group == "gateup"
-        fused_fn = (self.store.fmt.gemv_gateup(pinned=True, sparse=masking)
+        fused_fn = (self.store.fmt.gemv_gateup(sparse=masking)
                     if fuse_now else None)
 
         def warm_launch(i: int) -> None:
@@ -654,7 +655,7 @@ class WarmColdProfiler:
                         (x, ids_dev[i], *wg.parts, wg.row_off, wg.k_index,
                          *wu.parts, wu.row_off, wu.k_index, out,
                          0, shape.inter, False, torch.cuda.current_stream()))
-                self.store.call(fused_fn, args)
+                self.store.call(fused_fn, args, on_device=False)
                 return
             for proj in projs:
                 warm[proj].launch(x, ids_dev[i], topk_w_dev, out, cols[proj],
@@ -866,7 +867,7 @@ class WarmColdProfiler:
             if do_check:
                 d["check"] = self.check(group)
             results[group] = d
-        warm_kernel = self.store.fmt.gemv(pinned=True, sparse=self.masking).__name__
+        warm_kernel = self.store.fmt.gemv(sparse=self.masking).__name__
         return {
             "bench": "warm_cold_sparse",
             "kernels": {"warm": warm_kernel,
@@ -937,7 +938,7 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
         warm_sparse_gemv(1792, 768, 0.9, device=1, experts=128, topk=8).us  # 실제 풀·활성 수
 
     `dense_gemv`의 sparse 짝이다: W는 pinned host에 두고 GPU가 UVA로 제자리 읽는다
-    (`gemv_worklist_indexed_pinned_sparse` — `tiers.SparsePinnedGateUp`이 부르는 그
+    (`gemv_worklist_indexed_sparse(on_device=False)` — `tiers.SparsePinnedGateUp`이 부르는 그
     커널). 죽은 페어의 로드를 발행하지 않으므로 건너뛴 만큼이 그대로 PCIe 절약이다.
 
     `per_k=True`(score k1, fp8 전용)면 마스크가 페어가 아니라 **k 행 단위**다 —
@@ -1008,11 +1009,11 @@ def warm_sparse_gemv(k: int, n: int, sparsity: float = 0.9, *, m: int = 1,
     tw = torch.full((m, topk), 1.0 / topk, dtype=torch.float32, device=dev)
     out = torch.zeros(m, topk, n, dtype=torch.bfloat16, device=dev)
 
-    fn = store.fmt.gemv(pinned=True, sparse=True)
+    fn = store.fmt.gemv(sparse=True)
 
     def launch(i: int) -> None:
         store.call(fn, (x, ids[i], tw, *parts, row_off, kidx, out, spec, 0,
-                        x_row_is_pair, torch.cuda.current_stream()))
+                        x_row_is_pair, torch.cuda.current_stream()), on_device=False)
 
     try:
         with nvtx("warm/sparse_gemv" + ("/per_k" if per_k else "")):

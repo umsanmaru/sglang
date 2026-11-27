@@ -4,6 +4,7 @@ grouped 커널은 pair를 expert로 묶어 W를 expert당 한 번 읽는다. 읽
 worklist와 같고 누산 순서만 다르므로, 정확표현 입력(작은 정수)에서는 **비트일치**,
 일반 입력에서는 tolerance다. pinned(UVA) 쌍둥이는 device 변형과 비트일치해야 한다.
 """
+import functools
 import pytest
 import torch
 
@@ -45,7 +46,6 @@ def _run_pair(m, exact, pair, pinned, fused):
     from sglang.kernels.ops.moe.prism.gemv import gemv_worklist_indexed
     from sglang.kernels.ops.moe.prism.grouped import (
         grouped_gemm_indexed, grouped_gemm_indexed_gateup,
-        grouped_gemm_indexed_pinned, grouped_gemm_indexed_pinned_gateup,
     )
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
@@ -64,10 +64,10 @@ def _run_pair(m, exact, pair, pinned, fused):
     wa = w.pin_memory() if pinned else w.cuda()
     wb = w2.pin_memory() if pinned else w2.cuda()
     if fused:
-        fn = grouped_gemm_indexed_pinned_gateup if pinned else grouped_gemm_indexed_gateup
+        fn = functools.partial(grouped_gemm_indexed_gateup, on_device=not pinned)
         fn(x, g, wa, row_off, kidx, wb, row_off2, kidx2, out, 0, n_cols, pair, stream)
     else:
-        fn = grouped_gemm_indexed_pinned if pinned else grouped_gemm_indexed
+        fn = functools.partial(grouped_gemm_indexed, on_device=not pinned)
         fn(x, g, wa, row_off, kidx, out, 0, pair, stream)
     torch.cuda.synchronize()
     return out, ref

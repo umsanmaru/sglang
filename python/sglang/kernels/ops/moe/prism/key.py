@@ -1,8 +1,8 @@
 """Kernel keys for the Prism GEMV and grouped GEMM entry points.
 
 A key names one entry point: (op, store format, sparse score, gate+up fusion). Hot and warm
-placements share the export, which takes the placement as its last argument. Support is read
-from the wrappers' export tables, so a key is supported exactly when its export is built.
+placements share the entry; the wrapper takes the placement as its `on_device` argument. Support
+is read from the wrappers' export tables, so a key is supported exactly when its export is built.
 """
 
 from __future__ import annotations
@@ -46,20 +46,10 @@ class PrismKernelKey(msgspec.Struct, frozen=True):
     mode: Mode = "dense"
     fused: bool = False
 
-    def placements(self) -> tuple[bool, ...]:
-        """on_device values with an export: cold slabs are host-only, the rest have both."""
-        return (False,) if self.op == "grouped_cold" else (True, False)
-
     def export_name(self) -> str:
         _, prefix = _FAMILY[(self.op, self.fmt)]
         gateup = "_gateup" if self.fused else ""
         return f"{prefix}{_MODE_SUFFIX[self.mode]}{gateup}"
-
-    def wrapper_name(self, *, on_device: bool) -> str:
-        _, prefix = _FAMILY[(self.op, self.fmt)]
-        pinned = "" if on_device or self.op == "grouped_cold" else "_pinned"
-        gateup = "_gateup" if self.fused else ""
-        return f"{prefix}{pinned}{_MODE_SUFFIX[self.mode]}{gateup}"
 
 
 def _module(name: str):
@@ -86,7 +76,7 @@ def supports(key: PrismKernelKey) -> bool:
     return unsupported_reason(key) is None
 
 
-def wrapper(key: PrismKernelKey, *, on_device: bool) -> Callable:
+def wrapper(key: PrismKernelKey) -> Callable:
     """Python wrapper for `key`. The sparse wrappers take every score and pick the k1/k1w
     export from the spec at call time, so a sparse key resolves to its pair-named wrapper."""
     reason = unsupported_reason(key)
@@ -95,14 +85,12 @@ def wrapper(key: PrismKernelKey, *, on_device: bool) -> Callable:
     mode = "dense" if key.mode == "dense" else "pair"
     named = PrismKernelKey(op=key.op, fmt=key.fmt, mode=mode, fused=key.fused)
     return getattr(
-        _module(_FAMILY[(key.op, key.fmt)][0]), named.wrapper_name(on_device=on_device)
+        _module(_FAMILY[(key.op, key.fmt)][0]), named.export_name()
     )
 
 
 @functools.cache
-def resolve(
-    *, op: str, fmt: str, mode: str, fused: bool, on_device: bool
-) -> Optional[Callable]:
+def resolve(*, op: str, fmt: str, mode: str, fused: bool) -> Optional[Callable]:
     """Cached wrapper lookup for the per-step tier paths; None if the key is not built."""
     key = PrismKernelKey(op=op, fmt=fmt, mode=mode, fused=fused)
-    return wrapper(key, on_device=on_device) if supports(key) else None
+    return wrapper(key) if supports(key) else None

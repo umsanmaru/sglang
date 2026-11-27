@@ -204,14 +204,14 @@ def test_warm_passes_per_k_through_for_k1(spy):
     shape = DenseShape(k=1024, n=1024, slots=2)
     r = dense_warm(shape, 0.9, dtype="fp8", kernel_type="k1", device=0)
     assert spy["warm"]["per_k"] is True
-    assert r.backend == "gemv_fp8_indexed_pinned_sparsek1"
+    assert r.backend == "gemv_fp8_indexed_sparsek1"
     # 나머지 변종은 페어 마스크 그대로
-    for kt, entry in (("k2", "gemv_fp8_indexed_pinned_sparse"),
-                      ("pt", "gemv_fp8pt_indexed_pinned_sparse")):
+    for kt, entry in (("k2", "gemv_fp8_indexed_sparse"),
+                      ("pt", "gemv_fp8pt_indexed_sparse")):
         assert dense_warm(shape, 0.9, dtype="fp8", kernel_type=kt).backend == entry
         assert spy["warm"]["per_k"] is False
     assert dense_warm(DenseShape(k=512, n=512), 0.9, dtype="bf16").backend == \
-        "gemv_worklist_indexed_pinned_sparse"
+        "gemv_worklist_indexed_sparse"
     assert spy["warm"]["per_k"] is False
 
 
@@ -233,12 +233,11 @@ def test_backends_rows_enumerate_every_selectable_combo():
     assert by[("fp8", "pt")]["store"] == "fp8pt" and by[("fp8", "pt")]["k_align"] == 32
     assert by[("fp8", "k2")]["k_align"] == 128
     assert all(r["warm"] for r in rows), "다섯 조합 모두 warm이 있다"
-    assert by[("fp8", "k1")]["warm_gpu"] == "gemv_fp8_indexed_pinned_sparsek1"
+    assert by[("fp8", "k1")]["warm_gpu"] == "gemv_fp8_indexed_sparsek1"
     assert by[("bf16", None)]["has_vec"] is True
     for r in rows:
         assert r["hot_gpu"].endswith("_indexed")
-        assert r["warm_gpu"].endswith("_pinned_sparse" if r["kernel_type"] != "k1"
-                                      else "_pinned_sparsek1")
+        assert r["warm_gpu"].endswith("_sparse" if r["kernel_type"] != "k1" else "_sparsek1")
 
 
 # ── MoE Shape 과의 변환 ─────────────────────────────────────────────

@@ -103,7 +103,7 @@ def dense_backends() -> tuple:
                "has_vec": store.has_vec,
                "warm": True}
         try:
-            row["hot_gpu"] = store.fmt.gemv(pinned=False, sparse=False).__name__
+            row["hot_gpu"] = store.fmt.gemv(sparse=False).__name__
             row["warm_gpu"] = _warm_entry(store, per_k=kt == "k1")
         except ValueError as e:                    # GPU 진입점이 없는 스토어 (cold 전용)
             row["hot_gpu"] = row["warm_gpu"] = None
@@ -229,7 +229,7 @@ def _check(shape: DenseShape, store, kernel, *, tier: str):
 
 def _warm_entry(store, *, per_k: bool) -> str:
     """warm이 실제로 부르는 진입점 이름. per-k는 jit 래퍼가 `sparse`를 `sparsek1`로 바꾼다."""
-    name = store.fmt.gemv(pinned=True, sparse=True).__name__
+    name = store.fmt.gemv(sparse=True).__name__
     return name.replace("sparse", "sparsek1") if per_k else name
 
 
@@ -264,7 +264,7 @@ def dense_hot(shape: DenseShape, *, dtype: str = "bf16",
         keep_frac=1.0, tokens=m, timing=r.timing,
         weight_bytes=store.store_bytes(1, shape.k, shape.n),
         store_mb=r.w_store_mb,
-        backend=store.fmt.gemv(pinned=False, sparse=False).__name__,
+        backend=store.fmt.gemv(sparse=False).__name__,
         raw={"bytes_per_launch": r.w_bytes_per_launch, "gbps_worklist": r.gbps},
     )
 

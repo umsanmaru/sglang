@@ -108,14 +108,11 @@ class LinearStoreFormat:
         """커널 래퍼의 스토어 인자 (bf16: (w_flat,), fp8: (w_flat, s_flat))."""
         return (shard.w_flat,) if not self.has_scales else (shard.w_flat, shard.s_flat)
 
-    def _kernel(
-        self, op: str, *, pinned: bool, sparse: bool = False, fused: bool = False
-    ):
-        """Wrapper of this store's (op, sparse, fused) entry; None if that entry is not built."""
+    def _kernel(self, op: str, *, sparse: bool = False, fused: bool = False):
+        """Wrapper of this store's (op, sparse, fused) entry; None if that entry is not built.
+        Hot and warm stores share it and pass their placement as `on_device` at call time."""
         mode = "pair" if sparse else "dense"
-        return resolve_kernel(
-            op=op, fmt=self.name, mode=mode, fused=fused, on_device=not pinned
-        )
+        return resolve_kernel(op=op, fmt=self.name, mode=mode, fused=fused)
 
     def _required(self, op: str, **kw):
         fn = self._kernel(op, **kw)
@@ -123,17 +120,17 @@ class LinearStoreFormat:
             raise NotImplementedError(f"{self.name} store has no {op} kernel for {kw}")
         return fn
 
-    def gemv(self, *, pinned: bool, sparse: bool):
-        return self._required("gemv", pinned=pinned, sparse=sparse)
+    def gemv(self, *, sparse: bool):
+        return self._required("gemv", sparse=sparse)
 
-    def grouped(self, *, pinned: bool):
+    def grouped(self):
         """prefill 진입점 — W를 **한 번만** 읽는다.
 
         worklist(`gemv`)는 pair마다 W를 다시 읽는데, dense는 E=1이라 중복도가 곧 M이다
         (MoE는 M·k/E). warm은 그 재읽기가 전부 PCIe라 M=2048에서 층당 수 초가 된다 —
         실측 2026-09-01: Qwen3.8 전체 warm 43.8 GB × 2048 = 89.7 TB, 30분/forward.
         """
-        return self._required("grouped", pinned=pinned)
+        return self._required("grouped")
 
     def warmup(self) -> None:
         """JIT 컴파일을 startup으로 앞당긴다 (캡처 워밍업에 얽히지 않게)."""

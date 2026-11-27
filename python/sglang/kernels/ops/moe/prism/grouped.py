@@ -86,81 +86,62 @@ def warmup_jit() -> None:
 
 
 def grouped_gemm_indexed(x2d, grouping, w_flat, row_off, kidx, out3d,
-                         out_col_offset, x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
-    """out3d[m, j, off:off+N] = x_row · W[topk[m,j]] — device W (HOT), expert 그룹 GEMM.
+                         out_col_offset, x_row_is_pair, stream, max_blocks=0, wres_k_max=0,
+                         *, on_device: bool = True) -> None:
+    """out3d[m, j, off:off+N] = x_row · W[topk[m,j]], expert 그룹 GEMM (W를 expert당 한 번 읽는다).
 
     `grouping`은 `build_grouping(topk_ids, E)`의 결과다. x_row 규약은 worklist와
     같다: gateup은 hidden [M, K](False), down은 act.view(M·top_k, inter)(True).
+    on_device=False(WARM, pinned W)이고 buffered prefill이 켜져 있으면 그 경로로 간다.
     """
+    if not on_device:
+        from sglang.kernels.ops.moe.prism.prefill import (
+            Projection,
+            enabled,
+            grouped_prefill,
+        )
+        if enabled(out3d, grouping, stream):
+            p = Projection(w_flat, row_off, kidx, w_flat.shape[1],
+                           rows_host=getattr(w_flat, "_prism_prefill_rows", ()))
+            grouped_prefill(x2d, grouping, [(p, out_col_offset)], out3d, x_row_is_pair, stream)
+            return
     module = _jit_prism_grouped_module()
     with torch.cuda.stream(stream):
         module.grouped_gemm_indexed(
             x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
             w_flat, row_off, kidx, out3d, int(out_col_offset), int(bool(x_row_is_pair)),
-            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max), 1)
-
-
-def grouped_gemm_indexed_pinned(x2d, grouping, w_flat, row_off, kidx, out3d,
-                         out_col_offset, x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
-    """위의 쌍둥이 — W가 pinned CPU(UVA 제자리 읽기, WARM). expert당 W를 **한 번만**
-    PCIe로 읽는다 — worklist의 pair당 재읽기(중복도 M·k/E)가 사라진 자리다."""
-    from sglang.kernels.ops.moe.prism.prefill import (
-        Projection,
-        enabled,
-        grouped_prefill,
-    )
-    if enabled(out3d, grouping, stream):
-        p = Projection(w_flat, row_off, kidx, w_flat.shape[1],
-                       rows_host=getattr(w_flat, "_prism_prefill_rows", ()))
-        grouped_prefill(x2d, grouping, [(p, out_col_offset)], out3d, x_row_is_pair, stream)
-        return
-    module = _jit_prism_grouped_module()
-    with torch.cuda.stream(stream):
-        module.grouped_gemm_indexed(
-            x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
-            w_flat, row_off, kidx, out3d, int(out_col_offset), int(bool(x_row_is_pair)),
-            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max), 0)
+            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max),
+            int(bool(on_device)))
 
 
 def grouped_gemm_indexed_gateup(x2d, grouping, w_gate, row_off_gate, kidx_gate,
                                 w_up, row_off_up, kidx_up, out3d,
                                 out_col_gate, out_col_up, x_row_is_pair,
-                                stream, max_blocks=0, wres_k_max=0) -> None:
-    """gate와 up을 한 launch로 (device W). blockIdx.z가 슬롯을 고른다."""
+                                stream, max_blocks=0, wres_k_max=0, *,
+                                    on_device: bool = True) -> None:
+    """gate와 up을 한 launch로. blockIdx.z가 슬롯을 고른다."""
+    if not on_device:
+        from sglang.kernels.ops.moe.prism.prefill import (
+            Projection,
+            enabled,
+            grouped_prefill,
+        )
+        if enabled(out3d, grouping, stream):
+            gate = Projection(w_gate, row_off_gate, kidx_gate, w_gate.shape[1],
+                              rows_host=getattr(w_gate, "_prism_prefill_rows", ()))
+            up = Projection(w_up, row_off_up, kidx_up, w_up.shape[1],
+                            rows_host=getattr(w_up, "_prism_prefill_rows", ()))
+            grouped_prefill(x2d, grouping, [(gate, out_col_gate), (up, out_col_up)],
+                            out3d, x_row_is_pair, stream)
+            return
     module = _jit_prism_grouped_module()
     with torch.cuda.stream(stream):
         module.grouped_gemm_indexed_gateup(
             x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
             w_gate, row_off_gate, kidx_gate, w_up, row_off_up, kidx_up, out3d,
             int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
-            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max), 1)
-
-
-def grouped_gemm_indexed_pinned_gateup(x2d, grouping, w_gate, row_off_gate,
-                                       kidx_gate, w_up, row_off_up, kidx_up,
-                                       out3d, out_col_gate, out_col_up,
-                                       x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
-    """gate+up 융합의 warm 짝 (pinned W)."""
-    from sglang.kernels.ops.moe.prism.prefill import (
-        Projection,
-        enabled,
-        grouped_prefill,
-    )
-    if enabled(out3d, grouping, stream):
-        gate = Projection(w_gate, row_off_gate, kidx_gate, w_gate.shape[1],
-                          rows_host=getattr(w_gate, "_prism_prefill_rows", ()))
-        up = Projection(w_up, row_off_up, kidx_up, w_up.shape[1],
-                        rows_host=getattr(w_up, "_prism_prefill_rows", ()))
-        grouped_prefill(x2d, grouping, [(gate, out_col_gate), (up, out_col_up)],
-                        out3d, x_row_is_pair, stream)
-        return
-    module = _jit_prism_grouped_module()
-    with torch.cuda.stream(stream):
-        module.grouped_gemm_indexed_gateup(
-            x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
-            w_gate, row_off_gate, kidx_gate, w_up, row_off_up, kidx_up, out3d,
-            int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
-            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max), 0)
+            int(max_blocks), int(wres_k_max), _scratch(out3d, wres_k_max),
+            int(bool(on_device)))
 
 
 def grouped_gemm_cold(x2d, grouping, cold, out3d, out_col_offset, x_row_is_pair,

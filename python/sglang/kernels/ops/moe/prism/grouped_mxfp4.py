@@ -54,41 +54,37 @@ def warmup_jit() -> None:
 
 
 def _single(name):
-    export = name.replace("_pinned", "")
-    on_device = int("_pinned" not in name)
     def fn(x2d, grouping, codes, scales, row_off, kidx, out3d, out_col_offset,
-           x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
+           x_row_is_pair, stream, max_blocks=0, wres_k_max=0, *,
+           on_device: bool = True) -> None:
         module = _jit_prism_grouped_mxfp4_module()
         with torch.cuda.stream(stream):
-            getattr(module, export)(
+            getattr(module, name)(
                 x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
                 codes, scales, row_off, kidx, out3d, int(out_col_offset),
-                int(bool(x_row_is_pair)), int(max_blocks), on_device)
+                int(bool(x_row_is_pair)), int(max_blocks), int(bool(on_device)))
     fn.__name__ = name
     return fn
 
 
 def _gateup(name):
-    export = name.replace("_pinned", "")
-    on_device = int("_pinned" not in name)
     def fn(x2d, grouping, codes_g, scales_g, row_off_g, kidx_g,
            codes_u, scales_u, row_off_u, kidx_u, out3d,
-           out_col_gate, out_col_up, x_row_is_pair, stream, max_blocks=0, wres_k_max=0) -> None:
+           out_col_gate, out_col_up, x_row_is_pair, stream, max_blocks=0, wres_k_max=0, *,
+           on_device: bool = True) -> None:
         module = _jit_prism_grouped_mxfp4_module()
         with torch.cuda.stream(stream):
-            getattr(module, export)(
+            getattr(module, name)(
                 x2d, grouping.pair_sorted, grouping.pair_off, grouping.tile_off,
                 codes_g, scales_g, row_off_g, kidx_g, codes_u, scales_u, row_off_u, kidx_u,
                 out3d, int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
-                int(max_blocks), on_device)
+                int(max_blocks), int(bool(on_device)))
     fn.__name__ = name
     return fn
 
 
 grouped_mxfp4_indexed = _single("grouped_mxfp4_indexed")
-grouped_mxfp4_indexed_pinned = _single("grouped_mxfp4_indexed_pinned")
 grouped_mxfp4_indexed_gateup = _gateup("grouped_mxfp4_indexed_gateup")
-grouped_mxfp4_indexed_pinned_gateup = _gateup("grouped_mxfp4_indexed_pinned_gateup")
 
 
 def grouped_mxfp4_cold(x2d, grouping, cold, out3d, out_col_offset, x_row_is_pair,

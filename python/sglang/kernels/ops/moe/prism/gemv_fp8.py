@@ -74,39 +74,36 @@ def warmup_jit() -> None:
 
 
 def _dense(name):
-    export = name.replace("_pinned", "")
-    on_device = int("_pinned" not in name)
     def fn(x2d, topk_ids, codes, scales, row_off, kidx, out3d, out_col_offset,
-           x_row_is_pair, stream) -> None:
+           x_row_is_pair, stream, *, on_device: bool = True) -> None:
         module = _jit_prism_gemv_fp8_module()
         with torch.cuda.stream(stream):
-            getattr(module, export)(x2d, topk_ids, codes, scales, row_off, kidx, out3d,
-                                  int(out_col_offset), int(bool(x_row_is_pair)), on_device)
+            getattr(module, name)(x2d, topk_ids, codes, scales, row_off, kidx, out3d,
+                                  int(out_col_offset), int(bool(x_row_is_pair)),
+                                  int(bool(on_device)))
     fn.__name__ = name
     return fn
 
 
 def _sparse(name):
-    export = name.replace("_pinned", "")
-    on_device = int("_pinned" not in name)
     def fn(x2d, topk_ids, topk_weights, codes, scales, row_off, kidx, out3d, sp,
-           out_col_offset, x_row_is_pair, stream) -> None:
+           out_col_offset, x_row_is_pair, stream, *, on_device: bool = True) -> None:
         module = _jit_prism_gemv_fp8_module()
         tail = (int(out_col_offset), int(bool(x_row_is_pair)),
                 float(sp.p), float(sp.lam), float(sp.pmax), float(sp.grid), int(sp.ng), int(sp.renorm_it),
-                on_device)
+                int(bool(on_device)))
         with torch.cuda.stream(stream):
             if _per_k_w(sp):
-                getattr(module, export.replace("sparse", "sparsek1w"))(
+                getattr(module, name.replace("sparse", "sparsek1w"))(
                     x2d, topk_ids, codes, scales, row_off, kidx, out3d, sp.a, sp.thr,
                     topk_weights, keep_ctr_arg(sp), *tail)
                 return
             if _per_k(sp):
-                getattr(module, export.replace("sparse", "sparsek1"))(
+                getattr(module, name.replace("sparse", "sparsek1"))(
                     x2d, topk_ids, codes, scales, row_off, kidx, out3d, sp.thr, topk_weights,
                     keep_ctr_arg(sp), *tail)
             else:
-                getattr(module, export)(
+                getattr(module, name)(
                     x2d, topk_ids, codes, scales, row_off, kidx, out3d,
                     sp.a, sp.c, sp.thr, topk_weights, keep_ctr_arg(sp), *tail)
     fn.__name__ = name
@@ -114,27 +111,23 @@ def _sparse(name):
 
 
 def _dense_gateup(name):
-    export = name.replace("_pinned", "")
-    on_device = int("_pinned" not in name)
     def fn(x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
            codes_u, scales_u, row_off_u, kidx_u, out3d,
-           out_col_gate, out_col_up, x_row_is_pair, stream) -> None:
+           out_col_gate, out_col_up, x_row_is_pair, stream, *, on_device: bool = True) -> None:
         module = _jit_prism_gemv_fp8_module()
         with torch.cuda.stream(stream):
-            getattr(module, export)(
+            getattr(module, name)(
                 x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
                 codes_u, scales_u, row_off_u, kidx_u, out3d,
-                int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), on_device)
+                int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)), int(bool(on_device)))
     fn.__name__ = name
     return fn
 
 
 def _sparse_gateup(name):
-    export = name.replace("_pinned", "")
-    on_device = int("_pinned" not in name)
     def fn(x2d, topk_ids, topk_weights, codes_g, scales_g, row_off_g, kidx_g,
            codes_u, scales_u, row_off_u, kidx_u, out3d, sp_gate, sp_up,
-           out_col_gate, out_col_up, x_row_is_pair, stream) -> None:
+           out_col_gate, out_col_up, x_row_is_pair, stream, *, on_device: bool = True) -> None:
         for f in ("pmax", "grid", "ng", "renorm_it", "per_k"):
             if getattr(sp_gate, f, False) != getattr(sp_up, f, False):
                 raise ValueError(f"gateup fusion requires a shared sparsity budget; "
@@ -143,16 +136,16 @@ def _sparse_gateup(name):
         tail = (int(out_col_gate), int(out_col_up), int(bool(x_row_is_pair)),
                 float(sp_gate.p), float(sp_gate.lam), float(sp_up.p), float(sp_up.lam),
                 float(sp_gate.pmax), float(sp_gate.grid), int(sp_gate.ng), int(sp_gate.renorm_it),
-                on_device)
+                int(bool(on_device)))
         with torch.cuda.stream(stream):
             if _per_k(sp_gate):
-                getattr(module, export.replace("sparse", "sparsek1"))(
+                getattr(module, name.replace("sparse", "sparsek1"))(
                     x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
                     codes_u, scales_u, row_off_u, kidx_u, out3d,
                     sp_gate.thr, sp_up.thr, topk_weights,
                     keep_ctr_arg(sp_gate), keep_ctr_arg(sp_up), *tail)
             else:
-                getattr(module, export)(
+                getattr(module, name)(
                     x2d, topk_ids, codes_g, scales_g, row_off_g, kidx_g,
                     codes_u, scales_u, row_off_u, kidx_u, out3d,
                     sp_gate.a, sp_gate.c, sp_gate.thr, sp_up.a, sp_up.c, sp_up.thr, topk_weights,
@@ -161,22 +154,14 @@ def _sparse_gateup(name):
     return fn
 
 
-# device-상주(HOT) / pinned(WARM) 쌍둥이. 커널 코드는 하나이고 host 검증만 갈린다 (계약 ①).
+# HOT(device W)과 WARM(pinned W)은 같은 진입점이고 `on_device`로 host 검증만 갈린다 (계약 ①).
 gemv_fp8_indexed = _dense("gemv_fp8_indexed")
-gemv_fp8_indexed_pinned = _dense("gemv_fp8_indexed_pinned")
 gemv_fp8_indexed_sparse = _sparse("gemv_fp8_indexed_sparse")
-gemv_fp8_indexed_pinned_sparse = _sparse("gemv_fp8_indexed_pinned_sparse")
 gemv_fp8_indexed_gateup = _dense_gateup("gemv_fp8_indexed_gateup")
-gemv_fp8_indexed_pinned_gateup = _dense_gateup("gemv_fp8_indexed_pinned_gateup")
 gemv_fp8_indexed_sparse_gateup = _sparse_gateup("gemv_fp8_indexed_sparse_gateup")
-gemv_fp8_indexed_pinned_sparse_gateup = _sparse_gateup("gemv_fp8_indexed_pinned_sparse_gateup")
 
 # per-tensor 배율 쌍둥이 — 같은 호출 규약, scales만 [E].
 gemv_fp8pt_indexed = _dense("gemv_fp8pt_indexed")
-gemv_fp8pt_indexed_pinned = _dense("gemv_fp8pt_indexed_pinned")
 gemv_fp8pt_indexed_sparse = _sparse("gemv_fp8pt_indexed_sparse")
-gemv_fp8pt_indexed_pinned_sparse = _sparse("gemv_fp8pt_indexed_pinned_sparse")
 gemv_fp8pt_indexed_gateup = _dense_gateup("gemv_fp8pt_indexed_gateup")
-gemv_fp8pt_indexed_pinned_gateup = _dense_gateup("gemv_fp8pt_indexed_pinned_gateup")
 gemv_fp8pt_indexed_sparse_gateup = _sparse_gateup("gemv_fp8pt_indexed_sparse_gateup")
-gemv_fp8pt_indexed_pinned_sparse_gateup = _sparse_gateup("gemv_fp8pt_indexed_pinned_sparse_gateup")

@@ -241,8 +241,8 @@ def test_fp8pt_store_maps_to_pt_kernels():
     assert st.k_align == 32 and st.rows_step() == 32     # GPU row_off·kt pack 타일이 32 배수
     assert N_ALIGN["kt_tile_k2_fp8pt"] == 256
     assert st.fmt.name == "fp8pt"
-    assert st.fmt.gemv(pinned=True, sparse=True).__name__ == "gemv_fp8pt_indexed_pinned_sparse"
-    assert st.fmt.gemv_gateup(pinned=False, sparse=False).__name__ == "gemv_fp8pt_indexed_gateup"
+    assert st.fmt.gemv(sparse=True).__name__ == "gemv_fp8pt_indexed_sparse"
+    assert st.fmt.gemv_gateup(sparse=False).__name__ == "gemv_fp8pt_indexed_gateup"
     E, k, n = 3, 96, 256                                  # k % 32 == 0, 128 배수 아님
     codes, scales = st.cold_store(E, n, k)
     assert codes.shape == (E * n * k,) and codes.dtype is torch.uint8

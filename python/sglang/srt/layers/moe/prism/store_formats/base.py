@@ -77,10 +77,10 @@ class StoreFormat:
         raise NotImplementedError
 
     def grouped_cold(self):
-        return self._required("grouped_cold", pinned=True)
+        return self._required("grouped_cold")
 
     def grouped_cold_gateup(self):
-        return self._required("grouped_cold", pinned=True, fused=True)
+        return self._required("grouped_cold", fused=True)
 
     # ── 로딩: 파라미터 ───────────────────────────────────────────────────
     def create_params(self, layer, num_experts: int, hidden: int, inter: int,
@@ -120,14 +120,11 @@ class StoreFormat:
         """커널 래퍼의 스토어 인자 (bf16: (w_flat,), mxfp4: (w_flat, s_flat))."""
         return (shard.w_flat,) if not self.has_scales else (shard.w_flat, shard.s_flat)
 
-    def _kernel(
-        self, op: str, *, pinned: bool, sparse: bool = False, fused: bool = False
-    ):
-        """Wrapper of this store's (op, sparse, fused) entry; None if that entry is not built."""
+    def _kernel(self, op: str, *, sparse: bool = False, fused: bool = False):
+        """Wrapper of this store's (op, sparse, fused) entry; None if that entry is not built.
+        Hot and warm stores share it and pass their placement as `on_device` at call time."""
         mode = "pair" if sparse else "dense"
-        return resolve_kernel(
-            op=op, fmt=self.name, mode=mode, fused=fused, on_device=not pinned
-        )
+        return resolve_kernel(op=op, fmt=self.name, mode=mode, fused=fused)
 
     def _required(self, op: str, **kw):
         fn = self._kernel(op, **kw)
@@ -135,18 +132,18 @@ class StoreFormat:
             raise NotImplementedError(f"{self.name} store has no {op} kernel for {kw}")
         return fn
 
-    def gemv(self, *, pinned: bool, sparse: bool):
-        return self._required("gemv", pinned=pinned, sparse=sparse)
+    def gemv(self, *, sparse: bool):
+        return self._required("gemv", sparse=sparse)
 
-    def gemv_gateup(self, *, pinned: bool, sparse: bool):
+    def gemv_gateup(self, *, sparse: bool):
         """gate+up 융합 진입점. 그 조합의 진입점이 없으면 None (2회 launch)."""
-        return self._kernel("gemv", pinned=pinned, sparse=sparse, fused=True)
+        return self._kernel("gemv", sparse=sparse, fused=True)
 
-    def grouped(self, *, pinned: bool):
-        return self._required("grouped", pinned=pinned)
+    def grouped(self):
+        return self._required("grouped")
 
-    def grouped_gateup(self, *, pinned: bool):
-        return self._required("grouped", pinned=pinned, fused=True)
+    def grouped_gateup(self):
+        return self._required("grouped", fused=True)
 
     def wres_k_max(self, *shards) -> int:
         """PCIe grouped launch을 W-resident 커널로 보낼 때의 k_max (0 = 스트리밍 커널)."""

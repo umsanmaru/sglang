@@ -2,8 +2,8 @@
 
 계약 ①이 "hot과 warm의 계산 계약은 완전히 동일하다"고 못박은 것을 타입으로
 표현한다. 두 구현은 스토어가 device냐 pinned냐 하나로만 갈리고 커널·출력
-레이아웃·호출 규약이 같다 — `gemv_worklist_indexed`와 그 pinned 쌍둥이의
-차이가 곧 이 두 클래스의 차이 전부다.
+레이아웃·호출 규약이 같다 — 진입점에 넘기는 `on_device` 한 값이 곧 이 두
+클래스의 차이 전부다.
 
 warm이 "전송"되던 시절에는 `stage → arena → GEMM`이라는 별도 사슬이 필요했다.
 제자리 UVA 읽기가 되면서 그 사슬이 포인터 종류 하나로 축소됐고, 그래서
@@ -115,15 +115,17 @@ class _IndexedTier:
             x_row_is_pair, masking, grouping=None) -> None:
         s = self.shard
         if grouping is not None:
-            s.fmt.grouped(pinned=self.pinned)(
+            s.fmt.grouped()(
                 x2d, grouping, *s.store_args(), s.row_off, s.k_index, out3d,
                 out_col_off, x_row_is_pair, torch.cuda.current_stream(),
                 self._grouped_max_blocks(), self._grouped_wres(),
+                on_device=not self.pinned,
             )
             return
-        s.fmt.gemv(pinned=self.pinned, sparse=False)(
+        s.fmt.gemv(sparse=False)(
             x2d, topk_ids, *s.store_args(), s.row_off, s.k_index, out3d,
             out_col_off, x_row_is_pair, torch.cuda.current_stream(),
+            on_device=not self.pinned,
         )
 
 
@@ -147,16 +149,18 @@ class _SparseIndexedTier:
         stream = torch.cuda.current_stream()
         if grouping is not None:
             _reject_masked_grouping(masking)
-            s.fmt.grouped(pinned=self.pinned)(
+            s.fmt.grouped()(
                 x2d, grouping, *s.store_args(), s.row_off, s.k_index, out3d,
                 out_col_off, x_row_is_pair, stream, self._grouped_max_blocks(),
                 self._grouped_wres(),
+                on_device=not self.pinned,
             )
             return
         if not masking:
-            s.fmt.gemv(pinned=self.pinned, sparse=False)(
+            s.fmt.gemv(sparse=False)(
                 x2d, topk_ids, *s.store_args(), s.row_off, s.k_index, out3d,
                 out_col_off, x_row_is_pair, stream,
+                on_device=not self.pinned,
             )
             return
         # 커널이 fp32 라우터 가중을 요구한다 (kt의 slot_sparsity와 같은 타입).
@@ -166,9 +170,10 @@ class _SparseIndexedTier:
             raise TypeError(
                 f"sparse tier requires fp32 topk_weights, got {topk_weights.dtype}"
             )
-        s.fmt.gemv(pinned=self.pinned, sparse=True)(
+        s.fmt.gemv(sparse=True)(
             x2d, topk_ids, topk_weights, *s.store_args(), s.row_off, s.k_index, out3d,
             self.spec, out_col_off, x_row_is_pair, stream,
+            on_device=not self.pinned,
         )
 
 
@@ -264,22 +269,23 @@ class _GateUpDense:
         stream = torch.cuda.current_stream()
         fmt = self._fmt()
         if grouping is not None:
-            _run_grouped_gateup(fmt.grouped_gateup(pinned=self.pinned), self.gate, self.up, x2d,
+            _run_grouped_gateup(fmt.grouped_gateup(), self.gate, self.up, x2d,
                                 grouping, out3d, inter, stream,
-                                self._grouped_max_blocks(), self._grouped_wres())
+                                self._grouped_max_blocks(), self._grouped_wres(),
+                                on_device=not self.pinned)
             return
-        fused = fmt.gemv_gateup(pinned=self.pinned, sparse=False) if _worth_fusing(x2d) else None
+        fused = fmt.gemv_gateup(sparse=False) if _worth_fusing(x2d) else None
         if fused is not None:
             fused(x2d, topk_ids,
                   *self.gate.store_args(), self.gate.row_off, self.gate.k_index,
                   *self.up.store_args(), self.up.row_off, self.up.k_index,
-                  out3d, 0, inter, False, stream)
+                  out3d, 0, inter, False, stream, on_device=not self.pinned)
             return
-        fn = fmt.gemv(pinned=self.pinned, sparse=False)
+        fn = fmt.gemv(sparse=False)
         fn(x2d, topk_ids, *self.gate.store_args(), self.gate.row_off, self.gate.k_index,
-           out3d, 0, False, stream)
+           out3d, 0, False, stream, on_device=not self.pinned)
         fn(x2d, topk_ids, *self.up.store_args(), self.up.row_off, self.up.k_index,
-           out3d, inter, False, stream)
+           out3d, inter, False, stream, on_device=not self.pinned)
 
 
 @dataclass(frozen=True)
@@ -310,42 +316,44 @@ class _GateUpSparse:
         fmt = self._fmt()
         if grouping is not None:
             _reject_masked_grouping(masking)
-            _run_grouped_gateup(fmt.grouped_gateup(pinned=self.pinned), self.gate, self.up, x2d,
+            _run_grouped_gateup(fmt.grouped_gateup(), self.gate, self.up, x2d,
                                 grouping, out3d, inter, stream,
-                                self._grouped_max_blocks(), self._grouped_wres())
+                                self._grouped_max_blocks(), self._grouped_wres(),
+                                on_device=not self.pinned)
             return
         if not masking:
             # prefill은 dense다 (계약 ①). 융합 진입점이 없는 조합은 2회 launch인데, prefill은
             # M이 커서 grid.y = M×top_k만으로 블록이 수천 개라 융합의 이득(블록 배증)이 없다.
-            fused = fmt.gemv_gateup(pinned=self.pinned, sparse=False) if _worth_fusing(x2d) else None
+            fused = fmt.gemv_gateup(sparse=False) if _worth_fusing(x2d) else None
             if fused is not None:
                 fused(x2d, topk_ids,
                       *self.gate.store_args(), self.gate.row_off, self.gate.k_index,
                       *self.up.store_args(), self.up.row_off, self.up.k_index,
-                      out3d, 0, inter, False, stream)
+                      out3d, 0, inter, False, stream, on_device=not self.pinned)
                 return
-            fn = fmt.gemv(pinned=self.pinned, sparse=False)
+            fn = fmt.gemv(sparse=False)
             fn(x2d, topk_ids, *self.gate.store_args(), self.gate.row_off,
-               self.gate.k_index, out3d, 0, False, stream)
+               self.gate.k_index, out3d, 0, False, stream, on_device=not self.pinned)
             fn(x2d, topk_ids, *self.up.store_args(), self.up.row_off, self.up.k_index,
-               out3d, inter, False, stream)
+               out3d, inter, False, stream, on_device=not self.pinned)
             return
         if topk_weights.dtype is not torch.float32:
             raise TypeError(
                 f"sparse tier requires fp32 topk_weights, got {topk_weights.dtype}"
             )
-        fused = fmt.gemv_gateup(pinned=self.pinned, sparse=True) if _worth_fusing(x2d) else None
+        fused = fmt.gemv_gateup(sparse=True) if _worth_fusing(x2d) else None
         if fused is not None:
             fused(x2d, topk_ids, topk_weights,
                   *self.gate.store_args(), self.gate.row_off, self.gate.k_index,
                   *self.up.store_args(), self.up.row_off, self.up.k_index,
-                  out3d, self.gate_spec, self.up_spec, 0, inter, False, stream)
+                  out3d, self.gate_spec, self.up_spec, 0, inter, False, stream,
+                  on_device=not self.pinned)
             return
-        fn = fmt.gemv(pinned=self.pinned, sparse=True)
+        fn = fmt.gemv(sparse=True)
         fn(x2d, topk_ids, topk_weights, *self.gate.store_args(), self.gate.row_off,
-           self.gate.k_index, out3d, self.gate_spec, 0, False, stream)
+           self.gate.k_index, out3d, self.gate_spec, 0, False, stream, on_device=not self.pinned)
         fn(x2d, topk_ids, topk_weights, *self.up.store_args(), self.up.row_off,
-           self.up.k_index, out3d, self.up_spec, inter, False, stream)
+           self.up.k_index, out3d, self.up_spec, inter, False, stream, on_device=not self.pinned)
 
 
 def _reject_masked_grouping(masking: bool) -> None:
@@ -378,13 +386,13 @@ def _warm_max_blocks() -> int:
 
 def _run_grouped_gateup(fn, gate: TierShard, up: TierShard, x2d, grouping,
                         out3d, inter: int, stream, max_blocks: int = 0,
-                        wres_k_max: int = 0) -> None:
+                        wres_k_max: int = 0, *, on_device: bool) -> None:
     """gate+up을 grouped GEMM **한 launch**로. 두 티어 구현(device/pinned)이
     공유하는 호출 형태."""
     fn(x2d, grouping,
        *gate.store_args(), gate.row_off, gate.k_index,
        *up.store_args(), up.row_off, up.k_index,
-       out3d, 0, inter, False, stream, max_blocks, wres_k_max)
+       out3d, 0, inter, False, stream, max_blocks, wres_k_max, on_device=on_device)
 
 
 def _worth_fusing(x2d: torch.Tensor) -> bool:

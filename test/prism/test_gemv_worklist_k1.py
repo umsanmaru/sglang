@@ -14,6 +14,7 @@ per-k 마스킹이 조용히 틀리는 방식이 둘 있고, 각각을 한 테�
 성립하는 자리).
 """
 
+import functools
 import pytest
 import torch
 
@@ -60,15 +61,14 @@ def _masked_x(x, thr):
 @pytest.mark.parametrize("pinned", [False, True])
 def test_sparsek1_thr0_is_dense_bitwise(pinned):
     from sglang.kernels.ops.moe.prism.gemv import (
-        gemv_worklist_indexed, gemv_worklist_indexed_pinned,
-        gemv_worklist_indexed_pinned_sparse, gemv_worklist_indexed_sparse,
+        gemv_worklist_indexed, gemv_worklist_indexed_sparse,
     )
 
     x, w, row_off, kidx, ids, wts = _store(seed=11)
     if pinned:
         w = w.cpu().pin_memory()
-    dense_fn = gemv_worklist_indexed_pinned if pinned else gemv_worklist_indexed
-    sparse_fn = gemv_worklist_indexed_pinned_sparse if pinned else gemv_worklist_indexed_sparse
+    dense_fn = functools.partial(gemv_worklist_indexed, on_device=not pinned)
+    sparse_fn = functools.partial(gemv_worklist_indexed_sparse, on_device=not pinned)
     s = torch.cuda.current_stream()
 
     dense = torch.zeros(M, TOPK, N, dtype=torch.bfloat16, device="cuda")
@@ -84,16 +84,15 @@ def test_sparsek1_thr0_is_dense_bitwise(pinned):
 def test_sparsek1_masks_what_it_says(pinned):
     """thr>0 ↔ 마스킹된 dense와 **비트일치**, 그리고 실제로 일부만 산다."""
     from sglang.kernels.ops.moe.prism.gemv import (
-        gemv_worklist_indexed, gemv_worklist_indexed_pinned,
-        gemv_worklist_indexed_pinned_sparse, gemv_worklist_indexed_sparse,
+        gemv_worklist_indexed, gemv_worklist_indexed_sparse,
     )
 
     x, w, row_off, kidx, ids, wts = _store(seed=21)
     w_dense = w
     if pinned:
         w = w.cpu().pin_memory()
-    dense_fn = gemv_worklist_indexed_pinned if pinned else gemv_worklist_indexed
-    sparse_fn = gemv_worklist_indexed_pinned_sparse if pinned else gemv_worklist_indexed_sparse
+    dense_fn = functools.partial(gemv_worklist_indexed, on_device=not pinned)
+    sparse_fn = functools.partial(gemv_worklist_indexed_sparse, on_device=not pinned)
     s = torch.cuda.current_stream()
 
     thr = 2.5                       # 정수 입력 ±4 → |x| ∈ {0..4}, 3·4만 산다
@@ -118,7 +117,6 @@ def test_sparsek1_masks_what_it_says(pinned):
 def test_sparsek1_gateup_fusion_matches_two_launches(weighted):
     """warm의 실제 경로(gate|up 융합)가 per-k 2회 launch와 비트일치. thr은 서로 다르게."""
     from sglang.kernels.ops.moe.prism.gemv import (
-        gemv_worklist_indexed_pinned_sparse, gemv_worklist_indexed_pinned_sparse_gateup,
         gemv_worklist_indexed_sparse, gemv_worklist_indexed_sparse_gateup,
     )
 
@@ -134,8 +132,9 @@ def test_sparsek1_gateup_fusion_matches_two_launches(weighted):
     spg, spu = _spec(1.5, a=ag), _spec(3.5, a=au)
     for single, fused, pin in ((gemv_worklist_indexed_sparse,
                                 gemv_worklist_indexed_sparse_gateup, False),
-                               (gemv_worklist_indexed_pinned_sparse,
-                                gemv_worklist_indexed_pinned_sparse_gateup, True)):
+                               (functools.partial(gemv_worklist_indexed_sparse, on_device=False),
+                                functools.partial(gemv_worklist_indexed_sparse_gateup,
+                                    on_device=False), True)):
         w1 = wg.cpu().pin_memory() if pin else wg
         w2 = wu.cpu().pin_memory() if pin else wu
         two = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
@@ -183,16 +182,15 @@ def test_sparsek1w_matches_weighted_masked_dense(pinned):
     비트일치가 깨진다 — 이 테스트가 그 대응을 잡는다.
     """
     from sglang.kernels.ops.moe.prism.gemv import (
-        gemv_worklist_indexed, gemv_worklist_indexed_pinned,
-        gemv_worklist_indexed_pinned_sparse, gemv_worklist_indexed_sparse,
+        gemv_worklist_indexed, gemv_worklist_indexed_sparse,
     )
 
     x, w, row_off, kidx, ids, wts = _store(seed=51)
     w_dev = w
     if pinned:
         w = w.cpu().pin_memory()
-    dense_fn = gemv_worklist_indexed_pinned if pinned else gemv_worklist_indexed
-    sparse_fn = gemv_worklist_indexed_pinned_sparse if pinned else gemv_worklist_indexed_sparse
+    dense_fn = functools.partial(gemv_worklist_indexed, on_device=not pinned)
+    sparse_fn = functools.partial(gemv_worklist_indexed_sparse, on_device=not pinned)
     s = torch.cuda.current_stream()
 
     g = torch.Generator().manual_seed(52)
