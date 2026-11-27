@@ -41,7 +41,7 @@ def _packed_store(rows, n=64, seed=1):
 @pytest.mark.parametrize("pair", [False, True])
 def test_buffered_packed_reuses_topk_slots(m, pair, monkeypatch):
     from sglang.kernels.ops.moe.prism import buffered as prism_buffered
-    from sglang.kernels.ops.moe.prism.grouped import grouped_gemm_cold_gateup, grouped_gemm_indexed
+    from sglang.kernels.ops.moe.prism.grouped import grouped_gemm_indexed
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     # E is not divisible by top-k; zero-row and unselected experts are included.
@@ -68,9 +68,13 @@ def test_buffered_packed_reuses_topk_slots(m, pair, monkeypatch):
             allocations.append(tensor.numel())
         return tensor
 
+    # The buffered module is a direct-call reference (no longer dispatched); keep its inner
+    # grouped_gemm_cold on the CUDA kernel instead of the Triton prefill path.
+    monkeypatch.setenv("SGLANG_PRISM_BUFFERED_PREFILL", "0")
     with monkeypatch.context() as patch:
         patch.setattr(prism_buffered.torch, "empty", tracked_empty)
-        grouped_gemm_cold_gateup(x, grouping, gate, up, out, 0, 64, pair, stream)
+        prism_buffered.grouped_packed_buffered(
+            x, grouping, [(gate, 0), (up, 64)], out, pair, stream)
     torch.cuda.synchronize()
     assert torch.equal(out, ref)
     assert allocations == [topk * max(rows) * 64]

@@ -61,6 +61,9 @@ def mapped_bf16(w, device):
         raise ValueError("prefill weights must be contiguous BF16")
     if w.is_cuda:
         return w.view(-1)
+    if w.numel() == 0:
+        # No rows to stage (every expert has kr == 0); an empty host tensor is never pinned.
+        return torch.empty(0, dtype=torch.bfloat16, device=device)
     if not w.is_pinned():
         raise ValueError("prefill weights must be pinned or cudaHostRegister'ed")
     # UVA alias only; torch retains the interface object's owner. No allocation
