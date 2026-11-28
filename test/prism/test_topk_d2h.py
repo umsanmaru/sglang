@@ -29,10 +29,12 @@ def test_host_ids_and_output_match_legacy(mode, monkeypatch):
     actual = run(ex, *inputs)
     assert host_ids == [mode != "gpu"]
 
+    original_channel = ex._plan_cold_channel
+
     def legacy(*args, **kwargs):
         kwargs["needs_host_ids"] = True
-        return original(*args, **kwargs)
+        return original_channel(*args, **kwargs)
 
-    monkeypatch.setattr(ex, "_plan_flow", legacy)
+    monkeypatch.setattr(ex, "_plan_cold_channel", legacy)
     expected = run(ex, *inputs)
     assert torch.equal(actual, expected)

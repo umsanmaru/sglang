@@ -143,7 +143,7 @@ def test_gemv_counts_each_mask_once(fused):
     N spans several column tiles that each recompute the mask, so counting in more than one
     tile multiplies the totals; the fused gate+up launch must count each slot into its own spec.
     """
-    from sglang.jit_kernel import prism_gemv as k
+    from sglang.kernels.ops.moe.prism import gemv as k
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
     kr, N, T2 = 48, 512, 4.5  # energies are integers, so T2 sits strictly between two of them
@@ -191,7 +191,7 @@ def test_quantized_gemv_counts_each_mask_once(fmt):
     import sys
 
     sys.path.insert(0, os.path.dirname(__file__))
-    from sglang.jit_kernel import prism_gemv_fp8, prism_gemv_mxfp4
+    from sglang.kernels.ops.moe.prism import gemv_fp8 as prism_gemv_fp8, gemv_mxfp4 as prism_gemv_mxfp4
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
     ref = importlib.import_module(f"{fmt}_ref")
@@ -265,7 +265,7 @@ def test_controller_holds_budget_under_activation_drift_in_cuda_graph():
     The graph bakes pointers, not table values, so this fails if the step does not rewrite the
     table the kernel reads in place, or the kernel does not count into the controller.
     """
-    from sglang.jit_kernel.prism_gemv import gemv_worklist_indexed_sparse
+    from sglang.kernels.ops.moe.prism.gemv import gemv_worklist_indexed_sparse
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
     W, STEPS = 8, 640

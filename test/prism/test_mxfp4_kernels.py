@@ -4,6 +4,7 @@
 - 정확표현 입력(작은 정수 x, 배율 2^0, 코드 {0,±1,±2}): GEMV ↔ grouped ↔ sparse(thr=0) 비트일치
 - pinned(UVA) 쌍둥이는 device 변형과 비트일치
 """
+import functools
 import os
 import sys
 
@@ -65,7 +66,7 @@ def _ref(x, ids, wref, kidx_cpu, row_off_cpu, pair):
 @pytest.mark.parametrize("pair", [False, True])
 @pytest.mark.parametrize("exact", [False, True])
 def test_gemv_mxfp4_matches_reference(pair, exact):
-    from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed
+    from sglang.kernels.ops.moe.prism.gemv_mxfp4 import gemv_mxfp4_indexed
 
     N, K, k_rows, M = 160, 256, 128, 3
     codes, scales, row_off, kidx, wref = _store(N, K, k_rows, exact, seed=1)
@@ -83,7 +84,7 @@ def test_gemv_mxfp4_matches_reference(pair, exact):
 
 @cuda_required
 def test_gemv_mxfp4_pinned_bitwise_and_offset():
-    from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_pinned
+    from sglang.kernels.ops.moe.prism.gemv_mxfp4 import gemv_mxfp4_indexed
 
     N, K, k_rows, M = 128, 512, 256, 2
     codes, scales, row_off, kidx, _ = _store(N, K, k_rows, False, seed=3)
@@ -93,7 +94,8 @@ def test_gemv_mxfp4_pinned_bitwise_and_offset():
     out_p = torch.zeros_like(out_d)
     gemv_mxfp4_indexed(x.cuda(), ids.cuda(), codes, scales, row_off, kidx, out_d, N, False, stream)
     cp = codes.cpu().pin_memory(); sp = scales.cpu().pin_memory()
-    gemv_mxfp4_indexed_pinned(x.cuda(), ids.cuda(), cp, sp, row_off, kidx, out_p, N, False, stream)
+    gemv_mxfp4_indexed(x.cuda(), ids.cuda(), cp, sp, row_off, kidx, out_p, N, False, stream,
+        on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(out_d, out_p)
     assert torch.all(out_d[:, :, :N] == 0)  # 오프셋 밖은 건드리지 않는다
@@ -101,7 +103,7 @@ def test_gemv_mxfp4_pinned_bitwise_and_offset():
 
 @cuda_required
 def test_gemv_mxfp4_gateup_fused_bitwise():
-    from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_gateup
+    from sglang.kernels.ops.moe.prism.gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_gateup
 
     N, K, k_rows, M = 128, 256, 128, 1
     c1, s1, ro1, ki1, _ = _store(N, K, k_rows, False, seed=5)
@@ -127,8 +129,8 @@ def test_gemv_mxfp4_wide_tile_bitwise():
     융합/단일 launch가 서로 다른 kNY를 고르면 일반 입력에서 여기서 비트가 갈린다.
     위 테스트들은 k_rows가 작아(≤ 512) 넓은 분기(kNY=64)를 한 번도 타지 않는다.
     """
-    from sglang.jit_kernel.prism_gemv_mxfp4 import (
-        gemv_mxfp4_indexed, gemv_mxfp4_indexed_gateup, gemv_mxfp4_indexed_pinned,
+    from sglang.kernels.ops.moe.prism.gemv_mxfp4 import (
+        gemv_mxfp4_indexed, gemv_mxfp4_indexed_gateup,
     )
 
     N, K, k_rows, M = 128, 2048, 2048, 1  # k_rows >= 2048 이 넓은 kNY의 조건
@@ -140,8 +142,8 @@ def test_gemv_mxfp4_wide_tile_bitwise():
     dev = torch.zeros(M, TOPK, N, dtype=torch.bfloat16, device="cuda")
     pin = torch.zeros_like(dev)
     gemv_mxfp4_indexed(xd, idsd, c1, s1, ro1, ki1, dev, 0, False, stream)
-    gemv_mxfp4_indexed_pinned(xd, idsd, c1.cpu().pin_memory(), s1.cpu().pin_memory(),
-                              ro1, ki1, pin, 0, False, stream)
+    gemv_mxfp4_indexed(xd, idsd, c1.cpu().pin_memory(), s1.cpu().pin_memory(),
+                              ro1, ki1, pin, 0, False, stream, on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(dev, pin), "pinned가 device와 다른 kNY를 골랐다"
 
@@ -158,7 +160,7 @@ def test_gemv_mxfp4_wide_tile_bitwise():
 @cuda_required
 def test_gemv_mxfp4_sparse_thr0_bitwise_and_masked():
     """thr=0(전부 keep) ↔ dense 비트일치; thr>0 ↔ 마스크 적용 참조."""
-    from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_sparse
+    from sglang.kernels.ops.moe.prism.gemv_mxfp4 import gemv_mxfp4_indexed, gemv_mxfp4_indexed_sparse
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
     N, K, k_rows, M = 128, 256, 128, 2
@@ -209,12 +211,53 @@ def test_gemv_mxfp4_sparse_thr0_bitwise_and_masked():
 
 
 @cuda_required
+def test_gemv_mxfp4_sparse_gateup_fused_bitwise():
+    """sparse gate|up fusion matches two single sparse launches, device and pinned."""
+    from sglang.kernels.ops.moe.prism.gemv_mxfp4 import (
+        gemv_mxfp4_indexed_sparse, gemv_mxfp4_indexed_sparse_gateup,
+    )
+    from sglang.srt.layers.moe.prism.tiers import SparseSpec
+
+    N, K, k_rows, M = 128, 256, 128, 2
+    c1, s1, ro1, ki1, _ = _store(N, K, k_rows, False, seed=31)
+    c2, s2, ro2, ki2, _ = _store(N, K, k_rows, False, seed=32)
+    x, ids = _inputs(M, K, False, False, seed=33)
+    g = torch.Generator().manual_seed(34)
+    w = torch.rand(M, TOPK, generator=g).cuda()
+    total = E * k_rows
+
+    def spec(thr_val):
+        return SparseSpec(a=torch.rand(total, generator=g).cuda(),
+                          c=(torch.rand(total // 2, generator=g) * 0.1).cuda(),
+                          thr=torch.full((E, 4), thr_val, device="cuda"),
+                          p=0.5, lam=0.0, pmax=0.9, grid=0.1, ng=4, renorm_it=1)
+
+    spg, spu = spec(0.4), spec(0.6)
+    stream = torch.cuda.current_stream()
+    for single, fused, pin in ((gemv_mxfp4_indexed_sparse, gemv_mxfp4_indexed_sparse_gateup, False),
+                               (functools.partial(gemv_mxfp4_indexed_sparse, on_device=False),
+                                functools.partial(gemv_mxfp4_indexed_sparse_gateup, on_device=False),
+                                True)):
+        cg, sg, cu, su = (tuple(t.cpu().pin_memory() for t in (c1, s1, c2, s2)) if pin
+                          else (c1, s1, c2, s2))
+        ref = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
+        single(x.cuda(), ids.cuda(), w, cg, sg, ro1, ki1, ref, spg, 0, False, stream)
+        single(x.cuda(), ids.cuda(), w, cu, su, ro2, ki2, ref, spu, N, False, stream)
+        out = torch.zeros_like(ref)
+        fused(x.cuda(), ids.cuda(), w, cg, sg, ro1, ki1, cu, su, ro2, ki2, out, spg, spu,
+              0, N, False, stream)
+        torch.cuda.synchronize()
+        assert torch.equal(out, ref), f"pinned={pin}"
+        assert torch.count_nonzero(out) > 0
+
+
+@cuda_required
 @pytest.mark.parametrize("pair", [False, True])
 @pytest.mark.parametrize("exact", [False, True])
 @pytest.mark.parametrize("m", [8, 300])
 def test_grouped_mxfp4_matches_gemv(pair, exact, m):
-    from sglang.jit_kernel.prism_gemv_mxfp4 import gemv_mxfp4_indexed
-    from sglang.jit_kernel.prism_grouped_mxfp4 import grouped_mxfp4_indexed, grouped_mxfp4_indexed_pinned
+    from sglang.kernels.ops.moe.prism.gemv_mxfp4 import gemv_mxfp4_indexed
+    from sglang.kernels.ops.moe.prism.grouped_mxfp4 import grouped_mxfp4_indexed
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows = 144, 320, 96   # kr=96: 64 배수 아님 → 마지막 K 타일 절반 유효 경로
@@ -230,8 +273,8 @@ def test_grouped_mxfp4_matches_gemv(pair, exact, m):
     out = torch.zeros_like(ref)
     grouped_mxfp4_indexed(x.cuda(), grouping, codes, scales, row_off, kidx, out, 0, pair, stream)
     outp = torch.zeros_like(ref)
-    grouped_mxfp4_indexed_pinned(x.cuda(), grouping, codes.cpu().pin_memory(), scales.cpu().pin_memory(),
-                                 row_off, kidx, outp, 0, pair, stream, 64)
+    grouped_mxfp4_indexed(x.cuda(), grouping, codes.cpu().pin_memory(), scales.cpu().pin_memory(),
+                                 row_off, kidx, outp, 0, pair, stream, 64, on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(out, outp)
     if exact:
@@ -244,7 +287,7 @@ def test_grouped_mxfp4_matches_gemv(pair, exact, m):
 
 @cuda_required
 def test_grouped_mxfp4_gateup_fused():
-    from sglang.jit_kernel.prism_grouped_mxfp4 import grouped_mxfp4_indexed, grouped_mxfp4_indexed_gateup
+    from sglang.kernels.ops.moe.prism.grouped_mxfp4 import grouped_mxfp4_indexed, grouped_mxfp4_indexed_gateup
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows, m = 128, 256, 128, 40
@@ -271,7 +314,7 @@ def test_grouped_mxfp4_cold_slab_matches_pairrow(m):
     host 텐서(pinned)이고 blk_off는 바이트 오프셋."""
     from types import SimpleNamespace
 
-    from sglang.jit_kernel.prism_grouped_mxfp4 import grouped_mxfp4_cold, grouped_mxfp4_indexed
+    from sglang.kernels.ops.moe.prism.grouped_mxfp4 import grouped_mxfp4_cold, grouped_mxfp4_indexed
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows = 96, 256, 96          # kr=96: 64 배수 아님
@@ -316,7 +359,7 @@ def test_grouped_mxfp4_cold_tile_slab_matches_pairrow(m):
     from types import SimpleNamespace
 
     from mxfp4_ref import tile_block
-    from sglang.jit_kernel.prism_grouped_mxfp4 import grouped_mxfp4_cold, grouped_mxfp4_indexed
+    from sglang.kernels.ops.moe.prism.grouped_mxfp4 import grouped_mxfp4_cold, grouped_mxfp4_indexed
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows = 256, 256, 96          # kr=96: 64 배수 아님 (마지막 GPU 타일 절반 유효)

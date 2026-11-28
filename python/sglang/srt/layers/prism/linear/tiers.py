@@ -60,7 +60,7 @@ class LinearSparseSpec:
     """GPU 커널이 threshold를 스스로 계산하는 데 필요한 전부 — 전부 device 상주.
 
     필드 이름이 MoE `moe/prism/tiers.SparseSpec`과 같은 것은 우연이 아니다: GEMV
-    래퍼(`jit_kernel/prism_gemv*.py`)가 이 객체를 **덕 타이핑**으로 읽으므로 두
+    래퍼(`kernels/ops/moe/prism/gemv*.py`)가 이 객체를 **덕 타이핑**으로 읽으므로 두
     레인이 같은 커널을 부르려면 이름이 같아야 한다. 타입을 따로 두는 이유는
     dense의 사실(E=1, `lam` 무효)을 타입이 말하게 하기 위해서다.
 
@@ -157,15 +157,17 @@ class LinearGpuTier:
                     "cold가 prefill에서 마스킹하지 않는데 warm이 하면 두 티어가 서로 "
                     "다른 마스크로 계산한 부분합을 더하게 된다"
                 )
-            s.fmt.grouped(pinned=self.pinned)(
+            s.fmt.grouped()(
                 x2d, grouping, *s.store_args(), self.row_off, s.k_index,
                 out3d, self.out_col, False, stream,
+                on_device=not self.pinned,
             )
             return
         if not masking or self.spec is None:
-            s.fmt.gemv(pinned=self.pinned, sparse=False)(
+            s.fmt.gemv(sparse=False)(
                 x2d, topk_ids, *s.store_args(), self.row_off, s.k_index,
                 out3d, self.out_col, False, stream,
+                on_device=not self.pinned,
             )
             return
         # 커널이 fp32 라우터 가중을 요구한다 (kt의 slot_sparsity와 같은 타입).
@@ -174,9 +176,10 @@ class LinearGpuTier:
             raise TypeError(
                 f"sparse tier requires fp32 weights, got {topk_weights.dtype}"
             )
-        s.fmt.gemv(pinned=self.pinned, sparse=True)(
+        s.fmt.gemv(sparse=True)(
             x2d, topk_ids, topk_weights, *s.store_args(), self.row_off, s.k_index,
             out3d, self.spec, self.out_col, False, stream,
+            on_device=not self.pinned,
         )
 
 

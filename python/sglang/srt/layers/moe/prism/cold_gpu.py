@@ -55,7 +55,7 @@ class ColdSlab:
 
     @cached_property
     def prefill(self):
-        from sglang.jit_kernel.prism_prefill import Projection
+        from sglang.kernels.ops.moe.prism.prefill import Projection
         return Projection(self.slab, self.row_off, self.k_index, self.n,
                           self.layout, self.blk_off, self.n_block, self.k_block,
                           self.rows_host)

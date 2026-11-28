@@ -2,8 +2,8 @@
 
 계약 ①이 "hot과 warm의 계산 계약은 완전히 동일하다"고 못박은 것을 타입으로
 표현한다. 두 구현은 스토어가 device냐 pinned냐 하나로만 갈리고 커널·출력
-레이아웃·호출 규약이 같다 — `gemv_worklist_indexed`와 그 pinned 쌍둥이의
-차이가 곧 이 두 클래스의 차이 전부다.
+레이아웃·호출 규약이 같다 — 진입점에 넘기는 `on_device` 한 값이 곧 이 두
+클래스의 차이 전부다.
 
 warm이 "전송"되던 시절에는 `stage → arena → GEMM`이라는 별도 사슬이 필요했다.
 제자리 UVA 읽기가 되면서 그 사슬이 포인터 종류 하나로 축소됐고, 그래서
@@ -60,7 +60,7 @@ class SparseSpec:
     ng: int
     renorm_it: int
     # score k1 (2026-09-05): 마스크가 per-k |x_k| >= thr — 커널이 a/c를 읽지 않는다. fp8 worklist
-    # 커널만 per-k 진입점(sparsek1)을 갖는다 (prism_gemv_fp8.py가 이 플래그로 고른다).
+    # 커널만 per-k 진입점(sparsek1)을 갖는다 (kernels/ops/moe/prism/gemv_fp8.py가 이 플래그로 고른다).
     per_k: bool = False
     # Threshold-controller counter int64 [2] = {kept, total} mask units the kernel adds to
     # (thr_ctrl.py); with a controller, `thr` is the live device table it rewrites. None = off.
@@ -115,15 +115,17 @@ class _IndexedTier:
             x_row_is_pair, masking, grouping=None) -> None:
         s = self.shard
         if grouping is not None:
-            s.fmt.grouped(pinned=self.pinned)(
+            s.fmt.grouped()(
                 x2d, grouping, *s.store_args(), s.row_off, s.k_index, out3d,
                 out_col_off, x_row_is_pair, torch.cuda.current_stream(),
                 self._grouped_max_blocks(), self._grouped_wres(),
+                on_device=not self.pinned,
             )
             return
-        s.fmt.gemv(pinned=self.pinned, sparse=False)(
+        s.fmt.gemv(sparse=False)(
             x2d, topk_ids, *s.store_args(), s.row_off, s.k_index, out3d,
             out_col_off, x_row_is_pair, torch.cuda.current_stream(),
+            on_device=not self.pinned,
         )
 
 
@@ -147,16 +149,18 @@ class _SparseIndexedTier:
         stream = torch.cuda.current_stream()
         if grouping is not None:
             _reject_masked_grouping(masking)
-            s.fmt.grouped(pinned=self.pinned)(
+            s.fmt.grouped()(
                 x2d, grouping, *s.store_args(), s.row_off, s.k_index, out3d,
                 out_col_off, x_row_is_pair, stream, self._grouped_max_blocks(),
                 self._grouped_wres(),
+                on_device=not self.pinned,
             )
             return
         if not masking:
-            s.fmt.gemv(pinned=self.pinned, sparse=False)(
+            s.fmt.gemv(sparse=False)(
                 x2d, topk_ids, *s.store_args(), s.row_off, s.k_index, out3d,
                 out_col_off, x_row_is_pair, stream,
+                on_device=not self.pinned,
             )
             return
         # 커널이 fp32 라우터 가중을 요구한다 (kt의 slot_sparsity와 같은 타입).
@@ -166,9 +170,10 @@ class _SparseIndexedTier:
             raise TypeError(
                 f"sparse tier requires fp32 topk_weights, got {topk_weights.dtype}"
             )
-        s.fmt.gemv(pinned=self.pinned, sparse=True)(
+        s.fmt.gemv(sparse=True)(
             x2d, topk_ids, topk_weights, *s.store_args(), s.row_off, s.k_index, out3d,
             self.spec, out_col_off, x_row_is_pair, stream,
+            on_device=not self.pinned,
         )
 
 
@@ -264,22 +269,23 @@ class _GateUpDense:
         stream = torch.cuda.current_stream()
         fmt = self._fmt()
         if grouping is not None:
-            _run_grouped_gateup(fmt.grouped_gateup(pinned=self.pinned), self.gate, self.up, x2d,
+            _run_grouped_gateup(fmt.grouped_gateup(), self.gate, self.up, x2d,
                                 grouping, out3d, inter, stream,
-                                self._grouped_max_blocks(), self._grouped_wres())
+                                self._grouped_max_blocks(), self._grouped_wres(),
+                                on_device=not self.pinned)
             return
-        fused = fmt.gemv_gateup(pinned=self.pinned, sparse=False) if _worth_fusing(x2d) else None
+        fused = fmt.gemv_gateup(sparse=False) if _worth_fusing(x2d) else None
         if fused is not None:
             fused(x2d, topk_ids,
                   *self.gate.store_args(), self.gate.row_off, self.gate.k_index,
                   *self.up.store_args(), self.up.row_off, self.up.k_index,
-                  out3d, 0, inter, False, stream)
+                  out3d, 0, inter, False, stream, on_device=not self.pinned)
             return
-        fn = fmt.gemv(pinned=self.pinned, sparse=False)
+        fn = fmt.gemv(sparse=False)
         fn(x2d, topk_ids, *self.gate.store_args(), self.gate.row_off, self.gate.k_index,
-           out3d, 0, False, stream)
+           out3d, 0, False, stream, on_device=not self.pinned)
         fn(x2d, topk_ids, *self.up.store_args(), self.up.row_off, self.up.k_index,
-           out3d, inter, False, stream)
+           out3d, inter, False, stream, on_device=not self.pinned)
 
 
 @dataclass(frozen=True)
@@ -310,42 +316,44 @@ class _GateUpSparse:
         fmt = self._fmt()
         if grouping is not None:
             _reject_masked_grouping(masking)
-            _run_grouped_gateup(fmt.grouped_gateup(pinned=self.pinned), self.gate, self.up, x2d,
+            _run_grouped_gateup(fmt.grouped_gateup(), self.gate, self.up, x2d,
                                 grouping, out3d, inter, stream,
-                                self._grouped_max_blocks(), self._grouped_wres())
+                                self._grouped_max_blocks(), self._grouped_wres(),
+                                on_device=not self.pinned)
             return
         if not masking:
             # prefill은 dense다 (계약 ①). 융합 진입점이 없는 조합은 2회 launch인데, prefill은
             # M이 커서 grid.y = M×top_k만으로 블록이 수천 개라 융합의 이득(블록 배증)이 없다.
-            fused = fmt.gemv_gateup(pinned=self.pinned, sparse=False) if _worth_fusing(x2d) else None
+            fused = fmt.gemv_gateup(sparse=False) if _worth_fusing(x2d) else None
             if fused is not None:
                 fused(x2d, topk_ids,
                       *self.gate.store_args(), self.gate.row_off, self.gate.k_index,
                       *self.up.store_args(), self.up.row_off, self.up.k_index,
-                      out3d, 0, inter, False, stream)
+                      out3d, 0, inter, False, stream, on_device=not self.pinned)
                 return
-            fn = fmt.gemv(pinned=self.pinned, sparse=False)
+            fn = fmt.gemv(sparse=False)
             fn(x2d, topk_ids, *self.gate.store_args(), self.gate.row_off,
-               self.gate.k_index, out3d, 0, False, stream)
+               self.gate.k_index, out3d, 0, False, stream, on_device=not self.pinned)
             fn(x2d, topk_ids, *self.up.store_args(), self.up.row_off, self.up.k_index,
-               out3d, inter, False, stream)
+               out3d, inter, False, stream, on_device=not self.pinned)
             return
         if topk_weights.dtype is not torch.float32:
             raise TypeError(
                 f"sparse tier requires fp32 topk_weights, got {topk_weights.dtype}"
             )
-        fused = fmt.gemv_gateup(pinned=self.pinned, sparse=True) if _worth_fusing(x2d) else None
+        fused = fmt.gemv_gateup(sparse=True) if _worth_fusing(x2d) else None
         if fused is not None:
             fused(x2d, topk_ids, topk_weights,
                   *self.gate.store_args(), self.gate.row_off, self.gate.k_index,
                   *self.up.store_args(), self.up.row_off, self.up.k_index,
-                  out3d, self.gate_spec, self.up_spec, 0, inter, False, stream)
+                  out3d, self.gate_spec, self.up_spec, 0, inter, False, stream,
+                  on_device=not self.pinned)
             return
-        fn = fmt.gemv(pinned=self.pinned, sparse=True)
+        fn = fmt.gemv(sparse=True)
         fn(x2d, topk_ids, topk_weights, *self.gate.store_args(), self.gate.row_off,
-           self.gate.k_index, out3d, self.gate_spec, 0, False, stream)
+           self.gate.k_index, out3d, self.gate_spec, 0, False, stream, on_device=not self.pinned)
         fn(x2d, topk_ids, topk_weights, *self.up.store_args(), self.up.row_off,
-           self.up.k_index, out3d, self.up_spec, inter, False, stream)
+           self.up.k_index, out3d, self.up_spec, inter, False, stream, on_device=not self.pinned)
 
 
 def _reject_masked_grouping(masking: bool) -> None:
@@ -361,31 +369,30 @@ def _wres_k_max(*shards) -> int:
     k_max는 32의 배수여야 한다 (커널 K 스텝) — 로더가 그렇게 굽지 않은 스토어(밴드
     퇴화형에서 임의 k)는 32로 올린다. (bf16 cold/packed slab용 — GPU 티어 스토어는
     `shard.fmt.wres_k_max`가 같은 규칙을 포맷별로 준다.)"""
-    from sglang.jit_kernel import prism_grouped
+    from sglang.kernels.ops.moe.prism import tuning
 
-    if not prism_grouped.WRES_PCIE:
+    if not tuning.current().wres_pcie:
         return 0
     k = max(int(getattr(sh, "k_max", 0) or 0) for sh in shards)
     return (k + 31) // 32 * 32
 
 
 def _warm_max_blocks() -> int:
-    """PCIe launch의 블록 수 상한 — 호출 시점에 모듈 값을 읽는다 (벤치가 스윕할 수
-    있게). 0 = 상한 없음. 근거는 prism_grouped.WARM_MAX_BLOCKS 주석."""
-    from sglang.jit_kernel import prism_grouped
+    """PCIe launch block cap of the current GPU (tuning.LaunchTuning). 0 = no cap."""
+    from sglang.kernels.ops.moe.prism import tuning
 
-    return int(prism_grouped.WARM_MAX_BLOCKS)
+    return int(tuning.current().warm_max_blocks)
 
 
 def _run_grouped_gateup(fn, gate: TierShard, up: TierShard, x2d, grouping,
                         out3d, inter: int, stream, max_blocks: int = 0,
-                        wres_k_max: int = 0) -> None:
+                        wres_k_max: int = 0, *, on_device: bool) -> None:
     """gate+up을 grouped GEMM **한 launch**로. 두 티어 구현(device/pinned)이
     공유하는 호출 형태."""
     fn(x2d, grouping,
        *gate.store_args(), gate.row_off, gate.k_index,
        *up.store_args(), up.row_off, up.k_index,
-       out3d, 0, inter, False, stream, max_blocks, wres_k_max)
+       out3d, 0, inter, False, stream, max_blocks, wres_k_max, on_device=on_device)
 
 
 def _worth_fusing(x2d: torch.Tensor) -> bool:
@@ -501,8 +508,8 @@ class PackedWarmTier:
 
     def run(self, x2d, topk_ids, topk_weights, out3d, out_col_off, *,
             x_row_is_pair, masking, grouping=None) -> None:
-        from sglang.jit_kernel.prism_gemv_packed import gemv_packed, gemv_packed_sparse
-        from sglang.jit_kernel.prism_grouped import grouped_gemm_cold
+        from sglang.kernels.ops.moe.prism.gemv_packed import gemv_packed, gemv_packed_sparse
+        from sglang.kernels.ops.moe.prism.grouped import grouped_gemm_cold
 
         stream = torch.cuda.current_stream()
         if grouping is not None:
@@ -529,10 +536,10 @@ class PackedWarmGateUp:
 
     def run(self, x2d, topk_ids, topk_weights, out3d, inter, *, masking,
             grouping=None) -> None:
-        from sglang.jit_kernel.prism_gemv_packed import (
+        from sglang.kernels.ops.moe.prism.gemv_packed import (
             gemv_packed_gateup, gemv_packed_sparse_gateup,
         )
-        from sglang.jit_kernel.prism_grouped import grouped_gemm_cold_gateup
+        from sglang.kernels.ops.moe.prism.grouped import grouped_gemm_cold_gateup
 
         stream = torch.cuda.current_stream()
         if grouping is not None:
@@ -585,6 +592,24 @@ _GATEUP_DENSE = {Tier.HOT: ResidentGateUp, Tier.WARM: PinnedGateUp}
 _GATEUP_SPARSE = {Tier.HOT: SparseResidentGateUp, Tier.WARM: SparsePinnedGateUp}
 
 
+
+# MoE per-k sparse tiers are validated end to end only on FP8 stores. BF16 also has per-k
+# entry points (kernel-tested, used by dense linear), but no MoE executor test covers them.
+_MOE_PER_K_FORMATS = ("fp8",)
+
+
+def _check_moe_per_k(fmt: str, score: str, where: str) -> None:
+    from sglang.kernels.ops.moe.prism.key import PrismKernelKey, unsupported_reason
+
+    reason = unsupported_reason(PrismKernelKey(op="gemv", fmt=fmt, mode="k1"))
+    if reason is not None:
+        raise NotImplementedError(f"{where}: sparsity score '{score}' (per-k): {reason}")
+    if fmt not in _MOE_PER_K_FORMATS:
+        raise NotImplementedError(
+            f"{where}: sparsity score '{score}' (per-k) is validated for MoE only on "
+            f"{list(_MOE_PER_K_FORMATS)} stores, not {fmt}"
+        )
+
 def _sparse_spec(
     shard: TierShard, thr: torch.Tensor, plan: Plan, layer_idx: int, proj: Proj,
     where: str, ctr: Optional[torch.Tensor] = None,
@@ -606,11 +631,8 @@ def _sparse_spec(
     ep = plan.expert(layer_idx, 0).proj(proj)
     dev = shard.row_off.device
     if not spec.uses_weight_stats:
-        # score k1: 재료는 thr 곡선만. per-k 진입점은 fp8 worklist 커널에만 있다.
-        if shard.fmt.name != "fp8":
-            raise NotImplementedError(
-                f"{where}: sparsity score '{spec.score}' (per-k) has a GPU kernel only for the fp8 "
-                f"store, not {shard.fmt.name}")
+        # score k1: 재료는 thr 곡선만.
+        _check_moe_per_k(shard.fmt.name, spec.score, where)
         return SparseSpec(
             a=None, c=None, thr=thr.to(dev, torch.float32),
             p=float(ep.sparsity_p), lam=float(ep.sparsity_lambda),

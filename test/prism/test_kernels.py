@@ -52,3 +52,54 @@ def test_gpu_kernel_key_implies_store_format():
     assert fmt8.cold_kernels == ("kt_tile_k2_fp8b128", "kt_tile_k1_fp8b128")  # k2(페어) / k1(per-k) 타일
     with pytest.raises(KernelError):
         gpu_store_format("nope")
+
+
+def test_kernel_keys_cover_exactly_the_built_exports():
+    """Every GEMV/grouped export is reachable from a supported kernel key and every supported
+    key is built, so adding an export or a key without the other fails here."""
+    import itertools
+
+    from sglang.kernels.ops.moe.prism import key as K
+
+    unkeyed = {"gemv_worklist", "prism_wait_flag"}
+    modules = ("gemv", "gemv_fp8", "gemv_mxfp4", "grouped", "grouped_fp8", "grouped_mxfp4")
+    built = set().union(*(K.module_exports(m) for m in modules)) - unkeyed
+    keyed = set()
+    for op, fmt, mode, fused in itertools.product(K.OPS, K.FMTS, K.MODES, (False, True)):
+        key = K.PrismKernelKey(op=op, fmt=fmt, mode=mode, fused=fused)
+        if K.supports(key):
+            keyed.add(key.export_name())
+            assert callable(K.wrapper(key)), key
+    assert keyed == built
+
+    no_k1 = K.unsupported_reason(K.PrismKernelKey(op="gemv", fmt="mxfp4", mode="k1"))
+    assert no_k1 is not None and "gemv_mxfp4_indexed_sparsek1" in no_k1
+    assert not K.supports(K.PrismKernelKey(op="gemv", fmt="fp8", mode="k1w", fused=True))
+
+
+def test_plan_precheck_flags_unbuilt_entries():
+    """The load-time pre-check must flag a plan whose reachable entries are not built, and treat
+    a missing fused gate+up entry as a fallback (two launches) rather than a missing kernel."""
+    from sglang.srt.layers.prism.kernels import unsupported_plan_kernels
+
+    kw = dict(moe=True, has_warm=True, cold_on_gpu=True)
+    assert unsupported_plan_kernels("gemv_worklist", sparse_score="k2wl2", **kw) == ([], [])
+    required, _ = unsupported_plan_kernels("gemv_worklist_mxfp4", sparse_score="k1", **kw)
+    assert len(required) == 1 and "gemv_mxfp4_indexed_sparsek1" in required[0]
+    required, optional = unsupported_plan_kernels("gemv_worklist_fp8", sparse_score="k1w1", **kw)
+    assert required == [] and len(optional) == 1 and "sparsek1w_gateup" in optional[0]
+    required, _ = unsupported_plan_kernels("torch_bmm", sparse_score="k1", **kw)
+    assert len(required) == 1 and "pair score" in required[0]
+
+
+def test_launch_tuning_configs_decode():
+    """Per-GPU tuning files must parse, and a misspelled knob must be rejected rather than
+    silently ignored (the GPU would then run with the default)."""
+    import msgspec
+
+    from sglang.kernels.ops.moe.prism import tuning
+
+    for path in sorted(tuning._CONFIG_DIR.glob("*.json")):
+        msgspec.json.decode(path.read_bytes(), type=tuning.LaunchTuning)
+    with pytest.raises(msgspec.ValidationError):
+        msgspec.json.decode(b'{"warm_max_block": 64}', type=tuning.LaunchTuning)

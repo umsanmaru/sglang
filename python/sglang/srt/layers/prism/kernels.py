@@ -20,7 +20,7 @@ cpu_cold의 실체는 kt-kernel의 CRTP 클래스다. 여기서는 유효한 키
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 _GPU_WARM_KERNELS: Tuple[str, ...] = ("gemv_worklist", "torch_bmm", "gemv_worklist_mxfp4",
                                       "gemv_worklist_fp8", "gemv_worklist_fp8pt")
@@ -105,16 +105,12 @@ _CPU_COLD_SCORES: dict = {"kt_amx_bf16": ("k2wl2",), "kt_tile_k2_bf16": ("k2wl2"
                           "kt_tile_k1_fp8pt": ("k1", "k1w1")}
 
 
-# GPU warm 커널이 **마스킹할 수 있는** score. cold 커널은 자기 score가 하나로 정해져
-# 있지만(위 `_CPU_COLD_SCORE`) warm은 진입점이 있는 것만 마스킹할 수 있고, 없으면 그 티어를
-# dense로 돌려야 한다 (계약 ①: 마스킹 여부는 티어별 선택).
-#   k1 진입점(`*_sparsek1`)은 bf16·fp8(블록)·fp8pt 셋에 있다 (2026-09-07). mxfp4에는 없다 —
-#   k1 plan을 주고 warm에 spec을 달면 커널이 a/c를 읽어 **다른 마스크**를 만들므로, 조용히
-#   통과시키지 않고 여기서 능력을 선언한다. `torch_bmm`은 옛 이름이라 페어만 남긴다.
-_GPU_WARM_SCORES: dict = {"gemv_worklist": ("k2wl2", "k1", "k1w1"), "torch_bmm": ("k2wl2",),
-                          "gemv_worklist_mxfp4": ("k2wl2",),
-                          "gemv_worklist_fp8": ("k2wl2", "k1", "k1w1"),
-                          "gemv_worklist_fp8pt": ("k2wl2", "k1", "k1w1")}
+# Plan sparsity score -> kernel sparse mode. A GPU warm tier can mask with a score only if
+# its store format has that entry point; otherwise the caller runs the tier dense, because the
+# pair kernel would compute a different mask than the plan asks for.
+_SCORE_MODE: dict = {"k2wl2": "pair", "k1": "k1", "k1w1": "k1w"}
+# Legacy alias of gemv_worklist; plans only ever used it with the pair score.
+_PAIR_ONLY_GPU_KERNELS: Tuple[str, ...] = ("torch_bmm",)
 
 
 class KernelError(ValueError):
@@ -192,7 +188,13 @@ def gpu_warm_supports_score(name: str, score: str) -> bool:
     거짓이면 호출자는 그 티어를 **dense로 돌려야** 한다 — spec을 달면 커널이 자기가
     아는 식(k2wl2 페어 에너지)으로 계산해 plan이 말한 것과 다른 마스크가 된다.
     """
-    return score in _GPU_WARM_SCORES[resolve_gpu_kernel(name)]
+    from sglang.kernels.ops.moe.prism.key import PrismKernelKey, supports
+
+    fmt = gpu_store_format_tag(name)
+    if name in _PAIR_ONLY_GPU_KERNELS:
+        return score == "k2wl2"
+    mode = _SCORE_MODE.get(score)
+    return mode is not None and supports(PrismKernelKey(op="gemv", fmt=fmt, mode=mode))
 
 
 def cold_n_align(name: str) -> int:
@@ -208,3 +210,64 @@ def resolve_cpu_kernel(name: str) -> str:
             f"unknown cpu_cold kernel '{name}' (known: {sorted(_CPU_COLD_KERNELS)})"
         )
     return name
+
+
+# ===== Plan pre-check: kernel keys a plan can reach at run time =====
+
+
+def plan_kernel_needs(
+    gpu_warm: str,
+    *,
+    moe: bool,
+    has_warm: bool,
+    sparse_score: Optional[str],
+    cold_on_gpu: bool,
+) -> list:
+    """(PrismKernelKey, required, why) for every entry the executor may resolve for this plan.
+
+    The executor picks the call shape per step (GEMV vs grouped by M, fusion at M == 1,
+    masking at m == 1, cold on GPU at M >= cold_gpu_min_m), so this lists every shape the plan
+    can reach. `required` is False where the executor has a fallback (two launches instead
+    of a fused gate+up). Warm-KT stores use the packed and cold-slab kernels instead of the
+    row-major warm entries, so for them the warm rows here are an over-approximation.
+    """
+    from sglang.kernels.ops.moe.prism.key import PrismKernelKey as Key
+
+    fmt = gpu_store_format_tag(gpu_warm)
+    needs = [
+        (Key(op="gemv", fmt=fmt), True, "decode"),
+        (Key(op="grouped", fmt=fmt), True, "prefill (M >= grouped_min_m)"),
+    ]
+    if moe:
+        needs += [
+            (Key(op="gemv", fmt=fmt, fused=True), False, "decode gate+up fusion"),
+            (Key(op="grouped", fmt=fmt, fused=True), True, "prefill gate+up"),
+        ]
+    if has_warm and sparse_score is not None:
+        mode = _SCORE_MODE.get(sparse_score, "pair")
+        needs.append((Key(op="gemv", fmt=fmt, mode=mode), True,
+                      f"warm masking with score {sparse_score}"))
+        if moe:
+            needs.append((Key(op="gemv", fmt=fmt, mode=mode, fused=True), False,
+                          f"warm masking gate+up fusion with score {sparse_score}"))
+    if cold_on_gpu:
+        needs += [
+            (Key(op="grouped_cold", fmt=fmt), True, "cold read on GPU at large M"),
+            (Key(op="grouped_cold", fmt=fmt, fused=True), True, "cold gate+up on GPU"),
+        ]
+    return needs
+
+
+def unsupported_plan_kernels(gpu_warm: str, **kw) -> tuple[list, list]:
+    """(required, optional) messages for the plan's kernel needs that are not built."""
+    from sglang.kernels.ops.moe.prism.key import unsupported_reason
+
+    required, optional = [], []
+    pair_only = gpu_warm in _PAIR_ONLY_GPU_KERNELS
+    for key, is_required, why in plan_kernel_needs(gpu_warm, **kw):
+        reason = unsupported_reason(key)
+        if reason is None and pair_only and key.mode not in ("dense", "pair"):
+            reason = f"{gpu_warm} only masks with the pair score"
+        if reason is not None:
+            (required if is_required else optional).append(f"{why}: {reason}")
+    return required, optional

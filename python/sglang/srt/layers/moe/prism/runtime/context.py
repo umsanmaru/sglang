@@ -7,6 +7,7 @@ behavior as the legacy implementation. No new cleanup or caching policy.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -15,6 +16,8 @@ import torch
 from sglang.srt.layers.moe.prism.activation import Activation
 from sglang.srt.layers.moe.prism.plan import Plan, Proj, Tier
 from sglang.srt.layers.moe.prism.runtime.config import PrismEnvConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -87,6 +90,23 @@ class PrismRuntime:
         self._cold = None
         self._executor = None
 
+    def _warn_unbuilt_kernels(self) -> None:
+        """Plan pre-check, warn only: kernel entries this plan can reach that are not built."""
+        from sglang.srt.layers.prism.kernels import unsupported_plan_kernels
+
+        sparsity = self.plan.sparsity
+        required, optional = unsupported_plan_kernels(
+            self.plan.kernels.gpu_warm,
+            moe=True,
+            has_warm=self.has_warm,
+            sparse_score=None if sparsity is None else sparsity.score,
+            cold_on_gpu=self.has_cold and self._bindings.cold_gpu_min_m() is not None,
+        )
+        for msg in required:
+            logger.warning("[prism] plan can reach an unbuilt kernel entry; %s", msg)
+        for msg in optional:
+            logger.info("[prism] no fused entry, two launches instead; %s", msg)
+
     def executor(self, device: torch.device):
         if self._executor is None:
             from sglang.srt.layers.moe.prism.executor import PrismExecutor
@@ -97,6 +117,7 @@ class PrismRuntime:
             )
 
             resolve_gpu_kernel(self.plan.kernels.gpu_warm)  # 이름 검증
+            self._warn_unbuilt_kernels()
             # 이 포맷의 GEMV/grouped 커널 lazy JIT을 startup으로 앞당긴다 — 첫 호출이 캡처
             # 워밍업이면 컴파일이 캡처 순서에 얽힌다.
             self.fmt.warmup()

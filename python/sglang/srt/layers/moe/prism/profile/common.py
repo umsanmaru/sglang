@@ -100,31 +100,25 @@ class Fp8PtGpu:
     """per-tensor fp8의 GPU 진입점 묶음 — `formats.StoreFormat` 중 프로파일이 쓰는 부분만
     (`gemv`, `gemv_gateup`, `warmup`, `cold_kernels`). MoE에는 per-tensor fp8 체크포인트가
     없어 `moe/prism/formats.py`에 포맷을 두지 않는다; 커널은 dense 레인(Mistral)용으로
-    `jit_kernel/prism_gemv_fp8.py`에 있고(`gemv_fp8pt_*` 8개) 인자 순서는 블록판과 같다
+    `kernels/ops/moe/prism/gemv_fp8.py`에 있고(`gemv_fp8pt_*` 8개) 인자 순서는 블록판과 같다
     (배율만 슬롯당 스칼라 `[E]`).
     """
 
     name = "fp8pt"
     cold_kernels = ("kt_tile_k2_fp8pt",)
 
-    def gemv(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_fp8 as k
+    def gemv(self, *, sparse):
+        from sglang.kernels.ops.moe.prism import gemv_fp8 as k
 
-        return {(False, False): k.gemv_fp8pt_indexed,
-                (True, False): k.gemv_fp8pt_indexed_pinned,
-                (False, True): k.gemv_fp8pt_indexed_sparse,
-                (True, True): k.gemv_fp8pt_indexed_pinned_sparse}[(pinned, sparse)]
+        return k.gemv_fp8pt_indexed_sparse if sparse else k.gemv_fp8pt_indexed
 
-    def gemv_gateup(self, *, pinned, sparse):
-        from sglang.jit_kernel import prism_gemv_fp8 as k
+    def gemv_gateup(self, *, sparse):
+        from sglang.kernels.ops.moe.prism import gemv_fp8 as k
 
-        return {(False, False): k.gemv_fp8pt_indexed_gateup,
-                (True, False): k.gemv_fp8pt_indexed_pinned_gateup,
-                (False, True): k.gemv_fp8pt_indexed_sparse_gateup,
-                (True, True): k.gemv_fp8pt_indexed_pinned_sparse_gateup}[(pinned, sparse)]
+        return k.gemv_fp8pt_indexed_sparse_gateup if sparse else k.gemv_fp8pt_indexed_gateup
 
     def warmup(self) -> None:
-        from sglang.jit_kernel.prism_gemv_fp8 import warmup_jit
+        from sglang.kernels.ops.moe.prism.gemv_fp8 import warmup_jit
 
         warmup_jit()
 
@@ -293,12 +287,13 @@ class Store:
             base += experts * 4
         return int(base)
 
-    def call(self, fn, args: tuple, *, vec: int = 0) -> None:
-        """진입점 호출 — bf16 커널만 받는 `vec` 인자를 여기서 흡수한다."""
+    def call(self, fn, args: tuple, *, on_device: bool, vec: int = 0) -> None:
+        """진입점 호출 — bf16 커널만 받는 `vec` 인자를 여기서 흡수한다. on_device: hot(device W)
+        이면 True, warm(pinned W)이면 False."""
         if self.has_vec:
-            fn(*args, vec)
+            fn(*args, vec, on_device=on_device)
         else:
-            fn(*args)
+            fn(*args, on_device=on_device)
 
     # ── 참조값 (check용 dequant) ─────────────────────────────────────────
     def dequant(self, parts: Sequence[torch.Tensor], k_rows: int, n: int) -> torch.Tensor:

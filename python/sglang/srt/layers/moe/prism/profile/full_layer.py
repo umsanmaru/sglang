@@ -217,15 +217,15 @@ class GpuTier:
 
     def launch(self, x, ids, tw, out, col_off: int, *,
                x_row_is_pair: bool) -> None:
-        fn = self.store.fmt.gemv(pinned=self.pinned, sparse=self.masking)
+        fn = self.store.fmt.gemv(sparse=self.masking)
         stream = torch.cuda.current_stream()
         if self.masking:
             self.store.call(fn, (x, ids, tw, *self.parts, self.row_off,
                                  self.k_index, out, self.spec, col_off,
-                                 x_row_is_pair, stream))
+                                 x_row_is_pair, stream), on_device=not self.pinned)
         else:
             self.store.call(fn, (x, ids, *self.parts, self.row_off, self.k_index,
-                                 out, col_off, x_row_is_pair, stream))
+                                 out, col_off, x_row_is_pair, stream), on_device=not self.pinned)
 
     @staticmethod
     def launch_gateup(gate: "GpuTier", up: "GpuTier", x, ids, tw, out,
@@ -233,7 +233,7 @@ class GpuTier:
         """gate와 up을 한 커널로 — executor가 그렇게 발행한다 (`tiers.ResidentGateUp`,
         `tiers.SparsePinnedGateUp`). 두 번 launch하면 시스템보다 비싼 값이 나온다."""
         store = gate.store
-        fn = store.fmt.gemv_gateup(pinned=gate.pinned, sparse=gate.masking)
+        fn = store.fmt.gemv_gateup(sparse=gate.masking)
         if fn is None:                      # 그 조합의 융합 진입점이 없으면 2 launch
             gate.launch(x, ids, tw, out, 0, x_row_is_pair=False)
             up.launch(x, ids, tw, out, inter, x_row_is_pair=False)
@@ -246,7 +246,7 @@ class GpuTier:
         else:
             args = (x, ids, *gate.parts, gate.row_off, gate.k_index,
                     *up.parts, up.row_off, up.k_index, out, 0, inter, False, stream)
-        store.call(fn, args)
+        store.call(fn, args, on_device=not gate.pinned)
 
 
 # ─── L2 flush ──────────────────────────────────────────────────────────────

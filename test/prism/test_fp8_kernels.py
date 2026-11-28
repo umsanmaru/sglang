@@ -4,6 +4,7 @@
 - 정확표현 입력(작은 정수 x, 배율 1.0, 코드 {0,±1,±2}): dense ↔ sparse(thr=0) ↔ 융합 비트일치
 - pinned(UVA) 쌍둥이는 device 변형과 비트일치
 """
+import functools
 import os
 import sys
 
@@ -65,7 +66,7 @@ def _ref(x, ids, wref, kidx_cpu, row_off_cpu, pair):
 @pytest.mark.parametrize("pair", [False, True])
 @pytest.mark.parametrize("exact", [False, True])
 def test_gemv_fp8_matches_reference(pair, exact):
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8_indexed
 
     N, K, k_rows, M = 256, 512, 256, 3
     codes, scales, row_off, kidx, wref = _store(N, K, k_rows, exact, seed=1)
@@ -83,7 +84,7 @@ def test_gemv_fp8_matches_reference(pair, exact):
 
 @cuda_required
 def test_gemv_fp8_pinned_bitwise_and_offset():
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed, gemv_fp8_indexed_pinned
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8_indexed
 
     N, K, k_rows, M = 128, 512, 256, 2
     codes, scales, row_off, kidx, _ = _store(N, K, k_rows, False, seed=3)
@@ -93,7 +94,8 @@ def test_gemv_fp8_pinned_bitwise_and_offset():
     out_p = torch.zeros_like(out_d)
     gemv_fp8_indexed(x.cuda(), ids.cuda(), codes, scales, row_off, kidx, out_d, N, False, stream)
     cp = codes.cpu().pin_memory(); sp = scales.cpu().pin_memory()
-    gemv_fp8_indexed_pinned(x.cuda(), ids.cuda(), cp, sp, row_off, kidx, out_p, N, False, stream)
+    gemv_fp8_indexed(x.cuda(), ids.cuda(), cp, sp, row_off, kidx, out_p, N, False, stream,
+        on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(out_d, out_p)
     assert torch.all(out_d[:, :, :N] == 0)  # 오프셋 밖은 건드리지 않는다
@@ -103,10 +105,7 @@ def test_gemv_fp8_pinned_bitwise_and_offset():
 @pytest.mark.parametrize("pinned", [False, True])
 def test_gemv_fp8_gateup_fused_bitwise(pinned):
     """융합 진입점 4개(= {device, pinned} × {dense, sparse})가 2회 launch와 비트일치."""
-    from sglang.jit_kernel.prism_gemv_fp8 import (
-        gemv_fp8_indexed, gemv_fp8_indexed_gateup,
-        gemv_fp8_indexed_pinned, gemv_fp8_indexed_pinned_gateup,
-    )
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8_indexed, gemv_fp8_indexed_gateup
 
     N, K, k_rows, M = 128, 256, 128, 1
     c1, s1, ro1, ki1, _ = _store(N, K, k_rows, False, seed=5)
@@ -114,8 +113,8 @@ def test_gemv_fp8_gateup_fused_bitwise(pinned):
     x, ids = _inputs(M, K, False, False, seed=7)
     if pinned:
         c1, s1, c2, s2 = (t.cpu().pin_memory() for t in (c1, s1, c2, s2))
-    single = gemv_fp8_indexed_pinned if pinned else gemv_fp8_indexed
-    fused = gemv_fp8_indexed_pinned_gateup if pinned else gemv_fp8_indexed_gateup
+    single = functools.partial(gemv_fp8_indexed, on_device=not pinned)
+    fused = functools.partial(gemv_fp8_indexed_gateup, on_device=not pinned)
     stream = torch.cuda.current_stream()
     ref = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
     single(x.cuda(), ids.cuda(), c1, s1, ro1, ki1, ref, 0, False, stream)
@@ -145,9 +144,7 @@ def test_gemv_fp8_wide_tile_bitwise():
     융합/단일 launch가 서로 다른 kNY를 고르면 일반 입력에서 여기서 비트가 갈린다.
     위 테스트들은 k_rows가 작아(≤ 512) 넓은 분기(kNY=64, fp8은 kV=8도)를 한 번도 타지 않는다.
     """
-    from sglang.jit_kernel.prism_gemv_fp8 import (
-        gemv_fp8_indexed, gemv_fp8_indexed_gateup, gemv_fp8_indexed_pinned,
-    )
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8_indexed, gemv_fp8_indexed_gateup
 
     # N·k_rows를 이만큼 잡아야 fp8의 "SM당 바이트" 문턱(128 KB)을 넘어 kV=8 분기를 탄다:
     # pairs(8) × k_rows(2048) × N(2048) / SM ≈ 197 KB (170 SM) / 254 KB (132 SM).
@@ -159,8 +156,8 @@ def test_gemv_fp8_wide_tile_bitwise():
     dev = torch.zeros(M, TOPK, N, dtype=torch.bfloat16, device="cuda")
     pin = torch.zeros_like(dev)
     gemv_fp8_indexed(xd, idsd, c1, s1, ro1, ki1, dev, 0, False, stream)
-    gemv_fp8_indexed_pinned(xd, idsd, c1.cpu().pin_memory(), s1.cpu().pin_memory(),
-                            ro1, ki1, pin, 0, False, stream)
+    gemv_fp8_indexed(xd, idsd, c1.cpu().pin_memory(), s1.cpu().pin_memory(),
+                            ro1, ki1, pin, 0, False, stream, on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(dev, pin), "pinned가 device와 다른 kNY를 골랐다"
 
@@ -178,7 +175,7 @@ def test_gemv_fp8_wide_tile_bitwise():
 @cuda_required
 def test_gemv_fp8_sparse_thr0_bitwise_and_masked():
     """thr=0(전부 keep) ↔ dense 비트일치; thr>0 ↔ 마스크 적용 참조."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed, gemv_fp8_indexed_sparse
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8_indexed, gemv_fp8_indexed_sparse
 
     N, K, k_rows, M = 128, 256, 128, 2
     codes, scales, row_off, kidx, wref = _store(N, K, k_rows, False, seed=8)
@@ -224,8 +221,7 @@ def test_gemv_fp8_sparse_thr0_bitwise_and_masked():
 @cuda_required
 def test_gemv_fp8_sparse_gateup_fused_bitwise():
     """sparse 융합(warm의 실제 경로) ↔ sparse 2회 launch 비트일치, device/pinned 양쪽."""
-    from sglang.jit_kernel.prism_gemv_fp8 import (
-        gemv_fp8_indexed_pinned_sparse, gemv_fp8_indexed_pinned_sparse_gateup,
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import (
         gemv_fp8_indexed_sparse, gemv_fp8_indexed_sparse_gateup,
     )
 
@@ -238,8 +234,9 @@ def test_gemv_fp8_sparse_gateup_fused_bitwise():
     spu = _sparse_spec(E, E * k_rows, 17, 0.4)
     stream = torch.cuda.current_stream()
     for single, fused, store in ((gemv_fp8_indexed_sparse, gemv_fp8_indexed_sparse_gateup, False),
-                                 (gemv_fp8_indexed_pinned_sparse,
-                                  gemv_fp8_indexed_pinned_sparse_gateup, True)):
+                                 (functools.partial(gemv_fp8_indexed_sparse, on_device=False),
+                                  functools.partial(gemv_fp8_indexed_sparse_gateup, on_device=False),
+                                  True)):
         cc1, ss1, cc2, ss2 = (tuple(t.cpu().pin_memory() for t in (c1, s1, c2, s2)) if store
                               else (c1, s1, c2, s2))
         ref = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
@@ -260,8 +257,8 @@ def test_gemv_fp8_sparse_gateup_fused_bitwise():
 def test_grouped_fp8_matches_gemv(pair, exact, m):
     """grouped ↔ GEMV: 배율이 2의 거듭제곱이라 `bf16(code·scale)`이 정확 →
     정확표현 입력에서는 비트일치, 랜덤 입력에서는 누산 순서만큼의 tolerance."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed
-    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_indexed, grouped_fp8_indexed_pinned
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8_indexed
+    from sglang.kernels.ops.moe.prism.grouped_fp8 import grouped_fp8_indexed
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows = 256, 512, 256
@@ -277,8 +274,9 @@ def test_grouped_fp8_matches_gemv(pair, exact, m):
     out = torch.zeros_like(ref)
     grouped_fp8_indexed(x.cuda(), grouping, codes, scales, row_off, kidx, out, 0, pair, stream)
     outp = torch.zeros_like(ref)
-    grouped_fp8_indexed_pinned(x.cuda(), grouping, codes.cpu().pin_memory(),
-                               scales.cpu().pin_memory(), row_off, kidx, outp, 0, pair, stream, 64)
+    grouped_fp8_indexed(x.cuda(), grouping, codes.cpu().pin_memory(),
+                               scales.cpu().pin_memory(), row_off, kidx, outp, 0, pair, stream, 64,
+                                   on_device=False)
     torch.cuda.synchronize()
     assert torch.equal(out, outp)
     if exact:
@@ -291,7 +289,7 @@ def test_grouped_fp8_matches_gemv(pair, exact, m):
 
 @cuda_required
 def test_grouped_fp8_gateup_fused():
-    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_indexed, grouped_fp8_indexed_gateup
+    from sglang.kernels.ops.moe.prism.grouped_fp8 import grouped_fp8_indexed, grouped_fp8_indexed_gateup
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     N, K, k_rows, m = 128, 256, 128, 40
@@ -315,8 +313,8 @@ def test_grouped_fp8_gateup_fused():
 @pytest.mark.parametrize("exact", [True, False])
 def test_grouped_fp8_cold_tile_matches_gemv(exact, layout):
     """KT_TILE8 / KT_TILE8_K1 로더: kt fp8 타일 BufferB slab(k2 / k1 순열)을 제자리 읽어 GEMV와 일치."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed
-    from sglang.jit_kernel.prism_grouped_fp8 import grouped_fp8_cold
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8_indexed
+    from sglang.kernels.ops.moe.prism.grouped_fp8 import grouped_fp8_cold
     from sglang.srt.layers.moe.prism.grouping import build_grouping
 
     sys.path.insert(0, os.path.dirname(__file__))
@@ -362,10 +360,10 @@ def test_grouped_fp8_cold_tile_matches_gemv(exact, layout):
 # ── score k1 (per-k |x| >= thr) — fp8 warm worklist 커널의 per-k 마스크 (2026-09-05) ──────────
 
 
-def _sparse_spec_k1(E_, thr_val):
+def _sparse_spec_k1(E_, thr_val, a=None):
     from sglang.srt.layers.moe.prism.tiers import SparseSpec
 
-    return SparseSpec(a=None, c=None, thr=torch.full((E_, 4), thr_val, device="cuda"),
+    return SparseSpec(a=a, c=None, thr=torch.full((E_, 4), thr_val, device="cuda"),
                       p=0.5, lam=0.0, pmax=0.9, grid=0.1, ng=4, renorm_it=1, per_k=True)
 
 
@@ -386,17 +384,15 @@ def _zero_below(x, kidx_c, ro_c, ids, k_rows, thr):
 
 
 @cuda_required
+@pytest.mark.parametrize("weighted", [False, True], ids=["k1", "k1w"])
 @pytest.mark.parametrize("pinned", [False, True])
-def test_gemv_fp8_sparsek1_thr0_bitwise_and_masked(pinned):
+def test_gemv_fp8_sparsek1_thr0_bitwise_and_masked(pinned, weighted):
     """per-k: thr=0 ↔ dense 비트일치; thr>0 ↔ dense(|x|<thr 인 k를 0으로 둔 x) **비트일치**
     (죽은 행을 x=0·w=0으로 두므로 항과 순서가 같다)."""
-    from sglang.jit_kernel.prism_gemv_fp8 import (
-        gemv_fp8_indexed, gemv_fp8_indexed_pinned, gemv_fp8_indexed_pinned_sparse,
-        gemv_fp8_indexed_sparse,
-    )
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8_indexed, gemv_fp8_indexed_sparse
 
-    dense_fn = gemv_fp8_indexed_pinned if pinned else gemv_fp8_indexed
-    sparse_fn = gemv_fp8_indexed_pinned_sparse if pinned else gemv_fp8_indexed_sparse
+    dense_fn = functools.partial(gemv_fp8_indexed, on_device=not pinned)
+    sparse_fn = functools.partial(gemv_fp8_indexed_sparse, on_device=not pinned)
     N, K, k_rows, M = 128, 256, 128, 2
     codes, scales, row_off, kidx, _ = _store(N, K, k_rows, False, seed=61)
     if pinned:
@@ -404,18 +400,21 @@ def test_gemv_fp8_sparsek1_thr0_bitwise_and_masked(pinned):
     x, ids = _inputs(M, K, False, False, seed=62)
     stream = torch.cuda.current_stream()
     w = torch.rand(M, TOPK, generator=torch.Generator().manual_seed(63)).cuda()
+    # k1w with wn2 == 1 keeps exactly the k that k1 keeps (x*x*1 >= thr*thr is exact for
+    # bf16 x), so the same references hold and the sparsek1w entries get covered.
+    a = torch.ones(int(row_off[-1]), device="cuda") if weighted else None
 
     dense = torch.zeros(M, TOPK, N, dtype=torch.bfloat16, device="cuda")
     dense_fn(x.cuda(), ids.cuda(), codes, scales, row_off, kidx, dense, 0, False, stream)
     sp0 = torch.zeros_like(dense)
-    sparse_fn(x.cuda(), ids.cuda(), w, codes, scales, row_off, kidx, sp0, _sparse_spec_k1(E, 0.0),
+    sparse_fn(x.cuda(), ids.cuda(), w, codes, scales, row_off, kidx, sp0, _sparse_spec_k1(E, 0.0, a),
               0, False, stream)
     torch.cuda.synchronize()
     assert torch.equal(dense, sp0)
 
     thr = 0.5
     masked = torch.zeros_like(dense)
-    sparse_fn(x.cuda(), ids.cuda(), w, codes, scales, row_off, kidx, masked, _sparse_spec_k1(E, thr),
+    sparse_fn(x.cuda(), ids.cuda(), w, codes, scales, row_off, kidx, masked, _sparse_spec_k1(E, thr, a),
               0, False, stream)
     torch.cuda.synchronize()
     # 참조: (m, j)마다 마스킹된 x로 dense를 다시 돈다 — 그 슬롯 행만 취한다.
@@ -435,8 +434,7 @@ def test_gemv_fp8_sparsek1_thr0_bitwise_and_masked(pinned):
 @cuda_required
 def test_gemv_fp8_sparsek1_gateup_fused_bitwise():
     """per-k 융합(warm의 실제 경로) ↔ per-k 2회 launch 비트일치, device/pinned 양쪽. gate/up thr 상이."""
-    from sglang.jit_kernel.prism_gemv_fp8 import (
-        gemv_fp8_indexed_pinned_sparse, gemv_fp8_indexed_pinned_sparse_gateup,
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import (
         gemv_fp8_indexed_sparse, gemv_fp8_indexed_sparse_gateup,
     )
 
@@ -448,7 +446,8 @@ def test_gemv_fp8_sparsek1_gateup_fused_bitwise():
     stream = torch.cuda.current_stream()
     spg, spu = _sparse_spec_k1(E, 0.3), _sparse_spec_k1(E, 0.6)
     for single, fused, pin in ((gemv_fp8_indexed_sparse, gemv_fp8_indexed_sparse_gateup, False),
-                               (gemv_fp8_indexed_pinned_sparse, gemv_fp8_indexed_pinned_sparse_gateup, True)):
+                               (functools.partial(gemv_fp8_indexed_sparse, on_device=False),
+                                functools.partial(gemv_fp8_indexed_sparse_gateup, on_device=False), True)):
         cg, sg, cu, su = (c1, s1, c2, s2) if not pin else (
             c1.cpu().pin_memory(), s1.cpu().pin_memory(), c2.cpu().pin_memory(), s2.cpu().pin_memory())
         ref = torch.zeros(M, TOPK, 2 * N, dtype=torch.bfloat16, device="cuda")
@@ -464,7 +463,7 @@ def test_gemv_fp8_sparsek1_gateup_fused_bitwise():
 @cuda_required
 def test_gemv_fp8_sparsek1_rejects_mixed_modes():
     """gate(per-k)와 up(페어)을 한 launch로 융합할 수 없다."""
-    from sglang.jit_kernel.prism_gemv_fp8 import gemv_fp8_indexed_sparse_gateup
+    from sglang.kernels.ops.moe.prism.gemv_fp8 import gemv_fp8_indexed_sparse_gateup
 
     N, K, k_rows, M = 128, 256, 128, 1
     c1, s1, ro1, ki1, _ = _store(N, K, k_rows, False, seed=81)

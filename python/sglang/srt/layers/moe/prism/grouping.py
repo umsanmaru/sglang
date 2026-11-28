@@ -24,7 +24,7 @@ from functools import cached_property
 
 import torch
 
-from sglang.jit_kernel.prism_grouped import TILE_M
+from sglang.kernels.ops.moe.prism.grouped import TILE_M
 
 
 @dataclass(frozen=True)

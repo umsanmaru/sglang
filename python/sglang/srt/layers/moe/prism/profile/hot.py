@@ -136,7 +136,7 @@ def measure_proj(shape: Shape, proj: str, k_rows: int, *, m: int = 1,
     k_index uint16 device, out3d [M, top_k, N].
     """
     store = store_of(dtype)
-    gemv = store.fmt.gemv(pinned=False, sparse=False)
+    gemv = store.fmt.gemv(sparse=False)
 
     dev = select_device(device) if not isinstance(device, torch.device) else device
     E, topk = shape.experts, shape.topk
@@ -158,7 +158,7 @@ def measure_proj(shape: Shape, proj: str, k_rows: int, *, m: int = 1,
 
     def launch(i: int) -> None:
         store.call(gemv, (x, ids[i], *parts, row_off, kidx, out, 0,
-                          x_row_is_pair, torch.cuda.current_stream()), vec=vec)
+                          x_row_is_pair, torch.cuda.current_stream()), vec=vec, on_device=True)
 
     try:
         with nvtx(f"hot/{label or proj}"):
@@ -186,8 +186,8 @@ def measure_gateup(shape: Shape, k_rows: int, *, m: int = 1, vec: int = 0,
     `fused=False`로 두면 옛 경로(2 launch)를 재서 그 차이를 볼 수 있다.
     """
     store = store_of(dtype)
-    gemv = store.fmt.gemv(pinned=False, sparse=False)
-    gemv_gu = store.fmt.gemv_gateup(pinned=False, sparse=False)
+    gemv = store.fmt.gemv(sparse=False)
+    gemv_gu = store.fmt.gemv_gateup(sparse=False)
 
     dev = select_device(device) if not isinstance(device, torch.device) else device
     E, topk = shape.experts, shape.topk
@@ -214,10 +214,12 @@ def measure_gateup(shape: Shape, k_rows: int, *, m: int = 1, vec: int = 0,
         stream = torch.cuda.current_stream()
         if fused:
             store.call(gemv_gu, (x, ids[i], *wg, rog, kig, *wu, rou, kiu,
-                                 out, 0, n, False, stream), vec=vec)
+                                 out, 0, n, False, stream), vec=vec, on_device=True)
         else:
-            store.call(gemv, (x, ids[i], *wg, rog, kig, out, 0, False, stream), vec=vec)
-            store.call(gemv, (x, ids[i], *wu, rou, kiu, out, n, False, stream), vec=vec)
+            store.call(gemv, (x, ids[i], *wg, rog, kig, out, 0, False, stream), vec=vec,
+                on_device=True)
+            store.call(gemv, (x, ids[i], *wu, rou, kiu, out, n, False, stream), vec=vec,
+                on_device=True)
 
     try:
         with nvtx("hot/gateup" + ("" if fused else "/2launch")):
@@ -283,7 +285,7 @@ def hot_dense_gemv(shape: Shape, *, hot_frac: float = 1.0,
                     device=dev, shuffle_index=shuffle_index, seed=seed,
                     dtype=store))
 
-    params["kernel"] = store.fmt.gemv(pinned=False, sparse=False).__name__
+    params["kernel"] = store.fmt.gemv(sparse=False).__name__
     return HotGemvReport(shape=shape, params=params, results=tuple(results),
                          env=env_stamp(dev))
 
@@ -307,7 +309,7 @@ def dense_gemv(k: int, n: int, *, m: int = 1, vec: int = 0, reps: int = 100,
     `hot_dense_gemv(shape, ...)`에 실제 `experts`를 주면 된다 — 그쪽은 회전을
     자동으로 한다. `experts`/`topk` 인자로 이 helper에서도 풀을 키울 수 있다.
     """
-    from sglang.jit_kernel.prism_gemv import warmup_jit  # noqa: F401  (bf16 JIT 선행)
+    from sglang.kernels.ops.moe.prism.gemv import warmup_jit  # noqa: F401  (bf16 JIT 선행)
 
     store = store_of(dtype)
     store.fmt.warmup()
